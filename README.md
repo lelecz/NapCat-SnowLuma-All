@@ -1,36 +1,41 @@
-# NapCat + SnowLuma 全生态聚合仓库
+# NapCat + SnowLuma 全生态（单一仓库）
 
 把 [NapCat](https://github.com/NapNeko/NapCatQQ) 与 [SnowLuma](https://github.com/TomyJan/SnowLuma) 全生态，
-以 **git submodule** 形式锁定在本人账号下的 fork 快照，防止上游删库 / 改协议 / 断更。
+**平铺合并进一个仓库**，作为防上游删库 / 改协议 / 断更的完整快照。克隆一次即可拿到全部源码，无需子模块。
 
-## 一键全部拉取
-
-```bash
-git clone --recursive https://github.com/lelecz/NapCat-SnowLuma-All.git
-# 已克隆过：
-git submodule update --init --recursive
-```
-
-## 子模块（7 个，锁定 main 当前提交）
-
-| 目录 | 说明 | 锁定提交 |
-|---|---|---|
-| [`NapCatQQ`](./NapCatQQ) | NapCat 协议端本体（NTQQ Bot 框架，TypeScript） | `72912f293924` |
-| [`SnowLuma`](./SnowLuma) | 新一代协议框架 v2.4.2（Next Remote Protocol，TypeScript） | `f2ea3354f8bb` |
-| [`NapCatQQ-Desktop`](./NapCatQQ-Desktop) | 官方 GUI 控制台 V3（Rust + Tauri + React） | `0ad64a4ce233` |
-| [`NapCat-Installer`](./NapCat-Installer) | Linux 一键安装脚本 | `cbc0f10212a6` |
-| [`NapCat-Termux`](./NapCat-Termux) | Android Termux 部署 | `9f011b5aaa49` |
-| [`LiteLoader-NapCatExample`](./LiteLoader-NapCatExample) | LiteLoaderQQNT 加载示例 | `65e016bb24bb` |
-| [`BytecodeInjectBoot`](./BytecodeInjectBoot) | 字节码注入引导 | `8ad8c8e4d475` |
-
-## 同步上游最新
+## 克隆
 
 ```bash
-git submodule update --remote --merge
-git commit -am "sync upstream"
-git push
+git clone https://github.com/lelecz/NapCat-SnowLuma-All.git
 ```
 
-## 上游
+## 目录
 
-NapNeko/NapCatQQ · TomyJan/SnowLuma · NapNeko/NapCatQQ-Desktop · NapNeko/NapCat-Installer · NapNeko/NapCat-Termux · NapNeko/LiteLoader-NapCatExample · NapNeko/BytecodeInjectBoot
+| 目录 | 说明 | 文件数 | 上游 |
+|---|---|---|---|
+| `NapCatQQ/` | NapCat 协议端本体（NTQQ Bot 框架，TS） | 1111 | NapNeko/NapCatQQ |
+| `SnowLuma/` | SnowLuma 协议框架 v2.4.2（TS） | 1367 | TomyJan/SnowLuma |
+| `NapCatQQ-Desktop/` | GUI 控制台 V3（Rust+Tauri+React） | 3046 | NapNeko/NapCatQQ-Desktop |
+| `NapCat-Installer/` | Linux 一键安装脚本 | 22 | NapNeko/NapCat-Installer |
+| `NapCat-Termux/` | Android Termux 部署 | 10 | NapNeko/NapCat-Termux |
+| `LiteLoader-NapCatExample/` | LiteLoaderQQNT 加载示例 | 12 | NapNeko/LiteLoader-NapCatExample |
+| `BytecodeInjectBoot/` | 字节码注入引导 | 1 | NapNeko/BytecodeInjectBoot |
+
+合计 **5571 个文件 / 约 202 MB**（快照时间 2026-11-11）。
+
+## 更新
+
+`.github/workflows/merge-monorepo.yml` 会在 GitHub 服务器端重新拉取本人名下各 fork 的 main 并平铺合并：
+
+Actions → *Merge into monorepo* → Run workflow
+
+本地快速更新单个项目：
+
+```bash
+# 例：只更新 NapCatQQ 目录（保持其他不动）
+git subtree pull --prefix=NapCatQQ https://github.com/lelecz/NapCatQQ.git main --squash
+```
+
+## 上游与许可
+
+各目录保留原项目的 LICENSE 与版权声明；使用请遵守上游许可证与当地法律法规。

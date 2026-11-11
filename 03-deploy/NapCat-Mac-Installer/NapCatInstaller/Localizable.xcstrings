@@ -1,0 +1,568 @@
+{
+  "sourceLanguage" : "zh-Hans",
+  "strings" : {
+    " %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " %@"
+          }
+        }
+      }
+    },
+    " %@，可升级%@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " %1$@, new version %2$@ available"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : " %1$@，可升级%2$@"
+          }
+        }
+      }
+    },
+    " %@，已安装" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " %@, installed"
+          }
+        }
+      }
+    },
+    " %@，已是最新" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " %@, up to date"
+          }
+        }
+      }
+    },
+    " %@：未运行" : {
+
+    },
+    " %@：运行中（%@）" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : " %1$@：运行中（%2$@）"
+          }
+        }
+      }
+    },
+    " NapCat" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " NapCat"
+          }
+        }
+      }
+    },
+    " 原版QQ" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Original QQ"
+          }
+        }
+      }
+    },
+    " 发生错误" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Failed"
+          }
+        }
+      }
+    },
+    " 未安装" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Not installed"
+          }
+        }
+      }
+    },
+    " 正在加载…" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Loading..."
+          }
+        }
+      }
+    },
+    " 正在读取…" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Loading..."
+          }
+        }
+      }
+    },
+    " 自定义 %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " Custom %@"
+          }
+        }
+      }
+    },
+    " 需要授权访问 QQ 数据目录" : {
+
+    },
+    "🐧 启动 原版QQ" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "🐧 Launch Original QQ"
+          }
+        }
+      }
+    },
+    "🐧 显示 原版QQ" : {
+
+    },
+    "🐱 启动 NapCat" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "🐱 Launch NapCat"
+          }
+        }
+      }
+    },
+    "HTTP(S) 加速前缀，例如 https://mirror.example" : {
+
+    },
+    "NapCat 安装成功" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NapCat installed successfully"
+          }
+        }
+      }
+    },
+    "NapCat 已更新至最新版本" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NapCat updated to the latest version"
+          }
+        }
+      }
+    },
+    "NapCat版本" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NapCat Version"
+          }
+        }
+      }
+    },
+    "QQ 可执行文件不存在或不可执行" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The QQ executable does not exist or is not executable"
+          }
+        }
+      }
+    },
+    "QQ版本" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "QQ Version"
+          }
+        }
+      }
+    },
+    "下载线路" : {
+
+    },
+    "代理" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Proxy"
+          }
+        }
+      }
+    },
+    "使用终端打开" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open in Terminal"
+          }
+        }
+      }
+    },
+    "停止" : {
+
+    },
+    "停止 %@" : {
+
+    },
+    "允许安装器访问 QQ 数据目录，以读取和安装 NapCat" : {
+
+    },
+    "切换程序入口「 NapCat 」" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Switch Entry to「 NapCat 」"
+          }
+        }
+      }
+    },
+    "切换程序入口「 原版 QQ 」" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Switch Entry to「 Original QQ 」"
+          }
+        }
+      }
+    },
+    "刷新" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reload"
+          }
+        }
+      }
+    },
+    "卸载" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uninstall"
+          }
+        }
+      }
+    },
+    "发生错误" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Error"
+          }
+        }
+      }
+    },
+    "取消" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel"
+          }
+        }
+      }
+    },
+    "启动" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Launch"
+          }
+        }
+      }
+    },
+    "启动原版QQ" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Launch Original QQ"
+          }
+        }
+      }
+    },
+    "启动失败: %@" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Launch failed: %@"
+          }
+        }
+      }
+    },
+    "复制" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy"
+          }
+        }
+      }
+    },
+    "好" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OK"
+          }
+        }
+      }
+    },
+    "安装" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Install"
+          }
+        }
+      }
+    },
+    "安装结果" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installation Result"
+          }
+        }
+      }
+    },
+    "完成" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Done"
+          }
+        }
+      }
+    },
+    "将恢复 QQ 原版程序入口并启动，需要输入开机密码。" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The original QQ entry will be restored and launched. Your login password is required."
+          }
+        }
+      }
+    },
+    "将正常退出 NapCat（PID %@），机器人会离线。原版 QQ 不受影响。" : {
+
+    },
+    "将正常退出原版 QQ（PID %@）。NapCat 不受影响。" : {
+
+    },
+    "打开 %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open %@"
+          }
+        }
+      }
+    },
+    "打开WebUI" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open WebUI"
+          }
+        }
+      }
+    },
+    "授权访问" : {
+
+    },
+    "提示" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Notice"
+          }
+        }
+      }
+    },
+    "操作完成" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Operation completed"
+          }
+        }
+      }
+    },
+    "文件位置" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "File Location"
+          }
+        }
+      }
+    },
+    "无法授权" : {
+
+    },
+    "更新" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Upgrade"
+          }
+        }
+      }
+    },
+    "未找到 QQ.app，请确认已安装 QQ" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "QQ.app not found. Please make sure QQ is installed."
+          }
+        }
+      }
+    },
+    "未找到该路径：\n%@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Path not found: %@"
+          }
+        }
+      }
+    },
+    "注意：需要在“系统设置-隐私与安全性-App管理”中添加该程序！" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Note: You need to add this app in System Settings > Privacy & Security > App Management!"
+          }
+        }
+      }
+    },
+    "确认停止" : {
+
+    },
+    "确认启动" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confirm Launch"
+          }
+        }
+      }
+    },
+    "程序入口" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Program Entry"
+          }
+        }
+      }
+    },
+    "网络代理和私有 CA 使用 macOS 的系统代理与证书信任设置。" : {
+
+    },
+    "自动检测" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatic"
+          }
+        }
+      }
+    },
+    "自定义加速地址" : {
+
+    },
+    "请先还原再卸载" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Please restore the patch before uninstallation"
+          }
+        }
+      }
+    },
+    "进度: %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Progress: %@"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

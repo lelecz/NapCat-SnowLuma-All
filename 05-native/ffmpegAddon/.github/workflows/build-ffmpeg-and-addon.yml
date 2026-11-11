@@ -1,0 +1,478 @@
+name: Build FFmpeg and Node Addon
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  FFMPEG_COMMIT: 7107f093d7dafaf60f30a350eba8926aded39952
+
+jobs:
+  build-linux:
+    name: Build on Ubuntu (x64)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+      options: --user root
+    env:
+      PREFIX: ${{ github.workspace }}/ffmpeg_out
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y autoconf automake build-essential cmake pkg-config yasm nasm libtool git python3 curl ca-certificates
+
+      - name: Build and install lame (static library)
+        run: |
+          curl -L https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download -o lame-3.100.tar.gz
+          tar xzf lame-3.100.tar.gz
+          cd lame-3.100
+          ./configure --prefix="${PREFIX}" --enable-static --disable-shared --enable-nasm --with-pic CFLAGS="-fPIC"
+          make -j$(nproc)
+          make install
+          cd ..
+          echo "Lame installed, checking files:"
+          ls -la "${PREFIX}/lib" || true
+          ls -la "${PREFIX}/include" || true
+
+      - name: Build static AMR and Speex codecs
+        shell: bash
+        run: |
+          cmake -S scripts/audio-codecs -B build/audio-codecs -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$PREFIX"
+          cmake --build build/audio-codecs --config Release --parallel 2
+          cmake --install build/audio-codecs --config Release
+
+      - name: Checkout pinned FFmpeg into ffmpeg_src
+        run: |
+          rm -rf ffmpeg_src
+          git init ffmpeg_src
+          git -C ffmpeg_src remote add origin https://github.com/FFmpeg/FFmpeg
+          git -C ffmpeg_src fetch --depth 1 origin "$FFMPEG_COMMIT"
+          git -C ffmpeg_src checkout --detach FETCH_HEAD
+
+      - name: Clone silk-v3-decoder
+        run: |
+          rm -rf silk-v3-decoder
+          git clone https://github.com/kn007/silk-v3-decoder silk-v3-decoder
+          git -C silk-v3-decoder apply --ignore-whitespace ../silk-patches/0001-initialize-packet-inspection.patch
+
+      - name: Apply repository patches to ffmpeg_src
+        run: |
+          set -euo pipefail
+          echo "Applying patches to ffmpeg_src"
+          cd ffmpeg_src && git apply --whitespace=fix ../patches/*.patch
+        shell: bash
+
+      - name: Configure & build static FFmpeg
+        run: |
+          chmod +x scripts/build_ffmpeg_linux.sh || true
+          ./scripts/build_ffmpeg_linux.sh "$PREFIX"
+
+      - name: Show installed libs
+        run: ls -la "$PREFIX/lib" || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Configure Node addon (point to built FFmpeg)
+        run: npx cmake-js configure -- -DFFMPEG_SOURCE_DIR="$PREFIX"
+
+      - name: Build Node addon (cmake-js)
+        run: npx cmake-js build --arch=x64 --runtime=node
+
+      - name: Test native audio and video
+        run: npm test
+
+      - name: Upload built addon
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-addon-linux
+          path: |
+            build/**/*.node
+            Release/**/*.node
+      - name: Upload FFmpeg headers and libs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-libs-linux
+          path: |
+            ffmpeg_out/include
+            ffmpeg_out/lib
+
+  build-linux-arm64:
+    name: Build on Ubuntu (ARM64)
+    runs-on: ubuntu-22.04-arm
+    container:
+      image: ubuntu:20.04
+      options: --user root --platform linux/arm64
+    env:
+      PREFIX: ${{ github.workspace }}/ffmpeg_out
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y autoconf automake build-essential cmake pkg-config yasm nasm libtool git python3 curl ca-certificates
+
+      - name: Build and install lame (static library)
+        run: |
+          curl -L https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download -o lame-3.100.tar.gz
+          tar xzf lame-3.100.tar.gz
+          cd lame-3.100
+          ./configure --prefix="${PREFIX}" --enable-static --disable-shared --with-pic CFLAGS="-fPIC"
+          make -j$(nproc)
+          make install
+          cd ..
+          echo "Lame installed, checking files:"
+          ls -la "${PREFIX}/lib" || true
+          ls -la "${PREFIX}/include" || true
+
+      - name: Build static AMR and Speex codecs
+        shell: bash
+        run: |
+          cmake -S scripts/audio-codecs -B build/audio-codecs -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$PREFIX"
+          cmake --build build/audio-codecs --config Release --parallel 2
+          cmake --install build/audio-codecs --config Release
+
+      - name: Checkout pinned FFmpeg into ffmpeg_src
+        run: |
+          rm -rf ffmpeg_src
+          git init ffmpeg_src
+          git -C ffmpeg_src remote add origin https://github.com/FFmpeg/FFmpeg
+          git -C ffmpeg_src fetch --depth 1 origin "$FFMPEG_COMMIT"
+          git -C ffmpeg_src checkout --detach FETCH_HEAD
+
+      - name: Clone silk-v3-decoder
+        run: |
+          rm -rf silk-v3-decoder
+          git clone https://github.com/kn007/silk-v3-decoder silk-v3-decoder
+          git -C silk-v3-decoder apply --ignore-whitespace ../silk-patches/0001-initialize-packet-inspection.patch
+
+      - name: Apply repository patches to ffmpeg_src
+        run: |
+          set -euo pipefail
+          echo "Applying patches to ffmpeg_src"
+          cd ffmpeg_src && git apply --whitespace=fix ../patches/*.patch
+        shell: bash
+
+      - name: Configure & build static FFmpeg
+        run: |
+          chmod +x scripts/build_ffmpeg_linux_arm64.sh || true
+          ./scripts/build_ffmpeg_linux_arm64.sh "$PREFIX"
+
+      - name: Show installed libs
+        run: ls -la "$PREFIX/lib" || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Configure Node addon (point to built FFmpeg)
+        run: npx cmake-js configure -- -DFFMPEG_SOURCE_DIR="$PREFIX"
+
+      - name: Build Node addon (cmake-js)
+        run: npx cmake-js build --arch=arm64 --runtime=node
+
+      - name: Test native audio and video
+        run: npm test
+
+      - name: Upload built addon
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-addon-linux-arm64
+          path: |
+            build/**/*.node
+            Release/**/*.node
+
+      - name: Upload FFmpeg headers and libs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-libs-linux-arm64
+          path: |
+            ffmpeg_out/include
+            ffmpeg_out/lib
+
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-2022
+    env:
+      PREFIX: ${{ github.workspace }}/ffmpeg_out
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup official Node.js for the MSVC addon
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+
+      - name: Install MSYS2 and required packages
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          path-type: inherit
+          cache: true
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-pkg-config
+
+      - name: Build static AMR and Speex codecs
+        shell: bash
+        run: |
+          cmake -S scripts/audio-codecs -B build/audio-codecs -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$PREFIX"
+          cmake --build build/audio-codecs --config Release --parallel 2
+          cmake --install build/audio-codecs --config Release
+
+      - name: Checkout pinned FFmpeg into ffmpeg_src
+        run: |
+          if (Test-Path ffmpeg_src) { Remove-Item -Recurse -Force ffmpeg_src }
+          git init ffmpeg_src
+          git -C ffmpeg_src remote add origin https://github.com/FFmpeg/FFmpeg
+          git -C ffmpeg_src fetch --depth 1 origin $env:FFMPEG_COMMIT
+          git -C ffmpeg_src checkout --detach FETCH_HEAD
+
+      - name: Clone silk-v3-decoder
+        run: |
+          if (Test-Path silk-v3-decoder) { Remove-Item -Recurse -Force silk-v3-decoder }
+          git clone https://github.com/kn007/silk-v3-decoder silk-v3-decoder
+          git -C silk-v3-decoder apply --ignore-whitespace ../silk-patches/0001-initialize-packet-inspection.patch
+
+      - name: Apply repository patches to ffmpeg_src (Windows/msys2)
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          echo "Applying patches to ffmpeg_src"
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")/ffmpeg_src" && git apply --ignore-whitespace ../patches/*.patch
+
+      - name: Build and install lame (static library) on Windows
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        shell: msys2 {0}
+        run: |
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
+          
+          # Download and extract lame
+          curl -L https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download -o lame-3.100.tar.gz
+          tar xzf lame-3.100.tar.gz
+          cd lame-3.100
+          
+          # Use MSVC directly via Makefile.MSVC (official MSVC support)
+          # First generate config.h from configMS.h
+          cp configMS.h config.h
+          
+          # Build static library using nmake with MSVC for x64
+          # Override MACHINE and LIB_OPTS for x64
+          nmake -f Makefile.MSVC \
+            COMP=MSVC \
+            ASM=NO \
+            MSVCVER=Win64 \
+            MACHINE=/machine:X64 \
+            libmp3lame-static.lib
+          
+          # Install files with standardized naming (mp3lame.lib without lib prefix)
+          mkdir -p "$(cygpath -u "$PREFIX")/lib"
+          mkdir -p "$(cygpath -u "$PREFIX")/include/lame"
+          cp output/libmp3lame-static.lib "$(cygpath -u "$PREFIX")/lib/mp3lame.lib"
+          cp include/lame.h "$(cygpath -u "$PREFIX")/include/lame/"
+          # Also copy to root include for FFmpeg to find it
+          cp include/lame.h "$(cygpath -u "$PREFIX")/include/"
+          
+          cd ..
+          
+          echo "Lame installed, checking files:"
+          ls -la "$(cygpath -u "$PREFIX")/lib" || true
+          ls -la "$(cygpath -u "$PREFIX")/include" || true
+
+      - name: Build FFmpeg
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        shell: msys2 {0}
+        run: |
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
+          echo "Using MSYS2 at: $MSYS2_LOCATION"
+          export MSYS2_ARG_CONV_EXCL="*"
+          pacman -S --noconfirm gawk make diffutils
+          export AWK=gawk
+          
+          # Verify cl.exe is accessible (should be inherited from path-type: inherit)
+          echo "Checking for MSVC tools..."
+          which cl.exe || echo "Warning: cl.exe not found in PATH"
+          cl.exe 2>&1 | head -n 1 || echo "Warning: cl.exe test failed"
+          
+          chmod +x ./scripts/build_ffmpeg_win.sh || true
+          ./scripts/build_ffmpeg_win.sh "$(cygpath -u "$PREFIX")"
+
+      - name: Install npm deps with official Node.js
+        run: |
+          node --version
+          node -p "process.execPath"
+          npm ci
+
+      - name: Configure Node addon (point to built FFmpeg) and build
+        run: |
+          npx cmake-js configure -- "-DFFMPEG_SOURCE_DIR=$env:PREFIX"
+          npx cmake-js build --arch=x64 --runtime=node
+
+      - name: Test native audio and video
+        run: npm test
+
+      - name: Upload built addon
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-addon-windows
+          path: |
+            build\**\*.node
+            Release\**\*.node
+            ffmpeg_out\lib\**\*.node
+      - name: Upload FFmpeg headers and libs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-libs-windows
+          path: |
+            ffmpeg_out\include
+            ffmpeg_out\lib
+
+  build-macos:
+    name: Build on macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    env:
+      PREFIX: ${{ github.workspace }}/ffmpeg_out
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies (Homebrew)
+        run: |
+          brew install automake autoconf pkg-config yasm nasm libtool git python3
+
+      - name: Build and install lame (static library)
+        run: |
+          curl -L https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download -o lame-3.100.tar.gz
+          tar xzf lame-3.100.tar.gz
+          cd lame-3.100
+          ./configure --prefix="${PREFIX}" --enable-static --disable-shared --with-pic CFLAGS="-fPIC"
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          cd ..
+          echo "Lame installed, checking files:"
+          ls -la "${PREFIX}/lib" || true
+          ls -la "${PREFIX}/include" || true
+
+      - name: Build static AMR and Speex codecs
+        shell: bash
+        run: |
+          cmake -S scripts/audio-codecs -B build/audio-codecs -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=$PREFIX"
+          cmake --build build/audio-codecs --config Release --parallel 2
+          cmake --install build/audio-codecs --config Release
+
+      - name: Checkout pinned FFmpeg into ffmpeg_src
+        run: |
+          rm -rf ffmpeg_src
+          git init ffmpeg_src
+          git -C ffmpeg_src remote add origin https://github.com/FFmpeg/FFmpeg
+          git -C ffmpeg_src fetch --depth 1 origin "$FFMPEG_COMMIT"
+          git -C ffmpeg_src checkout --detach FETCH_HEAD
+
+      - name: Clone silk-v3-decoder
+        run: |
+          rm -rf silk-v3-decoder
+          git clone https://github.com/kn007/silk-v3-decoder silk-v3-decoder
+          git -C silk-v3-decoder apply --ignore-whitespace ../silk-patches/0001-initialize-packet-inspection.patch
+
+      - name: Apply repository patches to ffmpeg_src on macOS
+        run: |
+          set -euo pipefail
+          echo "Applying patches to ffmpeg_src"
+          cd ffmpeg_src && git apply --whitespace=fix ../patches/*.patch
+
+      - name: Configure & build static FFmpeg
+        run: |
+          chmod +x scripts/build_ffmpeg_mac.sh || true
+          ./scripts/build_ffmpeg_mac.sh "$PREFIX"
+
+      - name: Show installed libs
+        run: ls -la "$PREFIX/lib" || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Configure Node addon (point to built FFmpeg)
+        run: npx cmake-js configure -- -DFFMPEG_SOURCE_DIR="$PREFIX"
+
+      - name: Build Node addon (cmake-js)
+        run: npx cmake-js build --arch=${{ matrix.arch }} --runtime=node
+
+      - name: Ad-hoc sign the macOS native addon
+        run: |
+          codesign --force --sign - build/Release/ffmpegAddon.node
+          codesign --verify --strict build/Release/ffmpegAddon.node
+          file build/Release/ffmpegAddon.node
+          otool -L build/Release/ffmpegAddon.node
+
+      - name: Test native audio and video
+        run: npm test
+
+      - name: Upload built addon
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-addon-macos-${{ matrix.arch }}
+          path: |
+            build/**/*.node
+            Release/**/*.node
+      - name: Upload FFmpeg headers and libs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-libs-macos-${{ matrix.arch }}
+          path: |
+            ffmpeg_out/include
+            ffmpeg_out/lib

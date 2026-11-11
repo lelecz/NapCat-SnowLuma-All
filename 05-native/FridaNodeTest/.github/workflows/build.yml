@@ -1,0 +1,178 @@
+name: Build and Test Frida Hook
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+  release:
+    types: [ created ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}-${{ matrix.arch }} with Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux AMD64
+          - os: ubuntu-latest
+            runs-on: ubuntu-latest
+            arch: x64
+            node-version: 20.x
+          # Linux ARM64
+          - os: ubuntu-latest
+            runs-on: ubuntu-24.04-arm
+            arch: arm64
+            node-version: 20.x
+          # macOS ARM64
+          - os: macos-latest
+            runs-on: macos-latest
+            arch: arm64
+            node-version: 20.x
+          # Windows AMD64
+          - os: windows-latest
+            runs-on: windows-latest
+            arch: x64
+            node-version: 20.x
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        architecture: ${{ matrix.arch }}
+
+    - name: Install build tools (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential ninja-build
+
+    - name: Install build tools (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake ninja
+
+    - name: Setup MSVC (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Display system info
+      run: |
+        echo "Architecture: ${{ matrix.arch }}"
+        echo "Runner OS: ${{ runner.os }}"
+        if [ "${{ runner.os }}" = "Linux" ] || [ "${{ runner.os }}" = "macOS" ]; then
+          uname -m
+          echo "CMAKE_SYSTEM_PROCESSOR will be: $(uname -m)"
+        fi
+      shell: bash
+
+    - name: Cache Frida DevKit
+      uses: actions/cache@v4
+      with:
+        path: .frida-devkit
+        key: frida-devkit-16.5.9-${{ runner.os }}-${{ matrix.arch }}
+        restore-keys: |
+          frida-devkit-16.5.9-${{ runner.os }}-${{ matrix.arch }}
+
+    - name: Install npm dependencies
+      run: npm ci
+
+    - name: Clean old Frida DevKit if architecture mismatch
+      run: |
+        if [ -d ".frida-devkit" ]; then
+          echo "Checking existing Frida DevKit..."
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # Check if existing devkit is x86_64 (EM: 62)
+            if [ -f ".frida-devkit/libfrida-gum.a" ]; then
+              FILE_INFO=$(file .frida-devkit/libfrida-gum.a || true)
+              echo "DevKit file info: $FILE_INFO"
+              if echo "$FILE_INFO" | grep -q "x86-64\|x86_64"; then
+                echo "Found x86_64 DevKit on ARM64 runner, removing..."
+                rm -rf .frida-devkit .frida-devkit.tar.xz
+              fi
+            fi
+          elif [ "${{ matrix.arch }}" = "x64" ]; then
+            # Check if existing devkit is ARM64 (EM: 183)
+            if [ -f ".frida-devkit/libfrida-gum.a" ]; then
+              FILE_INFO=$(file .frida-devkit/libfrida-gum.a || true)
+              echo "DevKit file info: $FILE_INFO"
+              if echo "$FILE_INFO" | grep -q "aarch64\|ARM"; then
+                echo "Found ARM64 DevKit on x64 runner, removing..."
+                rm -rf .frida-devkit .frida-devkit.tar.xz
+              fi
+            fi
+          fi
+        fi
+      shell: bash
+      if: runner.os != 'Windows'
+
+    - name: Build native addon
+      run: npm run build
+
+    - name: Run tests
+      run: npm test
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: frida-hook-${{ matrix.os }}-${{ matrix.arch }}-node${{ matrix.node-version }}
+        path: build/Release/*.node
+        retention-days: 7
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.arch }}-node${{ matrix.node-version }}
+        path: |
+          *.log
+          npm-debug.log*
+        if-no-files-found: ignore
+        retention-days: 3
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'created'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+
+    - name: Display artifact structure
+      run: ls -R ./artifacts
+
+    - name: Package artifacts
+      run: |
+        mkdir -p release
+        cd artifacts
+        for dir in frida-hook-*; do
+          if [ -d "$dir" ]; then
+            cd "$dir"
+            zip -r "../../release/${dir}.zip" *.node
+            cd ..
+          fi
+        done
+
+    - name: Upload release assets
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

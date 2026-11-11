@@ -1,0 +1,197 @@
+# 接入框架
+
+## [NoneBot](https://nonebot.dev/docs/)
+
+1. 配置 NoneBot
+
+   这里假设你已经安装了 OneBot 适配器
+
+   默认情况下，NoneBot 是启用了反向 WS 的，如果出现 403，可能是默认配置问题，需要配置 `token` 才能正常连接。
+
+   具体方法为：修改 NoneBot 配置文件 `.env`，添加 `ONEBOT_ACCESS_TOKEN=你在 NapCat 中配置的 token`。
+
+   然后，启动 NoneBot，可以看到 NoneBot 输出的端口号，如 `8080`。
+
+2. 配置 NapCat
+
+   在 NapCat 配置添加反向 WS 地址，地址为 `ws://127.0.0.1:8080/onebot/v11/ws`, 这里的 `8080` 是 NoneBot 输出的端口号，`/onebot/v11/ws` 是 NoneBot onebot 适配器默认的路径。
+
+## [Koishi](https://koishi.chat)
+
+1. 在 Koishi 插件市场搜索 `onebot` 并安装 `adapter-onebot`，如下图：
+
+   ![koishi-install-onebot](/assets/use/koishi-install-onebot.png)
+
+2. 安装完之后，点击修改 → 配置
+
+   ![koishi-onebot-go-setting](/assets/use/koishi-onebot-go-setting.png)
+
+3. 配置 OneBot
+
+   这里以 WS 反向连接为例：
+
+   - `selfId` 为你的机器人的 QQ 号
+   - `token` 需和 NapCat 配置的 `token` 一致，当然，如果没有配置 token，则留空。
+   - `protocol` 选择 ws-reverse
+
+   其他配置保持默认即可，点击保存，然后启用插件。
+
+   ![koishi-onebot-setting](/assets/use/koishi-onebot-setting.png)
+
+   配置完成后，在 NapCat 的配置中添加 WS 反向地址。Koishi OneBot 的 WS 反向地址为 `ws://127.0.0.1:5140/onebot`。添加完成后，点击保存即可。
+   >如果你是使用 Docker 部署的 Koishi ，则反向地址应为 `ws://Koishi的容器名:5140/onebot` 
+   
+   >例如 `ws://koishi:5140/onebot`
+
+## [AstrBot](https://astrbot.app/)
+
+> 可以参考文档：[连接到 AstrBot](https://docs.astrbot.app/platform/aiocqhttp.html#%E9%99%84%E5%BD%95-%E9%83%A8%E7%BD%B2-napcat)
+
+1. 配置 AstrBot
+
+   进入 AstrBot 仪表盘 选择 机器人 → 创建机器人 → 消息平台类别 → `OneBot v11 (QQ 个人号等)`，启用适配器，其余默认即可，可根据需要更改(例如反向 Websocket Token)。
+
+   <img width="500" height="600" alt="image" src="https://github.com/user-attachments/assets/eef8d332-b592-4533-a4bd-e4a7f5e2480d" />
+
+
+
+2. 配置 OneBot
+
+   在 NapCat WebUI 页面选择 网络配置 → 新建 → WebSocket 客户端，URL 填入`ws://127.0.0.1:6199/ws`，添加完成后，点击保存即可。
+   
+   <img width="500" height="600" alt="image" src="https://github.com/user-attachments/assets/c256d576-670c-4f0c-a7ce-ac7affb786b3" />
+
+   >如果你是用 Docker 部署的 AstrBot ，则 URL 应为 `ws://astrbot:6199/ws` 
+   
+   <img width="500" height="600" alt="image" src="https://github.com/user-attachments/assets/55c7ea6b-177d-4d25-a6ee-6240b23a3164" />
+
+
+## OlivOS
+
+支持正向和反向 WS 以及 http 详见 [文档](https://doc.olivos.wiki/)
+
+## [NapLink](https://github.com/NapLink/NapLink)
+
+现代化的 NapCat WebSocket 客户端 SDK
+
+- 文档：https://naplink.github.io/
+- 代码：https://github.com/NapLink/NapLink
+- 实例项目：https://github.com/NapGram/NapGram
+
+## [onebotv11_rs](https://github.com/canxin121/onebotv11_rs)
+
+支持正向和反向 WS 以及 http
+
+## [node-napcat-ts](https://github.com/HkTeamX/node-napcat-ts)
+
+1. 配置 NapCat
+
+   在 NapCat 配置启用正向 WS
+
+2. 配置 node-napcat-ts
+
+   [详见 node-napcat-ts 文档](https://node-napcat-ts.huankong.top/guide/getting-started)
+
+   如果出现连接失败，可能是配置问题，需要配置 token 才能正常连接。
+
+   详见 `socket.error` 等事件
+
+## [ATRI](https://github.com/HkTeamX/ATRI)
+
+详见 [文档](https://atri.huankong.top/)
+
+## [Kovi](https://github.com/ThriceCola/Kovi)
+
+Rust Onebot V11 插件框架。
+
+将 NapCat 配置启用正向 WS。
+
+编写插件或使用社区插件，编译启动即可。（[文档](https://thricecola.github.io/kovi-doc)里面非常详细哦）
+
+编写插件可使用 [NapCat Api 拓展](https://crates.io/crates/kovi-plugin-expand-napcat) 。
+
+## [Mirai](https://github.com/mamoe/mirai)
+
+可通过 [Overflow](https://github.com/MrXiaoM/Overflow) 对接 Mirai 框架，以快速方便的实现 Mirai 插件从 MCL 启动方式无缝切换到 NapCat 继续使用。
+
+1. 配置 NapCat
+
+   按照 NapCat 相关文档下载并部署 NapCat，启动 NapCat (推荐使用控制台启动)并扫码登录 Bot，打开控制台输出的 WebUI 网址，使用默认 token 登录 WebUI 并配置和启用 WS（推荐将 NapCat 作为服务器端）。
+
+2. 配置 Overflow
+
+   [详见 Overflow 文档](https://mirai.mrxiaom.top/)
+
+   根据文档指引安装 Overflow，将在 NapCat 的 WebUI 中配置的 WS 相关信息填写到 overflow.json 中（推荐使用正向 WS，将 Overflow 当作是客户端），注意信息填写一致。
+
+3. 移动 Mirai 相关文件
+
+   将原先 MCL 中的插件（plugins）、数据（data）和配置（config）文件夹下相关文件移动至 Overflow 对应文件夹下。
+
+   由于登录将由 NapCat 负责，与登录相关的文件无需移动，例如：AutoLogin.yml、mirai-device-generator.jar、fix-protocol-version.jar 等。
+
+4. 都配置并移动好后，启动 NapCat 登录 Bot，再启动 Overflow，即可恢复 Mirai 插件的运行，替代原来 MCL + 签名服务的方式。
+
+## [NcatBot](https://github.com/ncatbot/ncatbot/)
+
+基于 NapCat 的 QQ 机器人 Python SDK，快速开发，轻松部署。
+
+使用 Python 编程，对新手十分友好，对老手十分高效。
+
+已完全对接 NapCat，提供一键安装并配置 NapCat 功能（Windows、Linux）
+
+
+## [qq-ai-bot](https://github.com/happysnaker/qq-ai-bot)
+
+一个面向实际部署的 QQ ↔ AI 机器人脚手架，使用 OneBot 11 对接 NapCat，并通过 ACP 兼容 agent 提供 AI 能力。
+
+默认支持私聊 / 群聊独立会话、处理进度回传、`/status` 等运维命令，更适合想把 NapCat 接到本地 agent 或自定义 AI 工作流上的场景。
+
+1. 配置 qq-ai-bot
+
+   拉取仓库并准备配置：
+
+   ```bash
+   git clone https://github.com/happysnaker/qq-ai-bot.git
+   cd qq-ai-bot
+   npm install
+   cp .env.example .env
+   cp examples/group-rules.example.json examples/group-rules.local.json
+   ```
+
+   最少需要确认这些配置：
+
+   - `ONEBOT_MODE=reverse`
+   - `ONEBOT_ACCESS_TOKEN=你的 token`
+   - `ONEBOT_REVERSE_WS_HOST=0.0.0.0`
+   - `ONEBOT_REVERSE_WS_PORT=16700`
+   - `ONEBOT_REVERSE_WS_PATH=/onebot/v11/ws`
+   - `ACP_AGENT_COMMAND` / `ACP_AGENT_ARGS_JSON` / `ACP_AGENT_WORKDIR` 已按你的 agent 实际情况填写
+
+   然后启动 qq-ai-bot：
+
+   ```bash
+   npm run dev
+   ```
+
+2. 配置 NapCat
+
+   在 NapCat WebUI 页面选择 网络配置 → 新建 → WebSocket 客户端，URL 填入 `ws://127.0.0.1:16700/onebot/v11/ws`。
+
+   如果配置了 token，请和 `ONEBOT_ACCESS_TOKEN` 保持一致。
+
+   > 如果你是用 Docker 部署的 qq-ai-bot，则 URL 应为 `ws://qq-ai-bot:16700/onebot/v11/ws`
+
+3. 验证连接
+
+   连接成功后，可在 QQ 中给机器人发送 `/ping` 或 `/status` 测试链路是否打通。默认群聊场景需要 `@机器人` 才会触发。
+
+   如果你暂时还没有现成的 ACP agent，也可以先参考项目自带的 mock agent 或 Docker 演示栈把链路跑通。
+
+- 项目主页：https://happysnaker.github.io/qq-ai-bot/
+- 快速开始：https://github.com/happysnaker/qq-ai-bot/blob/main/docs/getting-started.md
+
+
+项目发布至 PyPI，可通过 `pip install ncatbot5` 直接安装。
+
+请参考使用文档 [NcatBotDocs](https://docs.ncatbot.xyz/)

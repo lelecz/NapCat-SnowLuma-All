@@ -1,0 +1,28 @@
+[submodule "NapCatQQ"]
+	path = NapCatQQ
+	url = https://github.com/lelecz/NapCatQQ.git
+	branch = main
+[submodule "SnowLuma"]
+	path = SnowLuma
+	url = https://github.com/lelecz/SnowLuma.git
+	branch = main
+[submodule "NapCatQQ-Desktop"]
+	path = NapCatQQ-Desktop
+	url = https://github.com/lelecz/NapCatQQ-Desktop.git
+	branch = main
+[submodule "NapCat-Installer"]
+	path = NapCat-Installer
+	url = https://github.com/lelecz/NapCat-Installer.git
+	branch = main
+[submodule "NapCat-Termux"]
+	path = NapCat-Termux
+	url = https://github.com/lelecz/NapCat-Termux.git
+	branch = main
+[submodule "LiteLoader-NapCatExample"]
+	path = LiteLoader-NapCatExample
+	url = https://github.com/lelecz/LiteLoader-NapCatExample.git
+	branch = main
+[submodule "BytecodeInjectBoot"]
+	path = BytecodeInjectBoot
+	url = https://github.com/lelecz/BytecodeInjectBoot.git
+	branch = main

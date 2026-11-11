@@ -8,7 +8,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,45 +71,53 @@ jobs:
           git config user.name  "lelecz"
           git config user.email "lelecz@users.noreply.github.com"
 
-          # 移除旧的平铺结构（保持 README / .github）
           for old in NapCatQQ SnowLuma NapCatQQ-Desktop NapCat-Installer NapCat-Termux \
-                     LiteLoader-NapCatExample BytecodeInjectBoot; do
+                     LiteLoader-NapCatExample BytecodeInjectBoot \
+                     01-core 02-client 03-deploy 04-plugins 05-native 06-tools 07-docs; do
             git rm -r --cached --quiet "$old" >/dev/null 2>&1 || true
             rm -rf "$old"
           done
-          for d in 01-core 02-client 03-deploy 04-plugins 05-native 06-tools 07-docs; do
-            git rm -r --cached --quiet "$d" >/dev/null 2>&1 || true
-            rm -rf "$d"
-          done
           rm -f .gitmodules
           mkdir -p /tmp/src
+          OK=0; EMPTY=0
+
+          clone_one() {  # $1=repo  -> echo 来源
+            local r="$1" out="/tmp/src/$1"
+            rm -rf "$out"
+            for src in "lelecz" "NapNeko" "TomyJan"; do
+              if git clone --depth 1 --single-branch -q \
+                   "https://x-access-token:${GH_PAT}@github.com/${src}/${r}.git" "$out" 2>/dev/null; then
+                echo "$src"; return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
 
           while read -r dest repo; do
             [ -z "${dest:-}" ] && continue
             echo "::group::$repo -> $dest"
-            rm -rf "/tmp/src/$repo"
-            if git clone --depth 1 --single-branch -q \
-                 "https://x-access-token:${GH_PAT}@github.com/lelecz/${repo}.git" "/tmp/src/$repo" 2>/dev/null; then
+            if src=$(clone_one "$repo"); then
               mkdir -p "$dest"
               cp -a "/tmp/src/$repo/." "$dest/"
               rm -rf "$dest/.git"
-              echo "ok: $(find "$dest" -type f | wc -l) files"
+              echo "ok [$src]: $(find "$dest" -type f | wc -l) files"
+              OK=$((OK+1))
             else
               mkdir -p "$dest"
-              printf '# %s\n\n上游为空仓库（无 Git 内容），此处仅占位。\n\n源：https://github.com/NapNeko/%s\n' "$repo" "$repo" > "$dest/README.md"
-              echo "::warning::$repo 为空仓库，已占位"
+              printf '# %s\n\n上游为空仓库（无 Git 内容）或克隆失败，此处仅占位。\n\n源：https://github.com/NapNeko/%s\n' "$repo" "$repo" > "$dest/README.md"
+              echo "::warning::$repo 无内容，已占位"
+              EMPTY=$((EMPTY+1))
             fi
             echo "::endgroup::"
           done <<< "$MAP"
 
-          # 大文件预警
           BIG=$(find . -path ./.git -prune -o -type f -size +95M -print | head -20)
-          [ -n "$BIG" ] && echo "::warning::超过 95MB 的文件: $BIG"
+          [ -n "$BIG" ] && echo "::warning::超过 95MB: $BIG"
 
           git add -A -f
-          echo "staged: $(git diff --cached --name-only | wc -l) files"
-          git commit -q -m "feat: NapCat 全生态分类合并（7 大类，$(echo "$MAP" | wc -l) 个项目）" || echo "nothing to commit"
+          echo "staged: $(git diff --cached --name-only | wc -l) files | 成功 $OK / 占位 $EMPTY"
+          git commit -q -m "feat: NapCat 全生态七大分类合并（48 个项目）" || echo "nothing to commit"
           git push -q origin HEAD:main
           echo "PUSHED $(git rev-parse --short HEAD)"
-          echo "=== 各分类体积 ==="
-          du -sh 0*/ 2>/dev/null | sort -k2
+          echo "=== 分类体积 ==="; du -sh 0*/ | sort -k2

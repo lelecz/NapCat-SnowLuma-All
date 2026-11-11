@@ -12,6 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          submodules: false
 
       - name: 平铺合并 7 个仓库
         env:
@@ -27,20 +28,17 @@ jobs:
             rm -rf "/tmp/src/$r"
             git clone --depth 1 --single-branch -q \
               "https://x-access-token:${GH_PAT}@github.com/lelecz/${r}.git" "/tmp/src/$r"
-            rm -rf "$r"
+            git rm -r --cached --quiet "$r" > /dev/null 2>&1 || true
+            rm -rf "$r" ".git/modules/$r"
             mkdir -p "$r"
             cp -a "/tmp/src/$r/." "$r/"
             rm -rf "$r/.git"
             echo "::endgroup::"
           done
           rm -f .gitmodules
-          git add -A
-          if git diff --cached --quiet; then
-            echo "NO_CHANGE"
-          else
-            git commit -q -m "feat: 平铺合并 NapCat / SnowLuma 全生态（7 个项目，单一仓库）"
-            git push -q origin HEAD:main
-            echo "PUSHED $(git rev-parse --short HEAD)"
-          fi
-          echo "=== 结果目录 ==="
-          du -sh */ | sort -h
+          git add -A -f
+          echo "staged files: $(git diff --cached --name-only | wc -l)"
+          git commit -q -m "feat: 平铺合并 NapCat / SnowLuma 全生态（7 个项目，单一仓库）" || echo "nothing to commit"
+          git push -q origin HEAD:main
+          echo "PUSHED $(git rev-parse --short HEAD)"
+          du -sh */

@@ -1,0 +1,1836 @@
+//! SnowLumaComponent:SnowLuma framework tarball 部署组件
+//!
+//! 对齐 legacy install_snowluma.sh.j2 L300-L360 的安装步骤
+//!
+//! 安装流程:
+//! 1. 下载官方 tarball（完整包自带 node，lite 需外置 Node；GitHub + 国内镜像）
+//! 2. 上传到 <workspace_dir>/<FRAMEWORK_FILENAME>
+//! 3. tar -xzf $ARCHIVE -C $SNOWLUMA_DIR --strip-components=1(注意 strip-components=1)
+//! 4. 校验 $SNOWLUMA_DIR/index.mjs 存在
+//!
+//! 路径约定(对齐 legacy):
+//! - WORKSPACE_DIR:$HOME/Napcat/snowluma-workspace(上层注入)
+//! - SNOWLUMA_DIR:<workspace>/snowluma(framework 解压根)
+//! - 入口文件:<snowluma_dir>/index.mjs
+//!
+//! 镜像 fallback:与 legacy 完全一致,GitHub 直连 + 6 个国内镜像
+//! (gh.ddlc.top / gh-proxy.com / ghfast.top / cors.isteed.cc /
+//! ghproxy.cc / github.akams.cn)
+
+use async_trait::async_trait;
+
+use ncd_domain::SnowLumaLinuxPackage;
+use ncd_host::{Host, HostCommand, HostError, HostPath, Locality, Os};
+
+use crate::context::{ActionCtx, ProgressKind};
+use crate::download::DownloadHelper;
+use crate::error::ActionError;
+use crate::requirement::Requirement;
+use crate::traits::Component;
+use crate::types::{ComponentId, DetectedVersion, LaunchArgs, VerifyReport};
+
+pub use ncd_network::DEFAULT_MIRROR_PREFIXES;
+
+/// SnowLuma 部署模式
+///
+/// Linux 走官方 tar.gz + tar 解压（完整包自带 node；lite 由安装时选择并编排 Node）,
+/// Windows 走 SnowLuma-<tag>-win-x64.zip 扁平 zip 解压(legacy
+/// SnowLumaInstall),node.exe / index.mjs / package.json 三件套直
+/// 接落在 install_dir 根下
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlatformMode {
+    Linux,
+    Windows,
+}
+
+/// SnowLuma framework component 配置
+#[derive(Debug, Clone)]
+pub struct SnowLumaComponent {
+    /// SnowLuma 的工作目录(workspace dir),如 $HOME/Napcat/snowluma-workspace
+    pub workspace_dir: HostPath,
+    /// framework 解压根(默认 <workspace>/snowluma)
+    pub snowluma_dir: HostPath,
+    /// GitHub release URL(直连形式),如
+    /// https://github.com/SnowLuma/SnowLuma/releases/download/v1.14.13/SnowLuma-v1.14.13-linux-x64.tar.gz
+    pub framework_url: String,
+    /// 为空时使用 Desktop 的下载线路设置。
+    pub mirror_prefixes: Vec<String>,
+    /// 期望 SHA256(可选)
+    pub expected_sha256: Option<String>,
+    /// Desktop 预上传的 tarball 路径(可选,优先复用,跳过下载)
+    pub preloaded_tarball: Option<HostPath>,
+    /// 平台模式,决定 detect / install / verify 走 Linux tarball 还是
+    /// Windows zip 路径
+    mode: PlatformMode,
+    /// 完整包 (内置 Node) 还是精简包 (外置 Node)
+    pub package: SnowLumaLinuxPackage,
+    /// Windows 模式下的 release tag(如 v1.7.5),Linux 模式下为 None
+    /// 用于:1) 探测 install_dir 下的 .installed_tag 是否一致;
+    /// 2) install 完成后写回 .installed_tag(对齐 legacy
+    /// SnowLumaInstall.write_installed_tag)
+    windows_tag: Option<String>,
+    /// 主 snowluma_dir 没有入口时再探这些目录（系统包 / 上次库存路径）
+    extra_detect_dirs: Vec<HostPath>,
+}
+
+impl SnowLumaComponent {
+    /// Lite 包对外置 Node 的要求,对齐上游 `check-node-version.cjs`。
+    /// 全仓唯一字面量;Node 组件自己不知道这个范围,由本组件的依赖边带过去
+    pub const NODE_VERSION_RANGE: &'static str = "^22.13.0 || >=23.4.0";
+
+    /// 创建一个 Linux framework component 描述（URL 由调用方决定完整包或 lite）
+    /// workspace_dir:SL workspace 根;snowluma_dir:framework 解压根
+    pub fn new(workspace_dir: HostPath, framework_url: impl Into<String>) -> Self {
+        let snowluma_dir = workspace_dir.join("snowluma");
+        Self {
+            workspace_dir,
+            snowluma_dir,
+            framework_url: framework_url.into(),
+            mirror_prefixes: Vec::new(),
+            expected_sha256: None,
+            preloaded_tarball: None,
+            mode: PlatformMode::Linux,
+            package: SnowLumaLinuxPackage::Lite,
+            windows_tag: None,
+            extra_detect_dirs: Vec::new(),
+        }
+    }
+
+    /// 创建 Windows 扁平 zip 部署的 SnowLuma component(legacy
+    /// SnowLumaInstall 同款)
+    pub fn for_windows(install_dir: HostPath, tag: impl Into<String>) -> Self {
+        Self::for_windows_with_package(install_dir, tag, SnowLumaLinuxPackage::Full)
+    }
+
+    pub fn for_windows_with_package(
+        install_dir: HostPath,
+        tag: impl Into<String>,
+        package: SnowLumaLinuxPackage,
+    ) -> Self {
+        let tag_str = tag.into();
+        let asset_suffix = match package {
+            SnowLumaLinuxPackage::Full => "-win-x64.zip",
+            SnowLumaLinuxPackage::Lite => "-win-x64-lite.zip",
+        };
+        let url = format!(
+            "https://github.com/SnowLuma/SnowLuma/releases/download/{tag}/SnowLuma-{tag}{suffix}",
+            tag = tag_str,
+            suffix = asset_suffix
+        );
+        Self {
+            workspace_dir: install_dir.clone(),
+            snowluma_dir: install_dir,
+            framework_url: url,
+            mirror_prefixes: Vec::new(),
+            expected_sha256: None,
+            preloaded_tarball: None,
+            mode: PlatformMode::Windows,
+            package,
+            windows_tag: if tag_str.is_empty() {
+                None
+            } else {
+                Some(tag_str)
+            },
+            extra_detect_dirs: Vec::new(),
+        }
+    }
+
+    pub fn with_package(mut self, package: SnowLumaLinuxPackage) -> Self {
+        self.package = package;
+        self
+    }
+
+    pub fn with_snowluma_dir(mut self, dir: HostPath) -> Self {
+        self.snowluma_dir = dir;
+        self
+    }
+
+    pub fn with_extra_detect_dir(mut self, dir: HostPath) -> Self {
+        if dir != self.snowluma_dir && !self.extra_detect_dirs.iter().any(|p| p == &dir) {
+            self.extra_detect_dirs.push(dir);
+        }
+        self
+    }
+
+    pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.expected_sha256 = Some(sha256.into());
+        self
+    }
+
+    pub fn with_mirror_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.mirror_prefixes = prefixes;
+        self
+    }
+
+    pub fn with_preloaded_tarball(mut self, path: HostPath) -> Self {
+        self.preloaded_tarball = Some(path);
+        self
+    }
+
+    /// 入口文件:
+    /// - Linux 模式:<snowluma_dir>/index.mjs(lite tarball 解压根)
+    /// - Windows 模式:<install_dir>/index.mjs(扁平 zip 解压根,
+    ///   snowluma_dir == install_dir)
+    pub fn entry_path(&self) -> HostPath {
+        self.snowluma_dir.join("index.mjs")
+    }
+
+    /// Windows 安装根下的 node.exe(legacy SnowLuma release 自带 portable Node)
+    fn node_exe_path(&self) -> HostPath {
+        self.snowluma_dir.join("node.exe")
+    }
+
+    /// Windows / Linux 都会有的 package.json(SnowLuma release 自带)
+    /// detect 在 .installed_tag 缺失时走它的 version 字段 fallback
+    fn package_json_path(&self) -> HostPath {
+        self.snowluma_dir.join("package.json")
+    }
+
+    /// Windows install 完成后写 + detect 优先读的 tag 文件
+    /// (legacy SnowLumaInstall.write_installed_tag)
+    fn installed_tag_path(&self) -> HostPath {
+        self.snowluma_dir.join(".installed_tag")
+    }
+
+    fn mirror_urls(&self) -> Vec<String> {
+        if self.mirror_prefixes.is_empty() {
+            ncd_network::build_mirror_urls(&self.framework_url, None)
+        } else {
+            let prefixes: Vec<_> = self.mirror_prefixes.iter().map(String::as_str).collect();
+            ncd_network::build_mirror_urls(&self.framework_url, Some(&prefixes))
+        }
+    }
+
+    /// 组件元数据,给 list_components Tauri command 使用
+    pub fn info() -> crate::types::ComponentInfo {
+        crate::types::ComponentInfo {
+            id: ComponentId::SnowLuma,
+            display_name: "SnowLuma".to_string(),
+            description: "带 QQ 窗口的协议端".to_string(),
+            // 仓库已关闭，不再提供公开下载入口
+            repo_url: None,
+            supported_targets: vec![
+                crate::types::SupportedTarget::new(Os::Windows, Locality::Local),
+                crate::types::SupportedTarget::new(Os::Windows, Locality::Remote),
+                crate::types::SupportedTarget::new(Os::Linux, Locality::Local),
+                crate::types::SupportedTarget::new(Os::Linux, Locality::Remote),
+            ],
+            category: crate::types::ComponentCategory::Framework,
+            uninstall: crate::types::UninstallSupport::Supported,
+        }
+    }
+}
+
+#[async_trait]
+impl Component for SnowLumaComponent {
+    fn id(&self) -> ComponentId {
+        ComponentId::SnowLuma
+    }
+
+    fn supported_targets(&self) -> &'static [(Os, Locality)] {
+        // SnowLuma 在 Linux 走 lite tarball 注入,Windows 走扁平 zip 解压
+        // (legacy SnowLumaInstall),Windows 远端不支持(没有用例)
+        &[
+            (Os::Windows, Locality::Local),
+            (Os::Windows, Locality::Remote),
+            (Os::Linux, Locality::Local),
+            (Os::Linux, Locality::Remote),
+        ]
+    }
+
+    fn requirements(&self, os: Os, locality: Locality) -> Vec<Requirement> {
+        let mut reqs = Vec::new();
+        if os == Os::Windows && locality == Locality::Remote {
+            reqs.push(Requirement::component(ComponentId::WindowsAgent));
+        }
+        // 完整包自带 node;只有 lite 才要外置 Node,版本按上游脚本
+        if self.package == SnowLumaLinuxPackage::Lite {
+            reqs.push(Requirement::component_version(
+                ComponentId::NodeJs,
+                Self::NODE_VERSION_RANGE,
+            ));
+        }
+        reqs.push(Requirement::component(ComponentId::Qq));
+        if os == Os::Linux {
+            // 远端无显示器,QQ 扫码登录靠 noVNC 看画面
+            if locality == Locality::Remote {
+                reqs.push(Requirement::component(ComponentId::NoVnc));
+            }
+            reqs.push(Requirement::host_command("tar", "tar"));
+        }
+        reqs
+    }
+
+    async fn detect(&self, host: &dyn Host) -> Result<Option<DetectedVersion>, ActionError> {
+        match self.mode {
+            PlatformMode::Linux => self.detect_linux(host).await,
+            PlatformMode::Windows => self.detect_windows(host).await,
+        }
+    }
+
+    async fn install(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        self.check_target(host)?;
+        match host.os() {
+            Os::Windows => self.install_windows(host, ctx).await,
+            _ => self.install_linux(host, ctx).await,
+        }
+    }
+
+    async fn uninstall(&self, host: &dyn Host, _ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        match host.os() {
+            Os::Windows => self.uninstall_windows(host).await,
+            _ => self.uninstall_linux(host).await,
+        }
+    }
+
+    async fn verify(&self, host: &dyn Host) -> Result<VerifyReport, ActionError> {
+        match host.os() {
+            Os::Windows => self.verify_windows(host).await,
+            _ => self.verify_linux(host).await,
+        }
+    }
+
+    fn launch_command(
+        &self,
+        _host: &dyn Host,
+        args: &LaunchArgs,
+    ) -> Result<HostCommand, ActionError> {
+        // 启动命令:node <snowluma_dir>/index.mjs
+        // 实际 daemon 可能用绝对 node 路径(node 由 NodeJsComponent 装在 workspace/node/),
+        // 这里只给基础命令,daemon 拼装层会替换 node 路径
+        Ok(self.launch_command_inner(args))
+    }
+}
+
+// Linux / Windows 分支实装(独立 impl block 拆分关注点)
+
+impl SnowLumaComponent {
+    /// Linux detect:先确认入口 <snowluma_dir>/index.mjs 存在,再尝试从
+    /// 同目录的 package.json 读 version 字段拿真实版本号;缺 package.json
+    /// 或字段时回退到 "installed" 占位(lite tarball 旧版本可能没有)
+    async fn detect_linux(&self, host: &dyn Host) -> Result<Option<DetectedVersion>, ActionError> {
+        if let Some(found) = self
+            .detect_linux_at(&self.snowluma_dir, host, false)
+            .await?
+        {
+            return Ok(Some(found));
+        }
+        for dir in &self.extra_detect_dirs {
+            if let Some(found) = self.detect_linux_at(dir, host, true).await? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn detect_linux_at(
+        &self,
+        dir: &HostPath,
+        host: &dyn Host,
+        require_fingerprint: bool,
+    ) -> Result<Option<DetectedVersion>, ActionError> {
+        let entry = dir.join("index.mjs");
+        if !host.exists(&entry).await? {
+            return Ok(None);
+        }
+        for name in ["client", "native"] {
+            if !host.exists(&dir.join(name)).await? {
+                return Ok(None);
+            }
+        }
+        if self.package == SnowLumaLinuxPackage::Full
+            && !host.exists(&dir.join("node")).await?
+            && !host.exists(&dir.join("node/bin/node")).await?
+        {
+            return Ok(None);
+        }
+        let pkg = dir.join("package.json");
+        let package_read = host.read_file(&pkg).await;
+        let package = package_read
+            .as_ref()
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+        let has_package_identity = package
+            .as_ref()
+            .and_then(|json| json.get("name"))
+            .and_then(|name| name.as_str())
+            == Some("@snowluma/runtime");
+        // 首次启动才生成 config；发布包名称即可识别新安装，旧包仍兼容配置指纹。
+        if require_fingerprint && !has_package_identity {
+            let has_webui = host
+                .exists(&dir.join("config").join("webui.json"))
+                .await
+                .unwrap_or(false);
+            let runtime = dir.join("config").join("runtime.json");
+            let has_port = if host.exists(&runtime).await.unwrap_or(false) {
+                host.read_file(&runtime)
+                    .await
+                    .ok()
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                    .is_some_and(|s| s.contains("webuiPort"))
+            } else {
+                false
+            };
+            if !has_webui && !has_port {
+                return Ok(None);
+            }
+        }
+        if let Err(error) = package_read {
+            match error {
+                HostError::PathNotFound { .. } => {}
+                error => return Err(ActionError::Host(error)),
+            }
+        }
+
+        if let Some(version) = package
+            .as_ref()
+            .and_then(|json| json.get("version"))
+            .and_then(|version| version.as_str())
+        {
+            return Ok(Some(DetectedVersion {
+                version: version.to_string(),
+                source: format!("{pkg}"),
+            }));
+        }
+
+        Ok(Some(DetectedVersion {
+            version: "installed".to_string(),
+            source: format!("{entry}"),
+        }))
+    }
+
+    /// Linux verify:校验 entry + client/ + native/(legacy lite tarball 应有)
+    async fn verify_linux(&self, host: &dyn Host) -> Result<VerifyReport, ActionError> {
+        let root = self
+            .detect_linux(host)
+            .await?
+            .and_then(|v| {
+                v.source
+                    .rsplit_once('/')
+                    .map(|(root, _)| HostPath::from_posix(root))
+            })
+            .unwrap_or_else(|| self.snowluma_dir.clone());
+        let entry = root.join("index.mjs");
+        let entry_exists = host.exists(&entry).await?;
+        let mut report = VerifyReport::ok().with_check(
+            "framework entry exists (index.mjs)",
+            entry_exists,
+            Some(format!("{entry}")),
+        );
+        for sub in &["client", "native"] {
+            let path = root.join(*sub);
+            let exists = host.exists(&path).await.unwrap_or(false);
+            report = report.with_check(
+                format!("subdir {sub} exists"),
+                exists,
+                Some(format!("{path}")),
+            );
+        }
+        if self.package == SnowLumaLinuxPackage::Full {
+            let direct = root.join("node");
+            let nested = direct.join("bin/node");
+            let node = if host.exists(&nested).await? {
+                nested
+            } else {
+                direct
+            };
+            let version = crate::nodejs::probe_node_raw_version(host, &node).await?;
+            let required = [crate::requirement::VersionReq::semver(
+                Self::NODE_VERSION_RANGE,
+            )];
+            report = report.with_check(
+                "bundled Node runs and satisfies requirements",
+                version
+                    .as_ref()
+                    .is_some_and(|v| crate::requirement::all_versions_match(&required, v)),
+                version,
+            );
+        }
+        Ok(report)
+    }
+
+    /// Linux install(原 install 实装,挪到独立方法以便 trait install 按 host.os 分发)
+    async fn install_linux(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        ctx.emit(ProgressKind::Started { total_steps: 3 }).await;
+        ctx.info(format!(
+            "准备安装 SnowLuma 到 {}",
+            self.snowluma_dir.as_posix()
+        ))
+        .await;
+
+        host.create_dir_all(&self.workspace_dir).await?;
+        host.create_dir_all(&self.snowluma_dir).await?;
+
+        // tarball 在远端的目标路径(优先用 preloaded,否则放 workspace_dir 下)
+        let archive_filename = self
+            .framework_url
+            .rsplit('/')
+            .next()
+            .unwrap_or("snowluma.tar.gz");
+        let remote_archive = self.workspace_dir.join(archive_filename);
+        ctx.info(format!(
+            "SnowLuma tarball 目标路径: {}",
+            remote_archive.as_posix()
+        ))
+        .await;
+
+        // Step 1:获取 tarball(优先 preloaded,fallback 到镜像下载)
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: "obtain framework tarball".into(),
+        })
+        .await;
+
+        let mut have_archive = false;
+        if let Some(preloaded) = &self.preloaded_tarball {
+            if host.exists(preloaded).await? {
+                ctx.info(format!("reusing preloaded tarball: {preloaded}"))
+                    .await;
+                if preloaded.as_posix() != remote_archive.as_posix() {
+                    // 复制 / 移动到目标位置
+                    ctx.info(format!("复制预置 tarball 到 {}", remote_archive.as_posix()))
+                        .await;
+                    let cmd = HostCommand::new("cp")
+                        .arg(preloaded.as_posix())
+                        .arg(remote_archive.as_posix());
+                    let out = host.run_to_string(cmd).await?;
+                    if !out.success() {
+                        return Err(ActionError::install_step(
+                            "copy_preloaded",
+                            format!("exit={:?} stderr={}", out.exit_code, out.stderr.trim()),
+                        ));
+                    }
+                }
+                have_archive = true;
+            }
+        }
+        if !have_archive && host.exists(&remote_archive).await? {
+            ctx.info(format!("reusing existing tarball: {remote_archive}"))
+                .await;
+            have_archive = true;
+        }
+
+        if !have_archive {
+            // 走镜像 fallback:本机下载 → 上传
+            let helper = DownloadHelper::new()?;
+            let local_tmp = ctx.download_path(format!(
+                "ncd-snowluma-{}-{}.tar.gz",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ))?;
+
+            let mirrors = self.mirror_urls();
+            ctx.info(format!(
+                "准备下载 SnowLuma tarball，候选镜像 {} 个",
+                mirrors.len()
+            ))
+            .await;
+            helper
+                .download_with_mirrors(
+                    &mirrors,
+                    &local_tmp,
+                    self.expected_sha256.as_deref(),
+                    ctx,
+                    1,
+                )
+                .await?;
+            // 上传前验本地文件确实是 gzip(magic 1f 8b)
+            // 没传 sha256 时(release 快照缺失),这是唯一的内容闸:URL 拼错 / 镜像代理返回 404 HTML 页时,这里直接
+            // 报人话错误,而不是把 HTML 当 tar.gz 传上去让远端 tar 报 "not in gzip format"
+            verify_gzip_magic(&local_tmp)
+                .await
+                .map_err(|reason| ActionError::install_step("verify_download", reason))?;
+            ctx.info("SnowLuma tarball gzip 校验通过").await;
+            host.upload(&local_tmp, &remote_archive).await?;
+            ctx.info(format!(
+                "SnowLuma tarball 已上传到 {}",
+                remote_archive.as_posix()
+            ))
+            .await;
+            let _ = tokio::fs::remove_file(&local_tmp).await;
+        }
+        if have_archive {
+            if let Some(expected) = &self.expected_sha256 {
+                crate::host_download::verify_remote_sha256(host, &remote_archive, expected).await?;
+            }
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+
+        // Step 2:tar 解压 + strip-components=1
+        ctx.emit(ProgressKind::StepBegin {
+            step: 2,
+            message: "extract framework tarball".into(),
+        })
+        .await;
+        let stage = self
+            .snowluma_dir
+            .parent()
+            .ok_or_else(|| ActionError::other("SnowLuma 安装目录无父目录"))?
+            .join(format!(
+                ".ncd-snowluma-new-{}",
+                crate::windows_install::nonce()
+            ));
+        host.create_dir_all(&stage).await?;
+        // ncd-host::extract_archive 不支持 strip-components,直接走 tar 命令
+        ctx.info(format!(
+            "解压 SnowLuma tarball 到 {}",
+            self.snowluma_dir.as_posix()
+        ))
+        .await;
+        let cmd = HostCommand::new("tar")
+            .arg("-xzf")
+            .arg(remote_archive.as_posix())
+            .arg("-C")
+            .arg(stage.as_posix())
+            .arg("--strip-components=1");
+        let out = host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(ActionError::install_step(
+                "tar_extract",
+                format!("exit={:?} stderr={}", out.exit_code, out.stderr.trim()),
+            ));
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 2, ok: true }).await;
+
+        // Step 3:校验 entry 存在
+        ctx.emit(ProgressKind::StepBegin {
+            step: 3,
+            message: "verify framework entry".into(),
+        })
+        .await;
+        let mut staged = self.clone().with_snowluma_dir(stage.clone());
+        staged.extra_detect_dirs.clear();
+        let report = staged.verify_linux(host).await?;
+        if !report.ok {
+            let _ = host.remove_dir_all(&stage).await;
+            return Err(ActionError::install_step(
+                "verify_framework",
+                format!("SnowLuma 发行包不完整或无法运行：{:?}", report.checks),
+            ));
+        }
+        for name in ["config", "data"] {
+            let source = self.snowluma_dir.join(name);
+            if host.exists(&source).await? {
+                let target = stage.join(name);
+                if host.exists(&target).await? {
+                    host.remove_dir_all(&target).await?;
+                }
+                let output = host
+                    .run_to_string(HostCommand::new("cp").args([
+                        "-a",
+                        source.as_posix(),
+                        target.as_posix(),
+                    ]))
+                    .await?;
+                if !output.success() {
+                    return Err(ActionError::install_step("preserve_data", output.stderr));
+                }
+            }
+        }
+        if host.exists(&self.snowluma_dir).await? {
+            host.remove_dir_all(&self.snowluma_dir).await?;
+        }
+        host.rename(&stage, &self.snowluma_dir).await?;
+        ctx.info(format!("SnowLuma 安装产物已验证: {}", self.snowluma_dir))
+            .await;
+        ctx.emit(ProgressKind::StepEnd { step: 3, ok: true }).await;
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    /// Windows detect:优先读 .installed_tag(与 legacy 对齐);次选
+    /// package.json 的 version 字段;Full 模式下校验 node.exe
+    async fn detect_windows(
+        &self,
+        host: &dyn Host,
+    ) -> Result<Option<DetectedVersion>, ActionError> {
+        let entry = self.entry_path();
+        let pkg = self.package_json_path();
+        let node = self.node_exe_path();
+        // entry 与 package.json 必须在
+        if !host.exists(&entry).await? || !host.exists(&pkg).await? {
+            return Ok(None);
+        }
+        if self.package == SnowLumaLinuxPackage::Full && !host.exists(&node).await? {
+            return Ok(None);
+        }
+
+        // 优先 .installed_tag
+        let tag_path = self.installed_tag_path();
+        if host.exists(&tag_path).await? {
+            if let Ok(bytes) = host.read_file(&tag_path).await {
+                let tag = String::from_utf8_lossy(&bytes).trim().to_string();
+                if !tag.is_empty() {
+                    // 与 release_snapshot::ReleaseInfo.version(strip_v_prefix)
+                    // 对齐:UI 直接拿来跟 latest 字符串相等比较时不会因为 v
+                    // 前缀差异误报 "有更新",.installed_tag 文件本身保留
+                    // 原样 tag(含 v),兼容 legacy SnowLumaInstall
+                    let normalized = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+                    return Ok(Some(DetectedVersion {
+                        version: normalized,
+                        source: format!("{tag_path}"),
+                    }));
+                }
+            }
+        }
+
+        // fallback: package.json::version
+        if let Ok(bytes) = host.read_file(&pkg).await {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(v) = json.get("version").and_then(|x| x.as_str()) {
+                    if !v.is_empty() {
+                        return Ok(Some(DetectedVersion {
+                            version: v.to_string(),
+                            source: format!("{pkg}"),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 核心文件齐了但版本都没解析出 → 标 unknown,UI 仍可显示"已安装"
+        Ok(Some(DetectedVersion {
+            version: "unknown".to_string(),
+            source: format!("{entry} (no .installed_tag, package.json missing version)"),
+        }))
+    }
+
+    /// Windows verify:校验核心产物 + 版本号
+    async fn verify_windows(&self, host: &dyn Host) -> Result<VerifyReport, ActionError> {
+        let entry = self.entry_path();
+        let pkg = self.package_json_path();
+        let node = self.node_exe_path();
+
+        let mut report = VerifyReport::ok()
+            .with_check(
+                "index.mjs exists",
+                host.exists(&entry).await?,
+                Some(format!("{entry}")),
+            )
+            .with_check(
+                "package.json exists",
+                host.exists(&pkg).await?,
+                Some(format!("{pkg}")),
+            );
+
+        if self.package == SnowLumaLinuxPackage::Full {
+            report = report.with_check(
+                "node.exe exists",
+                host.exists(&node).await?,
+                Some(format!("{node}")),
+            );
+        }
+
+        if let Ok(Some(v)) = self.detect(host).await {
+            report = report.with_check(
+                "snowluma version detected",
+                v.version != "unknown",
+                Some(format!("version={}", v.version)),
+            );
+        }
+        Ok(report)
+    }
+
+    /// Windows install(对齐 legacy SnowLumaInstall):
+    /// 1) 下载 SnowLuma-<tag>-win-x64.zip 到本地临时目录(走镜像 fallback);
+    /// 2) 上传到 host(本机 = copy);
+    /// 3) extract_archive 到 install_dir,保留 config/ data/ 现有文件;
+    ///    Windows 端 ncd-host 的 zip 解压不支持 strip-components,所以包装目录
+    ///    的剥离由本方法在解压后做(legacy _detect_wrapper_prefix);
+    /// 4) verify entry / node.exe / package.json 三件套;
+    /// 5) 写 .installed_tag 让后续 detect 锁定版本号
+    ///
+    /// 不做 legacy 的 _init_or_update_password(那是 webui 密码同步,
+    /// 属于 ncd-runtime 的 SnowLuma daemon 编排,不在 ncd-component 边界)
+    async fn install_windows(
+        &self,
+        host: &dyn Host,
+        ctx: &mut ActionCtx,
+    ) -> Result<(), ActionError> {
+        let remote_windows = host.locality() == Locality::Remote;
+        crate::windows_install::require_x64(host, "SnowLuma")?;
+        if remote_windows {
+            crate::windows_install::recover(host, &self.snowluma_dir).await?;
+        }
+        let tag = self.windows_tag.as_deref().ok_or_else(|| {
+            ActionError::install_step(
+                "snowluma_windows_install",
+                "missing release tag; 调用方应用 SnowLumaComponent::for_windows(install_dir, tag) 提供 tag",
+            )
+        })?;
+
+        ctx.emit(ProgressKind::Started { total_steps: 5 }).await;
+        ctx.info(format!(
+            "准备安装 Windows SnowLuma {tag} 到 {}",
+            self.snowluma_dir.as_posix()
+        ))
+        .await;
+
+        let stage_dir = if remote_windows {
+            let parent = self
+                .snowluma_dir
+                .parent()
+                .ok_or_else(|| ActionError::other("SnowLuma 安装目录无父目录"))?;
+            host.create_dir_all(&parent).await?;
+            parent.join(format!(
+                ".ncd-snowluma-stage-{}",
+                crate::windows_install::nonce()
+            ))
+        } else {
+            host.create_dir_all(&self.snowluma_dir).await?;
+            self.snowluma_dir
+                .join(format!("_stage-{}", std::process::id()))
+        };
+        // 任何残留 stage 都先清掉
+        let _ = host.remove_dir_all(&stage_dir).await;
+        host.create_dir_all(&stage_dir).await?;
+
+        // Step 1:下载 zip(镜像 fallback)
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: format!("download SnowLuma-{tag}-win-x64.zip"),
+        })
+        .await;
+
+        let helper = DownloadHelper::new()?;
+        let local_tmp = ctx.download_path(format!(
+            "ncd-snowluma-win-{}-{}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ))?;
+
+        let mirrors = self.mirror_urls();
+        ctx.info(format!(
+            "准备下载 SnowLuma zip，候选镜像 {} 个",
+            mirrors.len()
+        ))
+        .await;
+        if let Err(e) = helper
+            .download_with_mirrors(
+                &mirrors,
+                &local_tmp,
+                self.expected_sha256.as_deref(),
+                ctx,
+                1,
+            )
+            .await
+        {
+            let _ = host.remove_dir_all(&stage_dir).await;
+            return Err(e);
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+
+        // Step 2:上传到 host stage
+        ctx.emit(ProgressKind::StepBegin {
+            step: 2,
+            message: "stage zip on host".into(),
+        })
+        .await;
+        let remote_zip = stage_dir.join("snowluma.zip");
+        host.upload(&local_tmp, &remote_zip).await?;
+        ctx.info(format!("SnowLuma zip 已暂存到 {}", remote_zip.as_posix()))
+            .await;
+        let _ = tokio::fs::remove_file(&local_tmp).await;
+        ctx.emit(ProgressKind::StepEnd { step: 2, ok: true }).await;
+
+        // Step 3:解压 + 探测包装目录 + 复制到 install_dir(保留 config/data)
+        ctx.emit(ProgressKind::StepBegin {
+            step: 3,
+            message: "extract zip (preserve config/ data/)".into(),
+        })
+        .await;
+        let extract_root = stage_dir.join("extracted");
+        host.create_dir_all(&extract_root).await?;
+        ctx.info(format!("解压 SnowLuma zip 到 {}", extract_root.as_posix()))
+            .await;
+        host.extract_archive(&remote_zip, &extract_root, ncd_host::ArchiveKind::Zip)
+            .await?;
+        let payload_root = self
+            .resolve_extracted_payload_root(host, &extract_root)
+            .await?;
+        ctx.info(format!(
+            "SnowLuma payload 根目录: {}",
+            payload_root.as_posix()
+        ))
+        .await;
+        if remote_windows {
+            let required: &[&str] = if self.package == SnowLumaLinuxPackage::Full {
+                &["index.mjs", "node.exe", "package.json"]
+            } else {
+                &["index.mjs", "package.json"]
+            };
+            for name in required {
+                if !host.exists(&payload_root.join(name)).await? {
+                    return Err(ActionError::other(format!("SnowLuma 发行包缺少 {name}")));
+                }
+            }
+            crate::windows_install::replace(
+                host,
+                &self.snowluma_dir,
+                &payload_root,
+                &["config", "data"],
+            )
+            .await?;
+        } else {
+            self.copy_extracted_into_install(host, &payload_root)
+                .await?;
+        }
+        let _ = host.remove_dir_all(&stage_dir).await;
+        ctx.info("SnowLuma 文件已复制，临时目录已清理").await;
+        ctx.emit(ProgressKind::StepEnd { step: 3, ok: true }).await;
+
+        // Step 4:校验安装产物
+        ctx.emit(ProgressKind::StepBegin {
+            step: 4,
+            message: "verify install artifacts".into(),
+        })
+        .await;
+        let required_files: &[&str] = match self.package {
+            SnowLumaLinuxPackage::Full => &["index.mjs", "node.exe", "package.json"],
+            SnowLumaLinuxPackage::Lite => &["index.mjs", "package.json"],
+        };
+        for required in required_files {
+            let p = self.snowluma_dir.join(*required);
+            if !host.exists(&p).await? {
+                return Err(ActionError::install_step(
+                    "snowluma_verify_artifact",
+                    format!("missing required file after extract: {p}"),
+                ));
+            }
+        }
+        ctx.info("SnowLuma 安装产物已验证").await;
+        ctx.emit(ProgressKind::StepEnd { step: 4, ok: true }).await;
+
+        // Step 5:写 .installed_tag
+        ctx.emit(ProgressKind::StepBegin {
+            step: 5,
+            message: "write .installed_tag".into(),
+        })
+        .await;
+        host.write_file(&self.installed_tag_path(), tag.as_bytes())
+            .await?;
+        ctx.info(format!("已写入 SnowLuma 安装标记: {tag}")).await;
+        ctx.emit(ProgressKind::StepEnd { step: 5, ok: true }).await;
+
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    /// 探测解压根下是否存在唯一一层包装目录(SnowLuma-vX-win-x64/),是则返回
+    /// 该子目录,否则返回 extract_root 自身,等价于 legacy
+    /// _detect_wrapper_prefix 的纯文件系统版
+    async fn resolve_extracted_payload_root(
+        &self,
+        host: &dyn Host,
+        extract_root: &HostPath,
+    ) -> Result<HostPath, ActionError> {
+        let entries = host.list_dir(extract_root).await?;
+        // 只有一个 entry 且为目录 → 视为包装目录
+        if entries.len() == 1 && entries[0].is_dir {
+            return Ok(extract_root.join(&entries[0].name));
+        }
+        Ok(extract_root.clone())
+    }
+
+    /// 把 payload_root 下所有内容复制到 install_dir,跳过 install_dir 下已有的
+    /// config/ data/(legacy 同款,保留用户运行期数据)
+    async fn copy_extracted_into_install(
+        &self,
+        host: &dyn Host,
+        payload_root: &HostPath,
+    ) -> Result<(), ActionError> {
+        host.create_dir_all(&self.snowluma_dir).await?;
+        copy_tree(host, payload_root, &self.snowluma_dir, &["config", "data"]).await
+    }
+
+    /// Linux uninstall:删 snowluma_dir(lite tarball 解压根)
+    /// 保留 workspace_dir 父目录——daemon 数据 / config / runtime / log
+    /// 都在 workspace 但不属于 framework,由用户自行清理
+    async fn uninstall_linux(&self, host: &dyn Host) -> Result<(), ActionError> {
+        if host.exists(&self.snowluma_dir).await? {
+            host.remove_dir_all(&self.snowluma_dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Windows uninstall:删 install_dir 下除 config/ data/ 外所有文件和目录,
+    /// 包括 .installed_tag(让后续 detect 必须靠新 install 写回)
+    async fn uninstall_windows(&self, host: &dyn Host) -> Result<(), ActionError> {
+        if !host.exists(&self.snowluma_dir).await? {
+            return Ok(());
+        }
+        let entries = match host.list_dir(&self.snowluma_dir).await {
+            Ok(es) => es,
+            Err(HostError::PathNotFound { .. }) => return Ok(()),
+            Err(e) => return Err(ActionError::Host(e)),
+        };
+        for entry in entries {
+            if entry.is_dir && (entry.name == "config" || entry.name == "data") {
+                continue;
+            }
+            let target = self.snowluma_dir.join(&entry.name);
+            let result = if entry.is_dir {
+                host.remove_dir_all(&target).await
+            } else {
+                host.remove_file(&target).await
+            };
+            if let Err(HostError::PathNotFound { .. }) = result {
+                continue;
+            }
+            result.map_err(ActionError::Host)?;
+        }
+        Ok(())
+    }
+
+    fn launch_command_inner(&self, args: &LaunchArgs) -> HostCommand {
+        let cmd = HostCommand::new("node").arg(self.entry_path().as_posix());
+        let mut cmd = args.apply_to(cmd);
+        // apply_to 只在 args.working_dir 为 Some 时设;snowluma 需 fallback 到 snowluma_dir
+        if args.working_dir.is_none() {
+            cmd = cmd.working_dir(self.snowluma_dir.clone());
+        }
+        cmd
+    }
+}
+
+/// 递归复制 src 目录树到 dst,保留 dst 下名字落在 preserve_top_level 列表
+/// 中的"顶层"目录已有内容(legacy SnowLumaInstall.unzip_file 同款语义,但
+/// 仅适用于 Linux/Windows 双平台都能跑通的 Host trait 文件操作)
+///
+/// 保留规则只看顶层(直接挂在 install_dir 下),深层同名子目录正常覆盖
+async fn copy_tree(
+    host: &dyn Host,
+    src_root: &HostPath,
+    dst_root: &HostPath,
+    preserve_top_level: &[&str],
+) -> Result<(), ActionError> {
+    let mut stack: Vec<(HostPath, HostPath, bool)> =
+        vec![(src_root.clone(), dst_root.clone(), true)];
+    while let Some((src, dst, is_top)) = stack.pop() {
+        let entries = host.list_dir(&src).await?;
+        for entry in entries {
+            let src_child = src.join(&entry.name);
+            let dst_child = dst.join(&entry.name);
+            if entry.is_dir {
+                // 顶层 + 在保留名单 + dst 已存在 → 整树跳过
+                if is_top
+                    && preserve_top_level.contains(&entry.name.as_str())
+                    && host.exists(&dst_child).await?
+                {
+                    continue;
+                }
+                host.create_dir_all(&dst_child).await?;
+                stack.push((src_child, dst_child, false));
+            } else {
+                // 文件:read 全部到内存再 write,避免依赖 host 的 cp 命令(Windows
+                // 没 cp,Linux 上 host.run_to_string("cp ...") 依赖 shell)
+                let bytes = host.read_file(&src_child).await?;
+                host.write_file(&dst_child, &bytes).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 校验本地文件确实是 gzip(开头 magic 1f 8b),下载层没传 sha256 时这是唯一能
+/// 拦住"假 tar.gz"(404 HTML 页 / 损坏文件 / 镜像代理错误页)的内容闸,读不到文件
+/// 或开头不对都返回人话错误,让上层在上传前就拦下,而不是把垃圾传到远端让 tar 报
+/// "not in gzip format" 这种天书
+async fn verify_gzip_magic(path: &std::path::Path) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("打开下载文件失败: {e}"))?;
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic)
+        .await
+        .map_err(|_| "下载文件过小或为空,可能是下载失败或返回了错误页".to_string())?;
+    if magic == [0x1f, 0x8b] {
+        Ok(())
+    } else {
+        Err(format!(
+            "下载内容不是 gzip 归档(开头字节 {:02x} {:02x},期望 1f 8b)。多半是下载 URL \
+             失效返回了 HTML 错误页,请检查 SnowLuma release 是否可达后重试",
+            magic[0], magic[1]
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comp() -> SnowLumaComponent {
+        SnowLumaComponent::new(
+            HostPath::from_posix("/home/test/Napcat/snowluma-workspace"),
+            "https://github.com/SnowLuma/SnowLuma/releases/download/v1.2.3/SnowLuma-v1.2.3-linux-x64-lite.tar.gz",
+        )
+    }
+
+    #[tokio::test]
+    async fn gzip_magic_accepts_real_gzip_header() {
+        // 1f 8b 打头 = 合法 gzip,放行
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ok.tar.gz");
+        tokio::fs::write(&p, [0x1f, 0x8b, 0x08, 0x00])
+            .await
+            .unwrap();
+        assert!(verify_gzip_magic(&p).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gzip_magic_rejects_html_error_page() {
+        // 404 错误页常以 "<!DOCTYPE" / "<html" 开头(0x3c ...),不是 gzip,必须拦
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fake.tar.gz");
+        tokio::fs::write(&p, b"<!DOCTYPE html><html>404</html>")
+            .await
+            .unwrap();
+        assert!(verify_gzip_magic(&p).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn gzip_magic_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty.tar.gz");
+        tokio::fs::write(&p, b"").await.unwrap();
+        assert!(verify_gzip_magic(&p).await.is_err());
+    }
+
+    #[test]
+    fn paths_default_layout() {
+        let c = comp();
+        assert_eq!(
+            c.workspace_dir.as_posix(),
+            "/home/test/Napcat/snowluma-workspace"
+        );
+        assert_eq!(
+            c.snowluma_dir.as_posix(),
+            "/home/test/Napcat/snowluma-workspace/snowluma"
+        );
+        assert_eq!(
+            c.entry_path().as_posix(),
+            "/home/test/Napcat/snowluma-workspace/snowluma/index.mjs"
+        );
+    }
+
+    #[test]
+    fn id_returns_snowluma_framework() {
+        assert_eq!(comp().id(), ComponentId::SnowLuma);
+    }
+
+    #[test]
+    fn supported_targets_includes_linux_and_windows_local() {
+        let c = comp();
+        assert!(
+            c.supported_targets()
+                .contains(&(Os::Linux, Locality::Local))
+        );
+        assert!(
+            c.supported_targets()
+                .contains(&(Os::Linux, Locality::Remote))
+        );
+        assert!(
+            c.supported_targets()
+                .contains(&(Os::Windows, Locality::Local))
+        );
+    }
+
+    // 依赖边只在这里声明;Lite 才要 Node,远端 Linux 才要 noVNC,Linux 装包要 tar
+    #[test]
+    fn requirements_follow_package_and_target() {
+        let node = Requirement::component_version(
+            ComponentId::NodeJs,
+            SnowLumaComponent::NODE_VERSION_RANGE,
+        );
+        let qq = Requirement::component(ComponentId::Qq);
+        let novnc = Requirement::component(ComponentId::NoVnc);
+        let tar = Requirement::host_command("tar", "tar");
+
+        let full = comp().with_package(SnowLumaLinuxPackage::Full);
+        assert_eq!(
+            full.requirements(Os::Linux, Locality::Remote),
+            vec![qq.clone(), novnc.clone(), tar.clone()]
+        );
+        assert_eq!(
+            full.requirements(Os::Linux, Locality::Local),
+            vec![qq.clone(), tar.clone()]
+        );
+
+        let lite = comp().with_package(SnowLumaLinuxPackage::Lite);
+        assert_eq!(
+            lite.requirements(Os::Linux, Locality::Remote),
+            vec![node.clone(), qq.clone(), novnc, tar]
+        );
+
+        let win_full = SnowLumaComponent::for_windows(HostPath::from_windows(r"C:\sl"), "v1");
+        assert_eq!(
+            win_full.requirements(Os::Windows, Locality::Local),
+            vec![qq.clone()]
+        );
+        let win_lite = win_full.with_package(SnowLumaLinuxPackage::Lite);
+        assert_eq!(
+            win_lite.requirements(Os::Windows, Locality::Local),
+            vec![node, qq]
+        );
+    }
+
+    #[test]
+    fn mirror_urls_first_is_direct() {
+        let c = comp();
+        let urls = c.mirror_urls();
+        assert!(urls.len() >= 7);
+        // 第一个是直连(空前缀)
+        assert_eq!(urls[0], c.framework_url);
+        // 第二个开始是镜像
+        assert!(urls[1].starts_with("https://gh.ddlc.top/"));
+        assert!(urls[1].ends_with("SnowLuma-v1.2.3-linux-x64-lite.tar.gz"));
+    }
+
+    #[test]
+    fn mirror_urls_no_trailing_slash_collision() {
+        // 即使前缀末尾带 /,拼出的 URL 也只有一个 /
+        let c = SnowLumaComponent::new(
+            HostPath::from_posix("/x"),
+            "https://github.com/foo/bar.tar.gz",
+        )
+        .with_mirror_prefixes(vec![
+            "".to_string(),
+            "https://mirror1.example.com/".to_string(),
+            "https://mirror2.example.com".to_string(),
+        ]);
+        let urls = c.mirror_urls();
+        assert_eq!(urls[0], "https://github.com/foo/bar.tar.gz");
+        assert_eq!(
+            urls[1],
+            "https://mirror1.example.com/https://github.com/foo/bar.tar.gz"
+        );
+        assert_eq!(
+            urls[2],
+            "https://mirror2.example.com/https://github.com/foo/bar.tar.gz"
+        );
+    }
+
+    #[test]
+    fn with_snowluma_dir_overrides() {
+        let c = comp().with_snowluma_dir(HostPath::from_posix("/custom/snowluma"));
+        assert_eq!(c.snowluma_dir.as_posix(), "/custom/snowluma");
+        assert_eq!(c.entry_path().as_posix(), "/custom/snowluma/index.mjs");
+    }
+
+    #[test]
+    fn extra_detect_dir_skips_primary() {
+        let c = comp().with_extra_detect_dir(HostPath::from_posix(
+            "/home/test/Napcat/snowluma-workspace/snowluma",
+        ));
+        assert!(c.extra_detect_dirs.is_empty());
+        let c = comp().with_extra_detect_dir(HostPath::from_posix("/opt/snowluma"));
+        assert_eq!(c.extra_detect_dirs.len(), 1);
+        assert_eq!(c.extra_detect_dirs[0].as_posix(), "/opt/snowluma");
+    }
+
+    mod linux_detection {
+        use super::*;
+        use bytes::Bytes;
+        use ncd_host::{
+            Arch, ArchiveKind, CommandOutput, DirEntry, HostProcess, HostShell, shell::BashShell,
+        };
+        use std::collections::HashMap;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DetectHost {
+            files: HashMap<&'static str, &'static [u8]>,
+            denied_package: Option<&'static str>,
+            package_reads: AtomicUsize,
+            config_checks: AtomicUsize,
+        }
+
+        impl DetectHost {
+            fn new(files: &[(&'static str, &'static [u8])]) -> Self {
+                Self {
+                    files: files.iter().copied().collect(),
+                    denied_package: None,
+                    package_reads: AtomicUsize::new(0),
+                    config_checks: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Host for DetectHost {
+            fn os(&self) -> Os {
+                Os::Linux
+            }
+            fn arch(&self) -> Arch {
+                Arch::X86_64
+            }
+            fn locality(&self) -> Locality {
+                Locality::Remote
+            }
+            fn id(&self) -> &str {
+                "snowluma-detect-test"
+            }
+            fn shell(&self) -> &dyn HostShell {
+                &BashShell
+            }
+            async fn exists(&self, path: &HostPath) -> Result<bool, HostError> {
+                if path.as_posix().contains("/config/") {
+                    self.config_checks.fetch_add(1, Ordering::SeqCst);
+                }
+                if let Some((root, name)) = path.as_posix().rsplit_once('/') {
+                    if matches!(name, "client" | "native") {
+                        return Ok(self
+                            .files
+                            .contains_key(format!("{root}/index.mjs").as_str()));
+                    }
+                }
+                Ok(self.files.contains_key(path.as_posix()))
+            }
+            async fn read_file(&self, path: &HostPath) -> Result<Bytes, HostError> {
+                if path.as_posix().ends_with("/package.json") {
+                    self.package_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                if self.denied_package == Some(path.as_posix()) {
+                    return Err(HostError::PermissionDenied {
+                        path: path.clone(),
+                        operation: "read",
+                    });
+                }
+                self.files
+                    .get(path.as_posix())
+                    .map(|contents| Bytes::from_static(contents))
+                    .ok_or_else(|| HostError::PathNotFound { path: path.clone() })
+            }
+            async fn write_file(&self, _: &HostPath, _: &[u8]) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn create_dir_all(&self, _: &HostPath) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn list_dir(&self, _: &HostPath) -> Result<Vec<DirEntry>, HostError> {
+                unreachable!()
+            }
+            async fn remove_file(&self, _: &HostPath) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn remove_dir_all(&self, _: &HostPath) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn upload(&self, _: &Path, _: &HostPath) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn download(&self, _: &HostPath, _: &Path) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn extract_archive(
+                &self,
+                _: &HostPath,
+                _: &HostPath,
+                _: ArchiveKind,
+            ) -> Result<(), HostError> {
+                unreachable!()
+            }
+            async fn run_to_string(&self, _: HostCommand) -> Result<CommandOutput, HostError> {
+                unreachable!()
+            }
+            async fn spawn(&self, _: HostCommand) -> Result<Box<dyn HostProcess>, HostError> {
+                unreachable!()
+            }
+        }
+
+        fn component() -> SnowLumaComponent {
+            comp().with_extra_detect_dir(HostPath::from_posix("/opt/snowluma"))
+        }
+
+        #[tokio::test]
+        async fn extra_directory_detects_fresh_package_without_runtime_config() {
+            let host = DetectHost::new(&[
+                ("/opt/snowluma/index.mjs", b"entry"),
+                (
+                    "/opt/snowluma/package.json",
+                    br#"{"name":"@snowluma/runtime","version":"2.2.5"}"#,
+                ),
+            ]);
+            let detected = component().detect(&host).await.unwrap().unwrap();
+            assert_eq!(detected.version, "2.2.5");
+            assert_eq!(detected.source, "/opt/snowluma/package.json");
+            assert_eq!(host.package_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(host.config_checks.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn extra_directory_requires_entry_even_with_package_and_config() {
+            let host = DetectHost::new(&[
+                (
+                    "/opt/snowluma/package.json",
+                    br#"{"name":"@snowluma/runtime","version":"2.2.5"}"#,
+                ),
+                ("/opt/snowluma/config/webui.json", b"{}"),
+            ]);
+            assert!(component().detect(&host).await.unwrap().is_none());
+            assert_eq!(host.package_reads.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn extra_directory_rejects_unrelated_and_invalid_packages_without_config() {
+            for package in [
+                br#"{"name":"other-runtime","version":"2.2.5"}"#.as_slice(),
+                br#"{"name":"@snowluma/runtime-tools","version":"2.2.5"}"#.as_slice(),
+                br#"{"description":"@snowluma/runtime"}"#.as_slice(),
+                b"invalid-json".as_slice(),
+                b"{}".as_slice(),
+            ] {
+                let host = DetectHost::new(&[
+                    ("/opt/snowluma/index.mjs", b"entry"),
+                    ("/opt/snowluma/package.json", package),
+                ]);
+                assert!(component().detect(&host).await.unwrap().is_none());
+            }
+            let host = DetectHost::new(&[("/opt/snowluma/index.mjs", b"entry")]);
+            assert!(component().detect(&host).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn extra_directory_keeps_version_fallback_for_identified_package() {
+            let host = DetectHost::new(&[
+                ("/opt/snowluma/index.mjs", b"entry"),
+                (
+                    "/opt/snowluma/package.json",
+                    br#"{"name":"@snowluma/runtime"}"#,
+                ),
+            ]);
+            let detected = component().detect(&host).await.unwrap().unwrap();
+            assert_eq!(detected.version, "installed");
+            assert_eq!(detected.source, "/opt/snowluma/index.mjs");
+        }
+
+        #[tokio::test]
+        async fn extra_directory_skips_unidentified_unreadable_package_before_valid_candidate() {
+            let mut host = DetectHost::new(&[
+                ("/custom/unrelated/index.mjs", b"entry"),
+                ("/opt/snowluma/index.mjs", b"entry"),
+                (
+                    "/opt/snowluma/package.json",
+                    br#"{"name":"@snowluma/runtime","version":"2.2.5"}"#,
+                ),
+            ]);
+            host.denied_package = Some("/custom/unrelated/package.json");
+            let component = comp()
+                .with_extra_detect_dir(HostPath::from_posix("/custom/unrelated"))
+                .with_extra_detect_dir(HostPath::from_posix("/opt/snowluma"));
+            assert_eq!(
+                component.detect(&host).await.unwrap().unwrap().source,
+                "/opt/snowluma/package.json"
+            );
+        }
+
+        #[tokio::test]
+        async fn extra_directory_propagates_package_error_after_legacy_fingerprint_matches() {
+            let mut host = DetectHost::new(&[
+                ("/opt/snowluma/index.mjs", b"entry"),
+                ("/opt/snowluma/config/webui.json", b"{}"),
+            ]);
+            host.denied_package = Some("/opt/snowluma/package.json");
+            assert!(matches!(
+                component().detect(&host).await,
+                Err(ActionError::Host(HostError::PermissionDenied { .. }))
+            ));
+        }
+
+        #[tokio::test]
+        async fn extra_directory_accepts_legacy_webui_config_without_package() {
+            let host = DetectHost::new(&[
+                ("/opt/snowluma/index.mjs", b"entry"),
+                ("/opt/snowluma/config/webui.json", b"{}"),
+            ]);
+            assert_eq!(
+                component().detect(&host).await.unwrap().unwrap().version,
+                "installed"
+            );
+        }
+
+        #[tokio::test]
+        async fn extra_directory_accepts_legacy_runtime_config_and_reads_package_once() {
+            let host = DetectHost::new(&[
+                ("/opt/snowluma/index.mjs", b"entry"),
+                ("/opt/snowluma/package.json", br#"{"version":"1.7.5"}"#),
+                (
+                    "/opt/snowluma/config/runtime.json",
+                    br#"{"webuiPort":15123}"#,
+                ),
+            ]);
+            assert_eq!(
+                component().detect(&host).await.unwrap().unwrap().version,
+                "1.7.5"
+            );
+            assert_eq!(host.package_reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn default_mirror_count_matches_legacy() {
+        // 7 = 1 直连 + 6 镜像(legacy install_snowluma.sh.j2 L325-L331)
+        assert_eq!(DEFAULT_MIRROR_PREFIXES.len(), 7);
+        assert_eq!(DEFAULT_MIRROR_PREFIXES[0], "");
+        assert!(DEFAULT_MIRROR_PREFIXES.contains(&"https://gh-proxy.com"));
+        assert!(DEFAULT_MIRROR_PREFIXES.contains(&"https://github.akams.cn"));
+    }
+
+    #[test]
+    fn preloaded_tarball_can_be_set() {
+        let c = comp().with_preloaded_tarball(HostPath::from_posix("/preload/snowluma.tar.gz"));
+        assert_eq!(
+            c.preloaded_tarball.unwrap().as_posix(),
+            "/preload/snowluma.tar.gz"
+        );
+    }
+
+    // Windows 模式纯结构断言(任意平台都能跑,不依赖真文件系统)
+
+    #[test]
+    fn windows_constructor_uses_flat_install_dir() {
+        let c = SnowLumaComponent::for_windows(
+            HostPath::from_windows(r"C:\ProgramData\NapCatQQ Desktop\runtime\SnowLuma"),
+            "v1.7.5",
+        );
+        assert!(matches!(c.mode, PlatformMode::Windows));
+        // 扁平模式下三件套直接落在 install_dir 根下,无 snowluma/ 子目录嵌套
+        let win = ncd_host::PathStyle::Windows;
+        assert_eq!(
+            c.entry_path().render(win),
+            r"C:\ProgramData\NapCatQQ Desktop\runtime\SnowLuma\index.mjs"
+        );
+        assert_eq!(
+            c.node_exe_path().render(win),
+            r"C:\ProgramData\NapCatQQ Desktop\runtime\SnowLuma\node.exe"
+        );
+        assert_eq!(
+            c.package_json_path().render(win),
+            r"C:\ProgramData\NapCatQQ Desktop\runtime\SnowLuma\package.json"
+        );
+        assert_eq!(c.windows_tag.as_deref(), Some("v1.7.5"));
+    }
+
+    #[test]
+    fn windows_constructor_default_url_format() {
+        let c = SnowLumaComponent::for_windows(HostPath::from_posix("/x"), "v1.7.5");
+        assert_eq!(
+            c.framework_url,
+            "https://github.com/SnowLuma/SnowLuma/releases/download/v1.7.5/SnowLuma-v1.7.5-win-x64.zip"
+        );
+    }
+
+    #[test]
+    fn windows_constructor_with_empty_tag_keeps_none() {
+        // 空 tag 用例:UI 只想 detect / verify 时不强制提供 tag,install 路径会
+        // 在调用时拒绝并报清晰错误
+        let c = SnowLumaComponent::for_windows(HostPath::from_posix("/x"), "");
+        assert!(matches!(c.mode, PlatformMode::Windows));
+        assert!(c.windows_tag.is_none());
+    }
+
+    #[test]
+    fn linux_constructor_keeps_workspace_layout() {
+        // 回归:Linux 默认 entry 仍嵌套在 workspace/snowluma/ 下
+        let c = comp();
+        assert!(matches!(c.mode, PlatformMode::Linux));
+        assert_eq!(
+            c.entry_path().as_posix(),
+            "/home/test/Napcat/snowluma-workspace/snowluma/index.mjs"
+        );
+    }
+
+    #[test]
+    fn info_lists_windows_local_in_supported_targets() {
+        let info = SnowLumaComponent::info();
+        assert!(
+            info.supported_targets
+                .iter()
+                .any(|t| t.os == Os::Windows && t.locality == Locality::Local)
+        );
+    }
+
+    // Windows 本机端到端测试(只在 Windows 上编译)
+
+    #[cfg(windows)]
+    mod windows_e2e {
+        use super::*;
+        use ncd_host::local::LocalWindowsHost;
+
+        fn windows_path(workspace: &tempfile::TempDir, sub: &str) -> HostPath {
+            let full = workspace.path().join(sub);
+            HostPath::from_windows(full.to_str().unwrap())
+        }
+
+        async fn write_file(host: &LocalWindowsHost, path: &HostPath, body: &[u8]) {
+            host.write_file(path, body).await.expect("write_file");
+        }
+
+        async fn lay_out_release(
+            host: &LocalWindowsHost,
+            install: &HostPath,
+            tag_file: Option<&str>,
+            pkg_version: &str,
+        ) {
+            host.create_dir_all(install).await.unwrap();
+            write_file(host, &install.join("index.mjs"), b"// snowluma entry").await;
+            write_file(host, &install.join("node.exe"), b"\x4d\x5a fake-pe").await;
+            let pkg = format!(r#"{{"name":"snowluma","version":"{pkg_version}"}}"#);
+            write_file(host, &install.join("package.json"), pkg.as_bytes()).await;
+            if let Some(tag) = tag_file {
+                write_file(host, &install.join(".installed_tag"), tag.as_bytes()).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn detect_returns_none_when_three_files_missing() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            let comp = SnowLumaComponent::for_windows(install, "v1.7.5");
+            assert!(comp.detect(&host).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn detect_prefers_installed_tag_over_package_json() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            // .installed_tag 写 v1.7.5,package.json 写 1.7.4(不一致),
+            // detect 必须取 .installed_tag,返回值的 v 前缀已剥(UI 直接跟
+            // ReleaseInfo.version 比较)
+            lay_out_release(&host, &install, Some("v1.7.5"), "1.7.4").await;
+
+            let comp = SnowLumaComponent::for_windows(install.clone(), "v1.7.5");
+            let v = comp.detect(&host).await.unwrap().expect("已装应返回 Some");
+            assert_eq!(v.version, "1.7.5");
+            assert!(v.source.contains(".installed_tag"));
+        }
+
+        #[tokio::test]
+        async fn detect_falls_back_to_package_json_when_tag_missing() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            lay_out_release(&host, &install, None, "1.7.4").await;
+
+            let comp = SnowLumaComponent::for_windows(install, "v1.7.5");
+            let v = comp.detect(&host).await.unwrap().expect("已装应返回 Some");
+            assert_eq!(v.version, "1.7.4");
+            assert!(v.source.contains("package.json"));
+        }
+
+        #[tokio::test]
+        async fn detect_returns_unknown_when_both_version_sources_absent() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            host.create_dir_all(&install).await.unwrap();
+            write_file(&host, &install.join("index.mjs"), b"e").await;
+            write_file(&host, &install.join("node.exe"), b"n").await;
+            // package.json 没有 version 字段
+            write_file(&host, &install.join("package.json"), b"{}").await;
+
+            let comp = SnowLumaComponent::for_windows(install, "v1.7.5");
+            let v = comp
+                .detect(&host)
+                .await
+                .unwrap()
+                .expect("三件套齐应返回 Some");
+            assert_eq!(v.version, "unknown");
+        }
+
+        #[tokio::test]
+        async fn verify_reports_three_artifacts_and_version() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            lay_out_release(&host, &install, Some("v1.7.5"), "1.7.5").await;
+
+            let comp = SnowLumaComponent::for_windows(install, "v1.7.5");
+            let report = comp.verify(&host).await.unwrap();
+            assert!(report.ok);
+            for needle in &["index.mjs", "node.exe", "package.json", "version"] {
+                assert!(
+                    report.checks.iter().any(|c| c.name.contains(needle)),
+                    "缺少 check 包含 {needle:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn uninstall_preserves_config_and_data() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            lay_out_release(&host, &install, Some("v1.7.5"), "1.7.5").await;
+            // 用户运行期数据
+            write_file(&host, &install.join("config/runtime.json"), b"user").await;
+            write_file(&host, &install.join("data/100200/messages.db"), b"db").await;
+
+            let comp = SnowLumaComponent::for_windows(install.clone(), "v1.7.5");
+            let (mut ctx, _rx) = ActionCtx::new();
+            comp.uninstall(&host, &mut ctx).await.unwrap();
+
+            // 三件套清掉
+            assert!(!host.exists(&install.join("index.mjs")).await.unwrap());
+            assert!(!host.exists(&install.join("node.exe")).await.unwrap());
+            assert!(!host.exists(&install.join("package.json")).await.unwrap());
+            assert!(!host.exists(&install.join(".installed_tag")).await.unwrap());
+            // config / data 整树保留
+            let cfg = host
+                .read_file(&install.join("config/runtime.json"))
+                .await
+                .unwrap();
+            assert_eq!(cfg.as_ref(), b"user");
+            let db = host
+                .read_file(&install.join("data/100200/messages.db"))
+                .await
+                .unwrap();
+            assert_eq!(db.as_ref(), b"db");
+        }
+
+        #[tokio::test]
+        async fn uninstall_is_noop_when_dir_missing() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "never");
+            let comp = SnowLumaComponent::for_windows(install, "v1.7.5");
+            let (mut ctx, _rx) = ActionCtx::new();
+            comp.uninstall(&host, &mut ctx).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn copy_extracted_keeps_existing_config_and_data() {
+            // 直接打 copy_extracted_into_install,模拟 install_windows 的 step 3:
+            // 解压后从 stage 复制到 install_dir,但 install_dir 下已有 config/data
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            host.create_dir_all(&install).await.unwrap();
+            // install_dir 已有用户运行期产物
+            write_file(&host, &install.join("config/runtime.json"), b"user").await;
+            write_file(&host, &install.join("data/100200/messages.db"), b"old").await;
+
+            // payload(模拟 zip 解压结果),含同名 config/ data/
+            let payload = windows_path(&ws, "stage/payload");
+            host.create_dir_all(&payload).await.unwrap();
+            write_file(&host, &payload.join("index.mjs"), b"new").await;
+            write_file(&host, &payload.join("node.exe"), b"new").await;
+            write_file(
+                &host,
+                &payload.join("package.json"),
+                br#"{"version":"1.7.5"}"#,
+            )
+            .await;
+            // 包内 config / data 默认值 —— 不应覆盖用户运行期数据
+            write_file(&host, &payload.join("config/runtime.json"), b"default").await;
+            write_file(&host, &payload.join("data/100200/messages.db"), b"shipped").await;
+
+            let comp = SnowLumaComponent::for_windows(install.clone(), "v1.7.5");
+            comp.copy_extracted_into_install(&host, &payload)
+                .await
+                .unwrap();
+
+            // 三件套来自 payload(用 b"new" / 1.7.5 区分)
+            let mjs = host.read_file(&install.join("index.mjs")).await.unwrap();
+            assert_eq!(mjs.as_ref(), b"new");
+            let pkg = host.read_file(&install.join("package.json")).await.unwrap();
+            assert!(String::from_utf8_lossy(&pkg).contains("1.7.5"));
+            // config / data 保留用户值
+            let cfg = host
+                .read_file(&install.join("config/runtime.json"))
+                .await
+                .unwrap();
+            assert_eq!(cfg.as_ref(), b"user");
+            let db = host
+                .read_file(&install.join("data/100200/messages.db"))
+                .await
+                .unwrap();
+            assert_eq!(db.as_ref(), b"old");
+        }
+
+        #[tokio::test]
+        async fn copy_extracted_creates_config_and_data_when_absent() {
+            // 首次安装(install_dir 下无任何文件):config / data 该走默认值
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            let payload = windows_path(&ws, "stage/payload");
+            host.create_dir_all(&payload).await.unwrap();
+            write_file(&host, &payload.join("index.mjs"), b"e").await;
+            write_file(&host, &payload.join("config/runtime.json"), b"default").await;
+
+            let comp = SnowLumaComponent::for_windows(install.clone(), "v1.7.5");
+            comp.copy_extracted_into_install(&host, &payload)
+                .await
+                .unwrap();
+
+            let cfg = host
+                .read_file(&install.join("config/runtime.json"))
+                .await
+                .unwrap();
+            assert_eq!(cfg.as_ref(), b"default");
+        }
+
+        #[tokio::test]
+        async fn resolve_payload_root_strips_single_wrapper() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let extracted = windows_path(&ws, "extracted");
+            host.create_dir_all(&extracted.join("SnowLuma-v1.7.5-win-x64"))
+                .await
+                .unwrap();
+            write_file(
+                &host,
+                &extracted.join("SnowLuma-v1.7.5-win-x64/index.mjs"),
+                b"e",
+            )
+            .await;
+
+            let comp = SnowLumaComponent::for_windows(windows_path(&ws, "snowluma"), "v1.7.5");
+            let payload = comp
+                .resolve_extracted_payload_root(&host, &extracted)
+                .await
+                .unwrap();
+            assert!(payload.as_posix().ends_with("/SnowLuma-v1.7.5-win-x64"));
+        }
+
+        #[tokio::test]
+        async fn resolve_payload_root_keeps_flat_zip_root() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let extracted = windows_path(&ws, "extracted");
+            host.create_dir_all(&extracted).await.unwrap();
+            write_file(&host, &extracted.join("index.mjs"), b"e").await;
+            write_file(&host, &extracted.join("node.exe"), b"n").await;
+            write_file(&host, &extracted.join("package.json"), b"{}").await;
+
+            let comp = SnowLumaComponent::for_windows(windows_path(&ws, "snowluma"), "v1.7.5");
+            let payload = comp
+                .resolve_extracted_payload_root(&host, &extracted)
+                .await
+                .unwrap();
+            // 扁平 zip:返回 extract_root 自身
+            assert_eq!(payload.as_posix(), extracted.as_posix());
+        }
+
+        #[tokio::test]
+        async fn install_windows_rejects_missing_tag() {
+            let host = LocalWindowsHost::new();
+            let ws = tempfile::tempdir().unwrap();
+            let install = windows_path(&ws, "snowluma");
+            let comp = SnowLumaComponent::for_windows(install, "");
+            let (mut ctx, _rx) = ActionCtx::new();
+            let err = comp.install(&host, &mut ctx).await.unwrap_err();
+            assert!(format!("{err}").contains("missing release tag"));
+        }
+    }
+}

@@ -1,0 +1,15 @@
+//! 远端会话：Docker 隧道、日志 follow、runtime 会话表、安装库存。
+
+pub mod bot_log_follow;
+pub mod docker_session;
+mod docker_webui_token;
+pub mod import_network;
+pub mod importable_bots;
+pub mod inventory;
+pub(crate) mod runtime_sessions;
+
+pub use bot_log_follow::RemoteBotLogFollowRegistry;
+pub use docker_session::{
+    DockerBotSessionRegistry, SnowLumaDockerEndpoints, is_remote_docker_config,
+    is_remote_native_napcat_config,
+};

@@ -1,0 +1,192 @@
+import { useEffect, useMemo } from 'react';
+import { RefreshCw } from 'lucide-react';
+import { clampRemoteHostHealthProbeIntervalMs } from '../../../core/domain/remote-host/healthProbeSettings';
+import { Button, NumberField, Select, Switch } from '../../../shared/ui';
+import { useLocalNodeCandidates } from '../../../hooks/settings/useLocalNodeCandidates';
+import { localOs } from '../../../core/domain/runtime/env';
+import type { SettingsDraft } from '../settings-draft';
+import { McpSection } from './McpSection';
+import {
+    FieldRow,
+    RemoteHostHealthProbeIntervalSlider,
+    SettingsSection,
+    SettingsTabSections,
+} from '../_shared';
+
+interface Props {
+    draft: SettingsDraft | null;
+    patchDraft: (patch: Partial<SettingsDraft>) => void;
+}
+
+export function RuntimeTab({ draft, patchDraft }: Props) {
+    const isLinux = localOs() === 'linux';
+    const { candidates, probing, probeComplete, reprobe } = useLocalNodeCandidates();
+
+    const configuredNode = draft?.snowlumaNodePath?.trim() ?? '';
+    const configuredNodeIsValid = candidates.some(
+        (candidate) => candidate.path.toLowerCase() === configuredNode.toLowerCase(),
+    );
+
+    useEffect(() => {
+        if (!probeComplete || !configuredNode || configuredNodeIsValid) return;
+        patchDraft({ snowlumaNodePath: null });
+    }, [configuredNode, configuredNodeIsValid, patchDraft, probeComplete]);
+
+    const nodeSelectItems = useMemo(() => {
+        const items = [{ value: '__auto__', label: '自动选择（默认优先级）' }];
+        for (const cand of candidates) {
+            items.push({
+                value: cand.path,
+                label: `${cand.label} — ${cand.path}`,
+            });
+        }
+        return items;
+    }, [candidates]);
+
+    const currentNodeValue = configuredNodeIsValid ? configuredNode : '__auto__';
+
+    if (!draft) {
+        return <p className="text-[13px] text-text-tertiary">正在加载设置…</p>;
+    }
+
+    return (
+        <SettingsTabSections>
+            <McpSection draft={draft} patchDraft={patchDraft} />
+            <SettingsSection title="Bot 与登录">
+                <FieldRow
+                    label="登录检查间隔"
+                    description="已登录时轮询 NapCat WebUI；未登录时固定 1 秒。1000–60000 毫秒"
+                    isLast
+                >
+                    <BackendNumber
+                        value={draft.botLoginCheckIntervalMs}
+                        min={1000}
+                        max={60000}
+                        step={500}
+                        onChange={(v) => patchDraft({ botLoginCheckIntervalMs: v })}
+                        suffix="ms"
+                    />
+                </FieldRow>
+            </SettingsSection>
+
+            <SettingsSection
+                title="SnowLuma 运行环境"
+                description="SnowLuma 启动所用 Node.js，需 ^22.13.0 || >=23.4.0"
+            >
+                <FieldRow
+                    label="Node.js 运行环境"
+                    description="默认按内置 > Node.js 组件 > 系统 PATH 选择"
+                    isLast
+                >
+                    <div className="flex items-center gap-2 max-w-md w-full">
+                        <div className="flex-1 min-w-0">
+                            <Select
+                                items={nodeSelectItems}
+                                value={currentNodeValue}
+                                onValueChange={(val) => {
+                                    patchDraft({
+                                        snowlumaNodePath: val === '__auto__' ? null : val,
+                                    });
+                                }}
+                            />
+                        </div>
+                        <Button
+                            variant="secondary"
+                            size="sm"
+                            disabled={probing}
+                            onClick={reprobe}
+                            title="重新探测本机环境"
+                        >
+                            <RefreshCw size={13} className={probing ? 'animate-spin' : ''} />
+                        </Button>
+                    </div>
+                </FieldRow>
+            </SettingsSection>
+
+            <SettingsSection
+                title="远程主机"
+                description="后台低频探测已连接的远端主机，失败时标记并通知；默认 30 秒一次"
+            >
+                <FieldRow
+                    label="启用后台探活"
+                    description="关闭后不再主动探测；已有失败状态保留至下次成功连接或手动测试"
+                >
+                    <Switch
+                        checked={draft.remoteHostHealthProbeEnabled}
+                        onCheckedChange={(v) => patchDraft({ remoteHostHealthProbeEnabled: v })}
+                    />
+                </FieldRow>
+
+                <FieldRow label="探活间隔" isLast>
+                    <RemoteHostHealthProbeIntervalSlider
+                        value={draft.remoteHostHealthProbeIntervalMs}
+                        onChange={(v) =>
+                            patchDraft({
+                                remoteHostHealthProbeIntervalMs:
+                                    clampRemoteHostHealthProbeIntervalMs(v),
+                            })
+                        }
+                        disabled={!draft.remoteHostHealthProbeEnabled}
+                    />
+                </FieldRow>
+            </SettingsSection>
+
+            {isLinux && (
+                <SettingsSection
+                    title="界面渲染（Linux）"
+                    description="修改后需重启 NapCatQQ Desktop 生效。"
+                >
+                    <FieldRow
+                        label="WebView 硬件加速"
+                        description="关闭时使用 WebKitGTK 兼容渲染，规避部分显卡 / 桌面组合下的黑屏、闪烁；在 4K、高刷新率或开启缩放时关闭会明显掉帧。确认当前环境显示正常后再打开。"
+                        isLast
+                    >
+                        <Switch
+                            checked={draft.linuxWebviewAcceleration}
+                            onCheckedChange={(v) => patchDraft({ linuxWebviewAcceleration: v })}
+                        />
+                    </FieldRow>
+                </SettingsSection>
+            )}
+        </SettingsTabSections>
+    );
+}
+
+function BackendNumber({
+    value,
+    min,
+    max,
+    step,
+    suffix,
+    disabled,
+    onChange,
+}: {
+    value: number;
+    min: number;
+    max: number;
+    step: number;
+    suffix?: string;
+    disabled?: boolean;
+    onChange: (v: number) => void;
+}) {
+    return (
+        <div className="flex items-center gap-1.5">
+            <NumberField
+                className="w-28"
+                value={value}
+                min={min}
+                max={max}
+                step={step}
+                disabled={disabled}
+                onValueChange={(n) => {
+                    if (n === null) return;
+                    onChange(Math.max(min, Math.min(max, Math.round(n))));
+                }}
+                onBlur={() => {
+                    onChange(Math.max(min, Math.min(max, Math.round(value))));
+                }}
+            />
+            {suffix && <span className="text-[11.5px] text-text-tertiary">{suffix}</span>}
+        </div>
+    );
+}

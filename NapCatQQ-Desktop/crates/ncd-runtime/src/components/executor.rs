@@ -1,0 +1,1953 @@
+//! 组件动作执行器:把 DependencyPlan 变成 deployment task 队列
+//!
+//! 从 L4 commands/components 下沉。一次动作会:
+//! 1. resolve(root, Install) 探出闭包里每个节点的状态
+//! 2. 没满足的组件节点 → EnsureInstalled 任务;主机命令 / 系统包节点 → 系统包任务
+//! 3. depends_on 按图反推:谁要它,谁的任务就等它;root 任务最后提交
+//! 4. dedupe_key 命中已在跑的直接复用,不重复排队
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ncd_appframework::AppFrameworkRegistry;
+#[cfg(any(windows, target_os = "linux"))]
+use ncd_component::NodeJsComponent;
+use ncd_component::{
+    ActionCtx, Component, ComponentId, DependencyPlan, DependencyTarget, ProgressEvent,
+    ProgressKind, ProgressLogLevel, RequirementPhase, RuntimeReadiness, VersionReq,
+};
+use ncd_deploy::{DeployOutcome, DeployPlan, StepKind};
+use ncd_domain::release_snapshot::ReleaseSnapshot;
+use ncd_domain::{
+    AppSettings, DeploymentTaskKind, DeploymentTaskResource, InstallDependenciesResult,
+    NodeEnvironmentCandidate, NodeProbeResult, RemoteSelectedPaths, SnowLumaLinuxPackage,
+    server_id_of_host,
+};
+#[cfg(any(windows, target_os = "linux"))]
+use ncd_host::HostPath;
+#[cfg(any(windows, target_os = "linux"))]
+use ncd_host::local::local_host;
+use ncd_host::{Host, HostCommand, Locality, Os};
+use ncd_server::ServerManager;
+use tokio::sync::{RwLock, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+#[cfg(any(windows, target_os = "linux"))]
+use crate::components::action_policy::data_root_to_host_path;
+use crate::components::action_policy::{
+    RemoteHostProbe, RemoteLayout, component_action_cancellable,
+    component_action_needs_runtime_closure, component_dedupe_key, component_needs_package_manager,
+    component_target_label, component_task_resources, dependency_target_display_name,
+};
+use crate::components::active_tasks::ActiveTasks;
+use crate::components::factory::{AppComponentHint, BuildComponentCtx, build_component_for_host};
+use crate::components::graph::catalog_version_reqs_for;
+use crate::components::resolver::{ResolveCtx, resolve_dependencies, resolve_runtime_readiness};
+use crate::components::system_package::{
+    qq_install_failure_message, run_qq_dependency_install_for_command, run_system_package_task,
+    system_package_group, system_package_title,
+};
+use crate::deploy::tasks::{
+    DeploymentTaskContext, DeploymentTaskManager, DeploymentTaskRequest, DeploymentTaskRunResult,
+};
+use crate::events::{BroadcastEventBus, DomainEvent, EventBus};
+use crate::release::read_cached_release_snapshot;
+use crate::remote::inventory::RemoteInventoryService;
+
+/// 实例化组件所需的全部输入,owned,能跨 task 边界。由 ComponentExecutor::build_inputs 收集
+#[derive(Clone)]
+pub struct ComponentBuildInputs {
+    pub data_root: PathBuf,
+    pub remote_windows_root: Option<String>,
+    pub remote_home: Option<String>,
+    pub layout: RemoteLayout,
+    pub snapshot: Option<ReleaseSnapshot>,
+    pub local_snowluma_version: Option<String>,
+    pub desktop_product_version: String,
+    pub selected: Option<RemoteSelectedPaths>,
+    /// 本次动作明确的 SnowLuma 包;None 交给 factory 按库存推断
+    pub snowluma_linux_package: Option<SnowLumaLinuxPackage>,
+    pub snowluma_node_path: Option<String>,
+    /// 应用端实例（Karin 等）的目录 / 端口；组件页动作为 None
+    pub app_component: Option<AppComponentHint>,
+    /// 与 AppManager 同一份注册表,应用端组件的适配器从这里取
+    pub registry: Arc<AppFrameworkRegistry>,
+}
+
+impl ComponentBuildInputs {
+    pub fn build(&self, id: ComponentId, host: &dyn Host) -> Result<Arc<dyn Component>, String> {
+        build_component_for_host(
+            id,
+            &BuildComponentCtx {
+                data_root: &self.data_root,
+                remote_windows_root: self.remote_windows_root.as_deref(),
+                host,
+                remote_home: self.remote_home.as_deref(),
+                layout: self.layout,
+                snapshot: self.snapshot.as_ref(),
+                local_snowluma_version: self.local_snowluma_version.as_deref(),
+                desktop_product_version: &self.desktop_product_version,
+                selected: self.selected.as_ref(),
+                snowluma_linux_package: self.snowluma_linux_package,
+                snowluma_node_path: self.snowluma_node_path.as_deref(),
+                app_component: self.app_component.as_ref(),
+                registry: &self.registry,
+            },
+        )
+    }
+
+    /// 目录沿用组件安装路径与工具链探测，避免把版本文件当作目录打开。
+    pub async fn local_component_directory(
+        &self,
+        id: ComponentId,
+        host: &dyn Host,
+    ) -> Result<PathBuf, String> {
+        use ncd_component::DetectOutcome;
+        use ncd_host::HostPath;
+
+        if host.locality() != Locality::Local {
+            return Err("只能打开本机目录".into());
+        }
+        let paths = crate::DataPaths::new(&self.data_root);
+        let directory = match id {
+            ComponentId::NapCat => paths.napcat_install_dir(),
+            ComponentId::SnowLuma => paths.snowluma_install_dir(),
+            ComponentId::Qq => {
+                crate::launch::plan::resolve_qq_install_path(&paths.components_dir())
+                    .map_err(|error| error.to_string())?
+            }
+            ComponentId::NodeJs
+            | ComponentId::Uv
+            | ComponentId::Git
+            | ComponentId::Redis
+            | ComponentId::DesktopSelf => {
+                let source = match self
+                    .build(id, host)?
+                    .detect_outcome(host)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    DetectOutcome::Installed(value) => value.source,
+                    DetectOutcome::Unusable(value) => value.source,
+                    DetectOutcome::NotInstalled => return Err("尚未安装，无法打开目录".into()),
+                };
+                let source = if let Some(command) = source.strip_prefix("$PATH/") {
+                    host.which(command)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("找不到 {command}"))?
+                } else {
+                    source
+                };
+                let path = if host.os() == Os::Windows {
+                    HostPath::from_windows(&source)
+                } else {
+                    HostPath::from_posix(source)
+                };
+                let mut binary = PathBuf::from(path.render_for(host.os()));
+                if !binary.is_absolute() || !binary.is_file() {
+                    return Err(format!("程序文件不存在: {}", binary.display()));
+                }
+                binary.pop();
+                // MinGit 的可执行文件在 cmd/ 内，打开托管安装根。
+                let managed_git = paths.components_dir().join("Git");
+                if id == ComponentId::Git && binary.starts_with(&managed_git) {
+                    managed_git
+                } else {
+                    binary
+                }
+            }
+            _ => return Err("没有可直接打开的本机目录".into()),
+        };
+        if !directory.is_absolute() || !directory.is_dir() {
+            return Err(format!("目录不存在: {}", directory.display()));
+        }
+        Ok(directory)
+    }
+
+    /// 任务去重 / 资源的实例作用域：只有应用端组件带
+    fn scope_for(&self, id: ComponentId) -> Option<&str> {
+        if id.is_app_framework() {
+            self.app_component.as_ref().map(|h| h.instance_id.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// root 在 host 上按 phase 的依赖状态;root 自己构建失败才 Err
+    pub async fn resolve(
+        &self,
+        root: ComponentId,
+        host: &dyn Host,
+        phase: RequirementPhase,
+    ) -> Result<DependencyPlan, String> {
+        let root = self.build(root, host)?;
+        let build = |id: ComponentId| self.build(id, host);
+        Ok(resolve_dependencies(
+            root.as_ref(),
+            &ResolveCtx {
+                host,
+                phase,
+                build: &build,
+                registry: &self.registry,
+            },
+        )
+        .await)
+    }
+
+    /// root 现在能不能跑(root 自己 + Run 依赖)
+    pub async fn readiness(
+        &self,
+        root: ComponentId,
+        host: &dyn Host,
+    ) -> Result<RuntimeReadiness, String> {
+        let root = self.build(root, host)?;
+        let build = |id: ComponentId| self.build(id, host);
+        Ok(resolve_runtime_readiness(
+            root.as_ref(),
+            &ResolveCtx {
+                host,
+                phase: RequirementPhase::Run,
+                build: &build,
+                registry: &self.registry,
+            },
+        )
+        .await)
+    }
+}
+
+pub struct ComponentActionRequest {
+    pub component_id: ComponentId,
+    pub host_id: String,
+    pub kind: StepKind,
+    /// 前端预生成的 task id;None 则随机
+    pub task_id: Option<String>,
+    pub host: Arc<dyn Host>,
+    pub inputs: ComponentBuildInputs,
+}
+
+// 密码只随本次动作的 runner 闭包传递，不进入任务记录或共享连接。
+#[derive(Clone)]
+struct ComponentTaskSudo {
+    password: String,
+    remember: bool,
+}
+
+fn component_task_sudo(
+    component_id: ComponentId,
+    host_id: &str,
+    kind: StepKind,
+    os: Os,
+    locality: Locality,
+    password: Option<String>,
+    remember: bool,
+) -> Result<Option<ComponentTaskSudo>, String> {
+    if password.is_none() && !remember {
+        return Ok(None);
+    }
+    let target_matches = match locality {
+        Locality::Local => host_id == "local",
+        Locality::Remote => server_id_of_host(host_id).is_some_and(|id| !id.is_empty()),
+    };
+    let linux_protocol_action = matches!(
+        component_id,
+        ComponentId::NapCat | ComponentId::SnowLuma | ComponentId::Qq | ComponentId::NoVnc
+    ) && os == Os::Linux
+        && target_matches
+        && matches!(
+            kind,
+            StepKind::EnsureInstalled
+                | StepKind::ForceInstall
+                | StepKind::Update
+                | StepKind::EnsureDependencies
+        );
+    if !linux_protocol_action {
+        return Err(
+            "sudo 密码仅可用于 Linux 协议端、QQ 或 noVNC 的安装、更新或依赖安装".to_string(),
+        );
+    }
+    let password = password
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| "请输入 sudo 密码".to_string())?;
+    Ok(Some(ComponentTaskSudo {
+        password,
+        remember: remember && locality == Locality::Remote,
+    }))
+}
+
+async fn validate_component_task_sudo(
+    host: &dyn Host,
+    sudo: Option<ComponentTaskSudo>,
+    server_manager: &ServerManager,
+    server_id: &str,
+) -> Result<(), String> {
+    let Some(sudo) = sudo else {
+        return Ok(());
+    };
+    let root = host
+        .run_to_string(HostCommand::new("id").arg("-u"))
+        .await
+        .map_err(|error| format!("sudo 验证执行失败: {error}"))?;
+    if root.success() && root.stdout.trim() == "0" {
+        return Ok(());
+    }
+    // -k 与命令同用时忽略已有 timestamp，不能把上一次认证误认成这次密码正确。
+    let passwordless = host
+        .run_to_string(HostCommand::new("sudo").args(["-k", "-n", "true"]))
+        .await
+        .map_err(|error| format!("sudo 验证执行失败: {error}"))?;
+    if passwordless.success() {
+        return Ok(());
+    }
+    let mut password_input = sudo.password.as_bytes().to_vec();
+    if !password_input.ends_with(b"\n") {
+        password_input.push(b'\n');
+    }
+    let result = host
+        .run_to_string(
+            HostCommand::new("sudo")
+                .args(["-k", "-S", "-p", "", "true"])
+                .stdin(password_input),
+        )
+        .await
+        .map_err(|error| format!("sudo 验证执行失败: {error}"))?;
+    if !result.success() {
+        return Err("elevation_required: sudo 密码验证失败，请重新输入".to_string());
+    }
+    if sudo.remember {
+        server_manager.remember_sudo_password(server_id, &sudo.password)?;
+    }
+    Ok(())
+}
+
+async fn inject_component_task_sudo(host: &dyn Host, sudo: Option<ComponentTaskSudo>) {
+    if let Some(sudo) = sudo {
+        host.set_elevation_password(Some(sudo.password)).await;
+    }
+}
+
+async fn preflight_qq_dependency_elevation(host: &dyn Host) -> Result<(), String> {
+    let root = host
+        .run_to_string(HostCommand::new("id").arg("-u"))
+        .await
+        .map_err(|error| format!("QQ 系统依赖提权检查失败: {error}"))?;
+    if root.success() && root.stdout.trim() == "0" {
+        return Ok(());
+    }
+    let result = host
+        .run_to_string(HostCommand::new("true").elevated())
+        .await
+        .map_err(|error| format!("QQ 系统依赖提权检查失败: {error}"))?;
+    if result.success() {
+        Ok(())
+    } else {
+        Err("elevation_required: 安装 QQ 系统依赖需要有效的 sudo 密码".to_string())
+    }
+}
+
+/// ComponentExecutor 的构造参数;启动时凑齐一次
+pub struct ComponentExecutorDeps {
+    pub deployment_tasks: DeploymentTaskManager,
+    pub server_manager: Arc<ServerManager>,
+    pub event_bus: BroadcastEventBus,
+    /// 本机 SnowLuma 的包类型 / Node 覆盖路径从这里读,装卸完回写包类型
+    pub app_settings: Arc<RwLock<AppSettings>>,
+    pub data_root: PathBuf,
+    /// 启动时读到的本机 SnowLuma 版本;GitHub 版本快照拿不到时靠它定 release tag
+    pub local_snowluma_version: Option<String>,
+    /// Desktop 产品版本(构建时注入),DesktopSelf 组件用
+    pub desktop_product_version: String,
+    /// 和 AppManager 共用的应用端注册表
+    pub registry: Arc<AppFrameworkRegistry>,
+}
+
+/// 组件页所有会排任务的动作都从这里走;启动时建一份,AppState 与 Bot 启动预检共用
+pub struct ComponentExecutor {
+    deployment_tasks: DeploymentTaskManager,
+    server_manager: Arc<ServerManager>,
+    event_bus: BroadcastEventBus,
+    active_tasks: ActiveTasks,
+    download_cache: crate::data::cache::DownloadCacheService,
+    /// 动作完成后清掉该主机的库存副本(安装可能改变布局)
+    inventory: Arc<RemoteInventoryService>,
+    app_settings: Arc<RwLock<AppSettings>>,
+    data_root: PathBuf,
+    local_snowluma_version: Option<String>,
+    desktop_product_version: String,
+    registry: Arc<AppFrameworkRegistry>,
+}
+
+impl ComponentExecutor {
+    pub fn new(deps: ComponentExecutorDeps) -> Self {
+        let ComponentExecutorDeps {
+            deployment_tasks,
+            server_manager,
+            event_bus,
+            app_settings,
+            data_root,
+            local_snowluma_version,
+            desktop_product_version,
+            registry,
+        } = deps;
+        Self {
+            deployment_tasks,
+            inventory: Arc::new(RemoteInventoryService::new(Arc::clone(&server_manager))),
+            server_manager,
+            event_bus,
+            active_tasks: ActiveTasks::default(),
+            download_cache: crate::data::cache::DownloadCacheService::new(&data_root),
+            app_settings,
+            data_root,
+            local_snowluma_version,
+            desktop_product_version,
+            registry,
+        }
+    }
+
+    /// 依赖图里所有会用到 `target` 的组件(含已注册应用端)对它的版本约束
+    pub fn catalog_version_reqs_for(
+        &self,
+        target: ComponentId,
+        os: Os,
+        locality: Locality,
+    ) -> Vec<VersionReq> {
+        catalog_version_reqs_for(&self.registry, target, os, locality)
+    }
+
+    pub fn inventory(&self) -> &RemoteInventoryService {
+        &self.inventory
+    }
+
+    /// 给 Bot 启动路由共用同一份库存副本
+    pub fn shared_inventory(&self) -> Arc<RemoteInventoryService> {
+        Arc::clone(&self.inventory)
+    }
+
+    pub fn active_tasks(&self) -> &ActiveTasks {
+        &self.active_tasks
+    }
+
+    pub fn download_cache(&self) -> &crate::data::cache::DownloadCacheService {
+        &self.download_cache
+    }
+
+    /// 组件任务排进的那条队列;要盯自己提交的任务、或往同一条队列里排任务的用这个
+    pub fn deployment_tasks(&self) -> &DeploymentTaskManager {
+        &self.deployment_tasks
+    }
+
+    /// 在已探好的布局上收集构建输入;本机 SnowLuma 的包类型与 Node 覆盖路径来自设置
+    pub async fn build_inputs(
+        &self,
+        host: &dyn Host,
+        probe: &RemoteHostProbe,
+        selected: Option<RemoteSelectedPaths>,
+        snowluma_linux_package: Option<SnowLumaLinuxPackage>,
+    ) -> ComponentBuildInputs {
+        let local = host.locality() == Locality::Local;
+        let (persisted_package, snowluma_node_path) = if local {
+            let settings = self.app_settings.read().await;
+            (
+                settings.snowluma_package,
+                settings.snowluma_node_override().map(str::to_string),
+            )
+        } else {
+            (None, None)
+        };
+        let snowluma_linux_package = snowluma_linux_package.or_else(|| {
+            local.then(|| {
+                persisted_package.unwrap_or_else(|| infer_local_snowluma_package(&self.data_root))
+            })
+        });
+        ComponentBuildInputs {
+            data_root: self.data_root.clone(),
+            remote_windows_root: if host.os() == Os::Windows && !local {
+                host.remote_windows_info()
+                    .await
+                    .ok()
+                    .map(|info| info.user_root)
+            } else {
+                None
+            },
+            remote_home: probe.home.clone(),
+            layout: probe.layout,
+            snapshot: read_cached_release_snapshot(&self.data_root),
+            local_snowluma_version: self.local_snowluma_version.clone(),
+            desktop_product_version: self.desktop_product_version.clone(),
+            selected,
+            snowluma_linux_package,
+            snowluma_node_path,
+            app_component: None,
+            registry: Arc::clone(&self.registry),
+        }
+    }
+
+    /// 取(或探测)主机库存再收集构建输入;远端探不到时按本机默认布局构建
+    pub async fn inputs_for(
+        &self,
+        host_id: &str,
+        host: &dyn Host,
+        snowluma_linux_package: Option<SnowLumaLinuxPackage>,
+    ) -> ComponentBuildInputs {
+        let result = self.inventory.host_probe(host_id, host).await;
+        let invalid_windows =
+            result.is_err() && host.os() == Os::Windows && host.locality() == Locality::Remote;
+        let (probe, selected) = result.unwrap_or_else(|_| (RemoteHostProbe::local_default(), None));
+        let mut inputs = self
+            .build_inputs(host, &probe, selected, snowluma_linux_package)
+            .await;
+        if invalid_windows {
+            inputs.remote_windows_root = None;
+        }
+        inputs
+    }
+
+    /// root 现在能不能跑(root 自己 + Run 依赖);组件页门禁和 Bot 启动预检共用。
+    /// 远端库存探不到直接报错:按猜的布局算出的「缺什么」对不上那台机器
+    pub async fn runtime_readiness(
+        &self,
+        root: ComponentId,
+        host_id: &str,
+        host: &dyn Host,
+    ) -> Result<RuntimeReadiness, String> {
+        let (probe, selected) = self.inventory.host_probe(host_id, host).await?;
+        self.build_inputs(host, &probe, selected, None)
+            .await
+            .readiness(root, host)
+            .await
+    }
+
+    /// 本机能给 SnowLuma 用的 Node:Desktop 管的 NodeJs 组件、设置里的自定义路径、PATH 上的。
+    /// 版本约束来自本机上要用 Node 的组件声明
+    #[cfg(any(windows, target_os = "linux"))]
+    pub async fn probe_local_node_candidates(&self) -> Vec<NodeEnvironmentCandidate> {
+        let host = local_host();
+        let managed = NodeJsComponent::node_binary_path_for_os(
+            &data_root_to_host_path(&self.data_root, host.os())
+                .join("components")
+                .join("NodeJs"),
+            host.os(),
+        );
+        let custom = self
+            .app_settings
+            .read()
+            .await
+            .snowluma_node_override()
+            .map(str::to_string);
+        let accept = self.catalog_version_reqs_for(ComponentId::NodeJs, host.os(), host.locality());
+        ncd_component::nodejs::probe_local_system_nodes(
+            host.as_ref(),
+            Some(&managed),
+            custom.as_deref(),
+            &accept,
+        )
+        .await
+    }
+
+    /// 设置页填的 Node 路径能不能跑、版本够不够
+    #[cfg(any(windows, target_os = "linux"))]
+    pub async fn probe_node_binary(&self, path: String) -> NodeProbeResult {
+        let host = local_host();
+        let accept = self.catalog_version_reqs_for(ComponentId::NodeJs, host.os(), host.locality());
+        let missing = |error: String| NodeProbeResult {
+            path: path.clone(),
+            exists: false,
+            version: None,
+            is_valid: false,
+            error: Some(error),
+        };
+        match ncd_component::nodejs::probe_node_raw_version(
+            host.as_ref(),
+            &match host.os() {
+                Os::Windows => HostPath::from_windows(path.trim()),
+                _ => HostPath::from_posix(path.trim()),
+            },
+        )
+        .await
+        {
+            Ok(Some(raw_ver)) => {
+                let is_valid = ncd_component::all_versions_match(&accept, &raw_ver);
+                let error = (!is_valid)
+                    .then(|| ncd_component::nodejs::version_mismatch_reason(&raw_ver, &accept));
+                NodeProbeResult {
+                    path,
+                    exists: true,
+                    version: Some(raw_ver),
+                    is_valid,
+                    error,
+                }
+            }
+            Ok(None) => missing("无法执行或未找到 Node.js".to_string()),
+            Err(err) => missing(err.to_string()),
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    pub async fn probe_local_node_candidates(&self) -> Vec<NodeEnvironmentCandidate> {
+        Vec::new()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    pub async fn probe_node_binary(&self, path: String) -> NodeProbeResult {
+        NodeProbeResult {
+            path,
+            exists: false,
+            version: None,
+            is_valid: false,
+            error: Some("当前平台不支持本机 Node 环境探测".to_string()),
+        }
+    }
+
+    /// 提交 root 动作及其未满足的前置;返回 root 的 task id
+    pub async fn submit(&self, req: ComponentActionRequest) -> Result<String, String> {
+        self.submit_with_sudo(req, None, false).await
+    }
+
+    pub async fn submit_with_sudo(
+        &self,
+        req: ComponentActionRequest,
+        sudo_password: Option<String>,
+        remember_sudo: bool,
+    ) -> Result<String, String> {
+        let ComponentActionRequest {
+            component_id,
+            host_id,
+            kind,
+            task_id,
+            host,
+            inputs,
+        } = req;
+        let sudo = component_task_sudo(
+            component_id,
+            &host_id,
+            kind,
+            host.os(),
+            host.locality(),
+            sudo_password,
+            remember_sudo,
+        )?;
+
+        let dedupe =
+            component_dedupe_key(&host_id, component_id, kind, inputs.scope_for(component_id));
+        if let Some(existing) = self
+            .deployment_tasks
+            .active_task_by_dedupe_key(&dedupe)
+            .await
+        {
+            return Ok(existing);
+        }
+
+        // 密码仅属于本次任务及其依赖，不进入解析器缓存的本机 Host。
+        #[cfg(target_os = "linux")]
+        let host = if sudo.is_some() && host.locality() == Locality::Local {
+            ncd_host::local::local_host_for_data_root(&self.data_root)
+        } else {
+            host
+        };
+        if sudo.is_some() {
+            if let Some(server_id) = server_id_of_host(&host_id) {
+                let validation_id = server_id.to_string();
+                let validation_sudo = sudo.clone();
+                let server_manager = Arc::clone(&self.server_manager);
+                self.server_manager
+                    .with_isolated_connection(server_id, move |isolated_host| {
+                        Box::pin(async move {
+                            validate_component_task_sudo(
+                                isolated_host.as_ref(),
+                                validation_sudo,
+                                server_manager.as_ref(),
+                                &validation_id,
+                            )
+                            .await
+                        })
+                    })
+                    .await?;
+            } else {
+                validate_component_task_sudo(
+                    host.as_ref(),
+                    sudo.clone(),
+                    self.server_manager.as_ref(),
+                    "",
+                )
+                .await?;
+                inject_component_task_sudo(host.as_ref(), sudo.clone()).await;
+            }
+        }
+
+        let root = inputs.build(component_id, host.as_ref())?;
+        let mut submitted: HashMap<DependencyTarget, String> = HashMap::new();
+
+        if component_action_needs_runtime_closure(kind) {
+            let plan = inputs
+                .resolve(component_id, host.as_ref(), RequirementPhase::Install)
+                .await?;
+
+            if host.os() == Os::Linux
+                && plan.nodes.iter().any(|node| {
+                    node.status.needs_action()
+                        && matches!(
+                            node.target,
+                            DependencyTarget::HostPackages {
+                                group: ncd_component::HostPackageGroup::QqDependencies
+                            }
+                        )
+                })
+            {
+                if let Some(server_id) = server_id_of_host(&host_id) {
+                    let preflight_sudo = sudo.clone();
+                    self.server_manager
+                        .with_isolated_connection(server_id, move |isolated_host| {
+                            Box::pin(async move {
+                                inject_component_task_sudo(isolated_host.as_ref(), preflight_sudo)
+                                    .await;
+                                preflight_qq_dependency_elevation(isolated_host.as_ref()).await
+                            })
+                        })
+                        .await?;
+                } else {
+                    preflight_qq_dependency_elevation(host.as_ref()).await?;
+                }
+            }
+
+            for node in &plan.nodes {
+                if !node.status.needs_action() {
+                    tracing::info!(
+                        host_id,
+                        target = %node.target.label(),
+                        status = ?node.status,
+                        "skip satisfied prerequisite"
+                    );
+                    continue;
+                }
+                // 拓扑序保证本节点依赖的节点已处理完(要么跳过要么已排队)
+                let depends_on: Vec<String> = match node.target.component_id() {
+                    Some(id) => plan
+                        .nodes
+                        .iter()
+                        .filter(|n| n.required_by.contains(&id))
+                        .filter_map(|n| submitted.get(&n.target).cloned())
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let task_id = match node.target.component_id() {
+                    Some(id) => {
+                        self.submit_component_task(
+                            id,
+                            &host_id,
+                            StepKind::EnsureInstalled,
+                            None,
+                            depends_on,
+                            Arc::clone(&host),
+                            &inputs,
+                            sudo.clone(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        self.submit_system_package_task(
+                            node.target.clone(),
+                            &host_id,
+                            Arc::clone(&host),
+                            sudo.clone(),
+                        )
+                        .await
+                    }
+                };
+                submitted.insert(node.target.clone(), task_id);
+            }
+        }
+
+        // root 直接依赖里被排了任务的:既是 depends_on,也是给 UI 看的「在等谁」
+        let waiting_on: Vec<(DependencyTarget, String)> = root
+            .requirements(host.os(), host.locality())
+            .into_iter()
+            .filter(|req| req.applies_to(RequirementPhase::Install))
+            .filter_map(|req| {
+                let target = req.target();
+                submitted.get(&target).cloned().map(|id| (target, id))
+            })
+            .collect();
+        let depends_on: Vec<String> = waiting_on.iter().map(|(_, id)| id.clone()).collect();
+        let queue_note = queue_note(
+            &waiting_on,
+            component_needs_package_manager(component_id, kind, host.os(), host.locality()),
+        );
+
+        let requested = task_id.clone();
+        let submitted_id = self
+            .submit_component_task(
+                component_id,
+                &host_id,
+                kind,
+                task_id,
+                depends_on,
+                host,
+                &inputs,
+                sudo,
+            )
+            .await?;
+
+        // dedupe 命中已有任务时不补写,免得往别人的日志里塞排队提示
+        let fresh = requested.as_deref().is_none_or(|t| t == submitted_id);
+        if let (true, Some(message)) = (fresh, queue_note) {
+            self.event_bus
+                .publish(DomainEvent::component_action_progress(
+                    submitted_id.clone(),
+                    ProgressEvent::new(ProgressKind::Log {
+                        level: ProgressLogLevel::Info,
+                        message,
+                    }),
+                ));
+        }
+        Ok(submitted_id)
+    }
+
+    /// 队列里的任务只按队列的规矩取消:在跑的不可取消任务由队列拒绝,可取消的经
+    /// forward_cancel 转给 ActionCtx。先直接掐 ActionCtx 的话,拒绝了也已经停下。
+    /// 队列不认识的只有 Desktop 自更新,它只登记在活跃表里
+    pub async fn cancel(&self, task_id: &str) -> Result<(), String> {
+        if self.deployment_tasks.status_of(task_id).await.is_some() {
+            return self.deployment_tasks.cancel(task_id).await;
+        }
+        if self.active_tasks.cancel(task_id) {
+            Ok(())
+        } else {
+            Err("任务不存在或已结束".to_string())
+        }
+    }
+
+    /// 用户显式「安装 QQ 依赖」:排一个系统包任务并等它跑完,把结果原样带回。
+    /// 没传 sudo 密码时用远端主机配置里记住的那份
+    pub async fn install_qq_dependencies(
+        &self,
+        host_id: &str,
+        host: Arc<dyn Host>,
+        packages: Vec<String>,
+        sudo_password: Option<String>,
+    ) -> Result<InstallDependenciesResult, String> {
+        let (tx, rx) = oneshot::channel::<Result<InstallDependenciesResult, String>>();
+        let task_id = uuid_v4();
+        let server_id = server_id_of_host(host_id).map(str::to_string);
+        let sudo_password = sudo_password.or_else(|| {
+            server_id
+                .as_deref()
+                .and_then(|id| self.server_manager.sudo_password(id))
+        });
+        let server_manager = Arc::clone(&self.server_manager);
+        #[cfg(target_os = "linux")]
+        let host = if host.locality() == Locality::Local && sudo_password.is_some() {
+            ncd_host::local::local_host_for_data_root(&self.data_root)
+        } else {
+            host
+        };
+        let local_host = if server_id.is_none() {
+            Some(host)
+        } else {
+            None
+        };
+        let group = "qq_dependencies";
+        let submitted = self
+            .deployment_tasks
+            .submit(DeploymentTaskRequest {
+                task_id: task_id.clone(),
+                kind: DeploymentTaskKind::SystemPackage {
+                    package_group: group.to_string(),
+                },
+                host_id: host_id.to_string(),
+                title: "安装 QQ 系统依赖".to_string(),
+                resources: system_package_resources(host_id, group),
+                depends_on: vec![],
+                dedupe_key: Some(system_package_dedupe_key(host_id, group)),
+                cancellable: false,
+                runner: Box::new(move |task_ctx| {
+                    Box::pin(async move {
+                        let result = if let Some(id) = server_id {
+                            server_manager
+                                .with_isolated_connection(&id, move |iso_host| {
+                                    Box::pin(async move {
+                                        run_qq_dependency_install_for_command(
+                                            iso_host.as_ref(),
+                                            packages,
+                                            sudo_password,
+                                            task_ctx,
+                                        )
+                                        .await
+                                    })
+                                })
+                                .await
+                        } else if let Some(host) = local_host {
+                            run_qq_dependency_install_for_command(
+                                host.as_ref(),
+                                packages,
+                                sudo_password,
+                                task_ctx,
+                            )
+                            .await
+                        } else {
+                            Err("无法解析 QQ 依赖安装目标主机".to_string())
+                        };
+
+                        let run_result = match &result {
+                            Ok(r) if r.success => DeploymentTaskRunResult::ok("QQ 系统依赖已就绪"),
+                            Ok(r) if r.elevation_required => {
+                                DeploymentTaskRunResult::failed("安装 QQ 系统依赖需要 sudo 密码")
+                            }
+                            Ok(r) => DeploymentTaskRunResult::failed(qq_install_failure_message(r)),
+                            Err(err) => DeploymentTaskRunResult::failed(err.clone()),
+                        };
+                        let _ = tx.send(result);
+                        run_result
+                    })
+                }),
+            })
+            .await;
+
+        if submitted != task_id {
+            return Err("该主机已有 QQ 系统依赖安装任务在队列中".to_string());
+        }
+        rx.await
+            .map_err(|_| "QQ 系统依赖安装任务异常结束".to_string())?
+    }
+
+    async fn submit_system_package_task(
+        &self,
+        target: DependencyTarget,
+        host_id: &str,
+        host: Arc<dyn Host>,
+        sudo: Option<ComponentTaskSudo>,
+    ) -> String {
+        let group = system_package_group(&target).unwrap_or_else(|| target.label());
+        let title = system_package_title(&target);
+        let server_id = server_id_of_host(host_id).map(str::to_string);
+        let server_manager = Arc::clone(&self.server_manager);
+        self.deployment_tasks
+            .submit(DeploymentTaskRequest {
+                task_id: uuid_v4(),
+                kind: DeploymentTaskKind::SystemPackage {
+                    package_group: group.clone(),
+                },
+                host_id: host_id.to_string(),
+                title,
+                resources: system_package_resources(host_id, &group),
+                depends_on: vec![],
+                dedupe_key: Some(system_package_dedupe_key(host_id, &group)),
+                cancellable: false,
+                runner: Box::new(move |task_ctx| {
+                    Box::pin(async move {
+                        if let Some(id) = server_id {
+                            let target = target.clone();
+                            server_manager
+                                .with_isolated_connection(&id, move |iso_host| {
+                                    Box::pin(async move {
+                                        inject_component_task_sudo(iso_host.as_ref(), sudo).await;
+                                        Ok(run_system_package_task(
+                                            target,
+                                            iso_host.as_ref(),
+                                            task_ctx,
+                                        )
+                                        .await)
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(DeploymentTaskRunResult::failed)
+                        } else {
+                            run_system_package_task(target, host.as_ref(), task_ctx).await
+                        }
+                    })
+                }),
+            })
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_component_task(
+        &self,
+        component_id: ComponentId,
+        host_id: &str,
+        kind: StepKind,
+        requested_task_id: Option<String>,
+        depends_on: Vec<String>,
+        host: Arc<dyn Host>,
+        inputs: &ComponentBuildInputs,
+        sudo: Option<ComponentTaskSudo>,
+    ) -> Result<String, String> {
+        let scope = inputs.scope_for(component_id);
+        let dedupe_key = component_dedupe_key(host_id, component_id, kind, scope);
+        if let Some(existing) = self
+            .deployment_tasks
+            .active_task_by_dedupe_key(&dedupe_key)
+            .await
+        {
+            return Ok(existing);
+        }
+
+        let component = inputs.build(component_id, host.as_ref())?;
+        let plan = DeployPlan::builder()
+            .step("single", kind, Arc::clone(&component))
+            .build();
+        plan.validate().map_err(|err| format!("{err}"))?;
+
+        let host_id_owned = host_id.to_string();
+        let server_id = server_id_of_host(&host_id_owned).map(str::to_string);
+        let remote_long_install = server_id.is_some()
+            && matches!(
+                kind,
+                StepKind::EnsureInstalled
+                    | StepKind::ForceInstall
+                    | StepKind::Update
+                    | StepKind::EnsureDependencies
+            );
+
+        let task_id = requested_task_id.unwrap_or_else(uuid_v4);
+        let resources = component_task_resources(
+            component_id,
+            &host_id_owned,
+            kind,
+            host.os(),
+            host.locality(),
+            scope,
+        );
+        let cancellable =
+            component_action_cancellable(component_id, kind, host.os(), host.locality());
+        let title = format!(
+            "{} {}",
+            component_target_label(component_id, scope),
+            kind.as_str()
+        );
+
+        let runner = ComponentTaskRunner {
+            component_id,
+            kind,
+            plan,
+            host,
+            server_id,
+            remote_long_install,
+            sudo,
+            snowluma_linux_package: inputs.snowluma_linux_package,
+            inventory: Arc::clone(&self.inventory),
+            event_bus: self.event_bus.clone(),
+            active_tasks: self.active_tasks.clone(),
+            download_cache: self.download_cache.clone(),
+            app_settings: Arc::clone(&self.app_settings),
+            data_root: self.data_root.clone(),
+            server_manager: Arc::clone(&self.server_manager),
+        };
+
+        let submitted = self
+            .deployment_tasks
+            .submit(DeploymentTaskRequest {
+                task_id,
+                kind: DeploymentTaskKind::ComponentAction {
+                    component_id: component_id.as_str().to_string(),
+                    action: kind.as_str().to_string(),
+                },
+                host_id: host_id_owned,
+                title,
+                resources,
+                depends_on,
+                dedupe_key: Some(dedupe_key),
+                cancellable,
+                runner: Box::new(move |task_ctx| Box::pin(runner.run(task_ctx))),
+            })
+            .await;
+        Ok(submitted)
+    }
+}
+
+/// 单个组件任务 runner 需要的全部状态(owned,进 task 闭包)
+struct ComponentTaskRunner {
+    component_id: ComponentId,
+    kind: StepKind,
+    plan: DeployPlan,
+    host: Arc<dyn Host>,
+    server_id: Option<String>,
+    /// 远端长安装走独立 SSH 连接,不占共享会话
+    remote_long_install: bool,
+    sudo: Option<ComponentTaskSudo>,
+    snowluma_linux_package: Option<SnowLumaLinuxPackage>,
+    inventory: Arc<RemoteInventoryService>,
+    event_bus: BroadcastEventBus,
+    active_tasks: ActiveTasks,
+    download_cache: crate::data::cache::DownloadCacheService,
+    app_settings: Arc<RwLock<AppSettings>>,
+    data_root: PathBuf,
+    server_manager: Arc<ServerManager>,
+}
+
+impl ComponentTaskRunner {
+    async fn run(mut self, task_ctx: DeploymentTaskContext) -> DeploymentTaskRunResult {
+        let task_id = task_ctx.task_id().to_string();
+        let task_cancel = task_ctx.cancel_token();
+        let cache_lease = tokio::select! {
+            lease = self.download_cache.lease() => lease,
+            () = task_cancel.cancelled() => Err("任务已取消".to_string()),
+        };
+        let _cache_lease = match cache_lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Some(ref id) = self.server_id {
+                    self.inventory.invalidate(id).await;
+                }
+                self.emit(&task_ctx, &task_id, ProgressKind::Finished { ok: false })
+                    .await;
+                return DeploymentTaskRunResult::failed(error);
+            }
+        };
+        let (ctx, mut rx) = ActionCtx::new();
+        let mut ctx =
+            ctx.with_download_dir(crate::DataPaths::new(&self.data_root).download_cache_dir());
+        let cancel_token = ctx.cancel_token();
+        // 从哪条路返回都会摘掉,取消命令不会拿到已结束任务的令牌
+        let registered = self
+            .active_tasks
+            .register(task_id.clone(), cancel_token.clone());
+        let (_stop_cancel_forward, _) =
+            forward_cancel(task_ctx.cancel_token(), cancel_token.clone());
+
+        // ActionCtx 进度 → task 记录 + 领域事件
+        let event_bus = self.event_bus.clone();
+        let progress_ctx = task_ctx.clone();
+        let progress_task_id = task_id.clone();
+        let (close_progress, mut close_requested) = oneshot::channel();
+        let progress_relay = tokio::spawn(async move {
+            let mut draining = false;
+            loop {
+                let event = if draining {
+                    rx.recv().await
+                } else {
+                    tokio::select! {
+                        _ = &mut close_requested => {
+                            // 组件可能保留 ctx clone；关闭接收端后排空，不能等所有发送端析构。
+                            rx.close();
+                            draining = true;
+                            continue;
+                        }
+                        event = rx.recv() => event,
+                    }
+                };
+                let Some(event) = event else { break };
+                // plan 完成后还有库存失效和设置落盘，终态由 runner 最后统一发。
+                if matches!(event.kind, ProgressKind::Finished { .. }) {
+                    continue;
+                }
+                progress_ctx.push_progress(event.clone()).await;
+                event_bus.publish(DomainEvent::component_action_progress(
+                    progress_task_id.clone(),
+                    event,
+                ));
+            }
+        });
+
+        if cancel_token.is_cancelled() || task_cancel.is_cancelled() {
+            let _ = close_progress.send(());
+            if let Err(error) = progress_relay.await {
+                tracing::error!(task_id, error = %error, "component progress relay failed");
+            }
+            drop(registered);
+            if let Some(ref id) = self.server_id {
+                self.inventory.invalidate(id).await;
+            }
+            self.emit(&task_ctx, &task_id, ProgressKind::Finished { ok: false })
+                .await;
+            return DeploymentTaskRunResult::failed("任务已取消");
+        }
+
+        // plan 进 'static 闭包要 owned;取出来换个空的占位
+        let plan = std::mem::replace(&mut self.plan, DeployPlan::builder().build());
+        let isolated_server = self.server_id.clone().filter(|_| self.remote_long_install);
+        let sudo = self.sudo.take();
+        let outcome: Result<DeployOutcome, String> = match isolated_server {
+            Some(id) => {
+                self.server_manager
+                    .with_isolated_connection(&id, move |iso_host| {
+                        Box::pin(async move {
+                            inject_component_task_sudo(iso_host.as_ref(), sudo).await;
+                            plan.run(iso_host.as_ref(), &mut ctx)
+                                .await
+                                .map_err(|e| format!("{e}"))
+                        })
+                    })
+                    .await
+            }
+            None => plan
+                .run(self.host.as_ref(), &mut ctx)
+                .await
+                .map_err(|e| format!("{e}")),
+        };
+
+        let _ = close_progress.send(());
+        if let Err(error) = progress_relay.await {
+            tracing::error!(task_id, error = %error, "component progress relay failed");
+        }
+
+        if outcome.is_err() {
+            if let Some(ref id) = self.server_id {
+                self.server_manager.disconnect_cached_host(id).await;
+            }
+        }
+
+        drop(registered);
+        if let Some(ref id) = self.server_id {
+            self.inventory.invalidate(id).await;
+        }
+
+        let result = match outcome {
+            Ok(outcome) if outcome.ok => {
+                let persisted = if self.component_id == ComponentId::SnowLuma
+                    && self.host.locality() == Locality::Local
+                    && matches!(
+                        self.kind,
+                        StepKind::EnsureInstalled
+                            | StepKind::ForceInstall
+                            | StepKind::Update
+                            | StepKind::Uninstall
+                    ) {
+                    let next = if self.kind == StepKind::Uninstall {
+                        None
+                    } else {
+                        self.snowluma_linux_package
+                    };
+                    persist_local_snowluma_package(&self.data_root, &self.app_settings, next).await
+                } else {
+                    Ok(())
+                };
+                match persisted {
+                    Ok(()) => DeploymentTaskRunResult::ok("组件操作完成"),
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to persist SnowLuma package state");
+                        DeploymentTaskRunResult::failed(format!(
+                            "组件操作已完成，但保存 SnowLuma 包类型失败: {err}"
+                        ))
+                    }
+                }
+            }
+            Ok(outcome) => {
+                let err = outcome
+                    .steps
+                    .iter()
+                    .find_map(|s| s.error.clone())
+                    .unwrap_or_else(|| "组件操作失败".to_string());
+                DeploymentTaskRunResult::failed(err)
+            }
+            Err(err) => {
+                self.emit(
+                    &task_ctx,
+                    &task_id,
+                    ProgressKind::Log {
+                        level: ProgressLogLevel::Error,
+                        message: format!("plan failed: {err}"),
+                    },
+                )
+                .await;
+                DeploymentTaskRunResult::failed(err)
+            }
+        };
+        let result = if result.ok && task_ctx.is_cancelled() {
+            DeploymentTaskRunResult::failed("任务已取消")
+        } else {
+            result
+        };
+        self.emit(
+            &task_ctx,
+            &task_id,
+            ProgressKind::Finished { ok: result.ok },
+        )
+        .await;
+        result
+    }
+
+    async fn emit(&self, task_ctx: &DeploymentTaskContext, task_id: &str, kind: ProgressKind) {
+        let event = ProgressEvent::new(kind);
+        task_ctx.push_progress(event.clone()).await;
+        self.event_bus
+            .publish(DomainEvent::component_action_progress(
+                task_id.to_string(),
+                event,
+            ));
+    }
+}
+
+#[cfg(test)]
+#[path = "executor_completion_tests.rs"]
+mod completion_tests;
+
+/// 本机 SnowLuma 装完 / 卸完后把包类型写回 app-settings.json
+async fn persist_local_snowluma_package(
+    data_root: &Path,
+    app_settings: &Arc<RwLock<AppSettings>>,
+    package: Option<SnowLumaLinuxPackage>,
+) -> Result<(), String> {
+    crate::desktop::update_app_settings(data_root, app_settings, |s| {
+        s.snowluma_package = package;
+    })
+    .await
+    .map(|_| ())
+}
+
+/// 本机 SnowLuma 自带 Node 就是完整包;没装按完整包(不会平白拉 Node)。
+pub fn infer_local_snowluma_package(data_root: &Path) -> SnowLumaLinuxPackage {
+    let install_dir = data_root.join("components").join("SnowLuma");
+    let bundled_node = if cfg!(windows) {
+        install_dir.join("node.exe").is_file()
+    } else {
+        install_dir.join("node").is_file() || install_dir.join("node/bin/node").is_file()
+    };
+    if install_dir.is_dir() && !bundled_node {
+        SnowLumaLinuxPackage::Lite
+    } else {
+        SnowLumaLinuxPackage::Full
+    }
+}
+
+fn system_package_resources(host_id: &str, group: &str) -> Vec<DeploymentTaskResource> {
+    vec![
+        DeploymentTaskResource::PackageManager {
+            host_id: host_id.to_string(),
+        },
+        DeploymentTaskResource::InstallTarget {
+            host_id: host_id.to_string(),
+            target: format!("system_package:{group}"),
+        },
+    ]
+}
+
+fn system_package_dedupe_key(host_id: &str, group: &str) -> String {
+    format!("system-package:{host_id}:{group}")
+}
+
+fn uuid_v4() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// 队列取消转给 ActionCtx。guard 一丢转发就收尾:正常跑完的任务
+/// 不会留下一个永远等着取消信号的 watcher
+fn forward_cancel(from: CancellationToken, to: CancellationToken) -> (DropGuard, JoinHandle<()>) {
+    let done = CancellationToken::new();
+    let stop = done.clone();
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            () = from.cancelled() => to.cancel(),
+            () = stop.cancelled() => {}
+        }
+    });
+    (done.drop_guard(), handle)
+}
+
+/// root 任务刚入队、还没开跑时给 UI 的一句话;没什么可等就 None。
+/// 前置任务优先于包管理器锁:有前置时锁的等待藏在前置之后,不值得同时说
+fn queue_note(
+    waiting_on: &[(DependencyTarget, String)],
+    needs_package_manager: bool,
+) -> Option<String> {
+    if !waiting_on.is_empty() {
+        let labels: Vec<String> = waiting_on
+            .iter()
+            .map(|(t, _)| dependency_target_display_name(t))
+            .collect();
+        return Some(format!("等待前置:{}", labels.join("、")));
+    }
+    needs_package_manager.then(|| "排队等待包管理器空闲".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use ncd_host::shell::BashShell;
+    use ncd_host::{
+        Arch, ArchiveKind, CommandOutput, DirEntry, HostError, HostPath, HostProcess, HostShell,
+    };
+
+    struct SudoHost {
+        password: tokio::sync::Mutex<Option<String>>,
+        commands: tokio::sync::Mutex<Vec<HostCommand>>,
+        requires_password: bool,
+        timestamp_cached: bool,
+        transport_fails: bool,
+    }
+
+    impl SudoHost {
+        fn new(requires_password: bool) -> Self {
+            Self {
+                password: tokio::sync::Mutex::new(None),
+                commands: tokio::sync::Mutex::new(Vec::new()),
+                requires_password,
+                timestamp_cached: false,
+                transport_fails: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Host for SudoHost {
+        fn os(&self) -> Os {
+            Os::Linux
+        }
+        fn arch(&self) -> Arch {
+            Arch::X86_64
+        }
+        fn locality(&self) -> Locality {
+            Locality::Remote
+        }
+        fn id(&self) -> &str {
+            "remote:test"
+        }
+        fn shell(&self) -> &dyn HostShell {
+            &BashShell
+        }
+        async fn read_file(&self, _: &HostPath) -> Result<Bytes, HostError> {
+            unreachable!()
+        }
+        async fn write_file(&self, _: &HostPath, _: &[u8]) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn list_dir(&self, _: &HostPath) -> Result<Vec<DirEntry>, HostError> {
+            unreachable!()
+        }
+        async fn create_dir_all(&self, _: &HostPath) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn remove_file(&self, _: &HostPath) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn remove_dir_all(&self, _: &HostPath) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &HostPath) -> Result<bool, HostError> {
+            unreachable!()
+        }
+        async fn upload(&self, _: &Path, _: &HostPath) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn download(&self, _: &HostPath, _: &Path) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn extract_archive(
+            &self,
+            _: &HostPath,
+            _: &HostPath,
+            _: ArchiveKind,
+        ) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn spawn(&self, _: HostCommand) -> Result<Box<dyn HostProcess>, HostError> {
+            unreachable!()
+        }
+        async fn run_to_string(&self, command: HostCommand) -> Result<CommandOutput, HostError> {
+            if self.transport_fails {
+                return Err(HostError::Unsupported { operation: "test" });
+            }
+            self.commands.lock().await.push(command.clone());
+            let ok = match command.program.as_str() {
+                "id" => true,
+                "sudo" => {
+                    let ignores_cache = command.args.iter().any(|arg| arg == "-k");
+                    !self.requires_password
+                        || self.timestamp_cached && !ignores_cache
+                        || command.args.iter().any(|arg| arg == "-S")
+                            && command.stdin.as_deref() == Some(b"accepted\n".as_slice())
+                }
+                "true" => {
+                    assert!(command.elevated);
+                    !self.requires_password
+                        || self.timestamp_cached
+                        || self.password.lock().await.as_deref() == Some("accepted")
+                }
+                _ => panic!("unexpected sudo validation command"),
+            };
+            Ok(CommandOutput {
+                exit_code: Some(if ok { 0 } else { 1 }),
+                stdout: if command.program == "id" {
+                    "1000".to_string()
+                } else {
+                    String::new()
+                },
+                stderr: if ok {
+                    String::new()
+                } else {
+                    "rejected-private-value".to_string()
+                },
+            })
+        }
+        async fn set_elevation_password(&self, password: Option<String>) {
+            *self.password.lock().await = password;
+        }
+    }
+
+    #[test]
+    fn component_sudo_rejects_unrelated_targets_and_actions() {
+        for (component, host_id, kind, os, locality) in [
+            (
+                ComponentId::NodeJs,
+                "remote:s1",
+                StepKind::Update,
+                Os::Linux,
+                Locality::Remote,
+            ),
+            (
+                ComponentId::Qq,
+                "local",
+                StepKind::Update,
+                Os::Linux,
+                Locality::Remote,
+            ),
+            (
+                ComponentId::Qq,
+                "remote:",
+                StepKind::Update,
+                Os::Linux,
+                Locality::Remote,
+            ),
+            (
+                ComponentId::Qq,
+                "remote:s1",
+                StepKind::Update,
+                Os::Windows,
+                Locality::Remote,
+            ),
+            (
+                ComponentId::Qq,
+                "remote:s1",
+                StepKind::Update,
+                Os::Linux,
+                Locality::Local,
+            ),
+            (
+                ComponentId::Qq,
+                "remote:s1",
+                StepKind::Uninstall,
+                Os::Linux,
+                Locality::Remote,
+            ),
+            (
+                ComponentId::Qq,
+                "remote:s1",
+                StepKind::Verify,
+                Os::Linux,
+                Locality::Remote,
+            ),
+        ] {
+            assert!(
+                component_task_sudo(
+                    component,
+                    host_id,
+                    kind,
+                    os,
+                    locality,
+                    Some("secret".into()),
+                    false,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            component_task_sudo(
+                ComponentId::Qq,
+                "remote:s1",
+                StepKind::Update,
+                Os::Linux,
+                Locality::Remote,
+                None,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn novnc_accepts_a_one_time_local_password() {
+        let sudo = component_task_sudo(
+            ComponentId::NoVnc,
+            "local",
+            StepKind::EnsureInstalled,
+            Os::Linux,
+            Locality::Local,
+            Some("secret".into()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sudo.password, "secret");
+        assert!(!sudo.remember);
+    }
+
+    #[test]
+    fn component_sudo_accepts_qq_mutations_without_changing_the_password() {
+        for kind in [
+            StepKind::EnsureInstalled,
+            StepKind::ForceInstall,
+            StepKind::Update,
+            StepKind::EnsureDependencies,
+        ] {
+            let sudo = component_task_sudo(
+                ComponentId::Qq,
+                "remote:s1",
+                kind,
+                Os::Linux,
+                Locality::Remote,
+                Some(" value with spaces ".into()),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(sudo.password, " value with spaces ");
+            assert!(!sudo.remember);
+        }
+        for component_id in [ComponentId::NapCat, ComponentId::SnowLuma] {
+            assert!(
+                component_task_sudo(
+                    component_id,
+                    "local",
+                    StepKind::EnsureInstalled,
+                    Os::Linux,
+                    Locality::Local,
+                    Some("local-password".into()),
+                    false,
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+        let local = component_task_sudo(
+            ComponentId::Qq,
+            "local",
+            StepKind::EnsureDependencies,
+            Os::Linux,
+            Locality::Local,
+            Some("local-password".into()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(local.password, "local-password");
+        assert!(!local.remember);
+        assert!(
+            component_task_sudo(
+                ComponentId::NapCat,
+                "local",
+                StepKind::Verify,
+                Os::Windows,
+                Locality::Local,
+                None,
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn component_sudo_keeps_one_time_password_off_shared_host_and_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = test_executor(temp.path());
+        let shared_host = SudoHost::new(true);
+        let validation_host = SudoHost::new(true);
+        let task_host = SudoHost::new(true);
+        let sudo = ComponentTaskSudo {
+            password: "accepted".into(),
+            remember: false,
+        };
+
+        validate_component_task_sudo(
+            &validation_host,
+            Some(sudo.clone()),
+            executor.server_manager.as_ref(),
+            "s1",
+        )
+        .await
+        .unwrap();
+        inject_component_task_sudo(&task_host, Some(sudo)).await;
+
+        assert!(validation_host.password.lock().await.is_none());
+        assert_eq!(task_host.password.lock().await.as_deref(), Some("accepted"));
+        assert!(shared_host.password.lock().await.is_none());
+        assert!(executor.server_manager.sudo_password("s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn component_sudo_saves_only_verified_password_and_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = test_executor(temp.path());
+        executor
+            .server_manager
+            .remember_sudo_password("s1", "previous")
+            .unwrap();
+        let mut validation_host = SudoHost::new(true);
+        validation_host.timestamp_cached = true;
+
+        let error = validate_component_task_sudo(
+            &validation_host,
+            Some(ComponentTaskSudo {
+                password: "rejected-private-value".into(),
+                remember: true,
+            }),
+            executor.server_manager.as_ref(),
+            "s1",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("elevation_required"));
+        assert!(!error.contains("rejected-private-value"));
+        assert_eq!(
+            executor.server_manager.sudo_password("s1").as_deref(),
+            Some("previous")
+        );
+
+        validate_component_task_sudo(
+            &validation_host,
+            Some(ComponentTaskSudo {
+                password: "accepted".into(),
+                remember: true,
+            }),
+            executor.server_manager.as_ref(),
+            "s1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            executor.server_manager.sudo_password("s1").as_deref(),
+            Some("accepted")
+        );
+    }
+
+    #[tokio::test]
+    async fn component_sudo_does_not_save_an_unneeded_or_unverified_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = test_executor(temp.path());
+        let passwordless_host = SudoHost::new(false);
+        validate_component_task_sudo(
+            &passwordless_host,
+            Some(ComponentTaskSudo {
+                password: "unused".into(),
+                remember: true,
+            }),
+            executor.server_manager.as_ref(),
+            "s1",
+        )
+        .await
+        .unwrap();
+        assert!(executor.server_manager.sudo_password("s1").is_none());
+
+        let mut disconnected_host = SudoHost::new(true);
+        disconnected_host.transport_fails = true;
+        let error = validate_component_task_sudo(
+            &disconnected_host,
+            Some(ComponentTaskSudo {
+                password: "accepted".into(),
+                remember: true,
+            }),
+            executor.server_manager.as_ref(),
+            "s1",
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.contains("elevation_required"));
+        assert!(executor.server_manager.sudo_password("s1").is_none());
+    }
+
+    #[tokio::test]
+    async fn qq_dependency_preflight_requests_password_before_any_package_change() {
+        let isolated_host = SudoHost::new(true);
+        let error = preflight_qq_dependency_elevation(&isolated_host)
+            .await
+            .unwrap_err();
+        assert!(error.contains("elevation_required"));
+        let commands = isolated_host.commands.lock().await;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].program, "id");
+        assert_eq!(commands[1].program, "true");
+        assert!(commands[1].elevated);
+        assert!(commands.iter().all(|command| command.stdin.is_none()));
+        assert!(isolated_host.password.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn qq_dependency_preflight_accepts_the_isolated_hosts_saved_password() {
+        let isolated_host = SudoHost::new(true);
+        isolated_host
+            .set_elevation_password(Some("accepted".into()))
+            .await;
+        preflight_qq_dependency_elevation(&isolated_host)
+            .await
+            .unwrap();
+        assert_eq!(isolated_host.commands.lock().await.len(), 2);
+    }
+
+    #[test]
+    fn queue_note_prefers_prerequisites_over_package_manager() {
+        assert_eq!(queue_note(&[], false), None);
+        assert_eq!(
+            queue_note(&[], true).as_deref(),
+            Some("排队等待包管理器空闲")
+        );
+        let waiting = vec![
+            (
+                DependencyTarget::Component {
+                    id: ComponentId::Qq,
+                },
+                "t1".to_string(),
+            ),
+            (
+                DependencyTarget::HostCommand {
+                    command: "tar".to_string(),
+                    package: "tar".to_string(),
+                },
+                "t2".to_string(),
+            ),
+        ];
+        assert_eq!(
+            queue_note(&waiting, true).as_deref(),
+            Some("等待前置:QQ、tar")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_forward_passes_cancel_and_ends_with_its_guard() {
+        let from = CancellationToken::new();
+        let to = CancellationToken::new();
+        let (_guard, handle) = forward_cancel(from.clone(), to.clone());
+        from.cancel();
+        handle.await.unwrap();
+        assert!(to.is_cancelled());
+
+        // 没人取消:guard 一丢 watcher 就退出,目标令牌不受影响
+        let from = CancellationToken::new();
+        let to = CancellationToken::new();
+        let (guard, handle) = forward_cancel(from, to.clone());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("watcher should end once its guard is dropped")
+            .unwrap();
+        assert!(!to.is_cancelled());
+    }
+
+    fn test_executor(root: &Path) -> ComponentExecutor {
+        let bus = BroadcastEventBus::default();
+        ComponentExecutor::new(ComponentExecutorDeps {
+            deployment_tasks: DeploymentTaskManager::new(bus.clone()),
+            server_manager: Arc::new(ServerManager::new(
+                root,
+                Arc::new(ncd_server::InMemoryCredentialStore::default()),
+            )),
+            event_bus: bus,
+            app_settings: Arc::new(RwLock::new(AppSettings::default())),
+            data_root: root.to_path_buf(),
+            local_snowluma_version: None,
+            desktop_product_version: "0.0.0".into(),
+            registry: Arc::new(AppFrameworkRegistry::new()),
+        })
+    }
+
+    /// 排一个和 ComponentTaskRunner 一样登记令牌、接上队列转发的任务,
+    /// 跑起来后一直等到令牌被取消;返回它的 ActionCtx 令牌
+    async fn submit_waiting_task(
+        executor: &ComponentExecutor,
+        task_id: &str,
+        cancellable: bool,
+    ) -> CancellationToken {
+        let (started_tx, started_rx) = oneshot::channel();
+        let active = executor.active_tasks().clone();
+        executor
+            .deployment_tasks
+            .submit(DeploymentTaskRequest {
+                task_id: task_id.to_string(),
+                kind: DeploymentTaskKind::ComponentAction {
+                    component_id: "qq".into(),
+                    action: "ensure_dependencies".into(),
+                },
+                host_id: "remote:s1".into(),
+                title: "t".into(),
+                resources: Vec::new(),
+                depends_on: Vec::new(),
+                dedupe_key: None,
+                cancellable,
+                runner: Box::new(move |task_ctx| {
+                    Box::pin(async move {
+                        let token = CancellationToken::new();
+                        let _registered = active.register(task_ctx.task_id(), token.clone());
+                        let (_forward, _) = forward_cancel(task_ctx.cancel_token(), token.clone());
+                        let _ = started_tx.send(token.clone());
+                        token.cancelled().await;
+                        DeploymentTaskRunResult::failed("任务已取消")
+                    })
+                }),
+            })
+            .await;
+        started_rx.await.expect("task should start")
+    }
+
+    #[tokio::test]
+    async fn cancel_refused_by_queue_leaves_running_action_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor = test_executor(tmp.path());
+        let token = submit_waiting_task(&executor, "pkg", false).await;
+
+        let err = executor.cancel("pkg").await.unwrap_err();
+
+        assert!(err.contains("不能安全强制停止"));
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancel_running_cancellable_task_goes_through_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor = test_executor(tmp.path());
+        let token = submit_waiting_task(&executor, "dl", true).await;
+
+        executor.cancel("dl").await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("queue cancel should reach the action token");
+    }
+
+    #[tokio::test]
+    async fn cancel_outside_queue_uses_active_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let executor = test_executor(tmp.path());
+        let token = CancellationToken::new();
+        let _registered = executor.active_tasks().register("desktop", token.clone());
+
+        executor.cancel("desktop").await.unwrap();
+        assert!(token.is_cancelled());
+        assert!(executor.cancel("gone").await.is_err());
+    }
+
+    #[test]
+    fn infer_local_package_defaults_to_full_when_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            infer_local_snowluma_package(tmp.path()),
+            SnowLumaLinuxPackage::Full
+        );
+        let dir = tmp.path().join("components").join("SnowLuma");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            infer_local_snowluma_package(tmp.path()),
+            SnowLumaLinuxPackage::Lite
+        );
+        let binaries: &[&str] = if cfg!(windows) {
+            &["node.exe"]
+        } else {
+            &["node", "node/bin/node"]
+        };
+        for binary in binaries {
+            let path = dir.join(binary);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            assert_eq!(
+                infer_local_snowluma_package(tmp.path()),
+                SnowLumaLinuxPackage::Full
+            );
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(
+                infer_local_snowluma_package(tmp.path()),
+                SnowLumaLinuxPackage::Lite
+            );
+        }
+    }
+}

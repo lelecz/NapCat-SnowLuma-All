@@ -1,0 +1,12 @@
+pub mod napcat;
+pub mod remote_native_napcat_session;
+
+// 兼容旧路径: ncd_backend_napcat::remote_native_launch
+pub use remote_native_napcat_session::launch as remote_native_launch;
+pub use remote_native_napcat_session::launch::read_remote_napcat_connect;
+
+pub use napcat::debug_client::{NapCatDebugClient, NapCatDebugError};
+pub use napcat::login_poller::{NapCatLoginPoller, PollerConfig, PollerDeps, RestartHandle};
+pub use napcat::offline_notifier::NoopOfflineNotifier;
+pub use napcat::webui_client::ReqwestNapCatWebUiClient;
+pub use napcat::webui_config::parse_webui_json_token;

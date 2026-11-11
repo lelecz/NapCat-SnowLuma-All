@@ -1,0 +1,128 @@
+//! 本机 NativeDeployment -> BotBackend 过渡壳
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ncd_deploy::{Deployment, NativeDeployment, NativeLaunchCommand};
+use ncd_domain::BotFlavor;
+use ncd_domain::bot_status::BotStatus;
+use ncd_domain::ids::BotId;
+use ncd_domain::kinds::{BackendKind, StopMode};
+use ncd_host::Host;
+use ncd_traits::runtime_backend::{
+    BotBackend, BotBackendError, BotRuntimeConfig, BotStartCtx, LogSnapshot, TailOpts,
+};
+
+use super::config::bot_config_for_start;
+
+/// 过渡壳:让 NativeDeployment 穿上 BotBackend trait 的外套
+pub struct NativeDeploymentBackend {
+    deployment: Arc<NativeDeployment>,
+    host: Arc<dyn Host>,
+    backend_id: BotId,
+    flavor: BotFlavor,
+}
+
+impl NativeDeploymentBackend {
+    pub fn new(
+        deployment: Arc<NativeDeployment>,
+        host: Arc<dyn Host>,
+        backend_id: impl Into<BotId>,
+        flavor: BotFlavor,
+    ) -> Self {
+        Self {
+            deployment,
+            host,
+            backend_id: backend_id.into(),
+            flavor,
+        }
+    }
+}
+
+#[async_trait]
+impl BotBackend for NativeDeploymentBackend {
+    fn id(&self) -> &BotId {
+        &self.backend_id
+    }
+
+    fn kind(&self) -> BackendKind {
+        BackendKind::Local
+    }
+
+    fn flavor(&self) -> BotFlavor {
+        self.flavor
+    }
+
+    async fn start(&self, ctx: &BotStartCtx) -> Result<BotStatus, BotBackendError> {
+        let bot_config = bot_config_for_start(ctx, self.flavor, false)?;
+
+        // BotManager 已 build_plan + 合并指标 env。优先用 ctx.config 直接 spawn，
+        // 避免 NativeDeployment::launch → translate → 二次 build_plan 冲掉探针。
+        let handle = if let Some(plan) = native_launch_command_from_runtime(&ctx.config) {
+            self.deployment
+                .launch_with_command(self.host.as_ref(), &bot_config, plan)
+                .await
+                .map_err(|err| BotBackendError::Io(err.to_string()))?
+        } else {
+            self.deployment
+                .launch(self.host.as_ref(), &bot_config)
+                .await
+                .map_err(|err| BotBackendError::Io(err.to_string()))?
+        };
+
+        match handle {
+            ncd_deploy::DeploymentHandle::Native { pid, started_at } => Ok(BotStatus::running(
+                ctx.config.bot_id.clone(),
+                pid,
+                started_at,
+            )),
+            _ => Err(BotBackendError::Io("unexpected handle variant".into())),
+        }
+    }
+
+    async fn stop(&self, bot_id: BotId, mode: StopMode) -> Result<(), BotBackendError> {
+        self.deployment
+            .stop(self.host.as_ref(), &bot_id, mode)
+            .await
+            .map_err(|err| BotBackendError::Io(err.to_string()))
+    }
+
+    async fn status(&self, bot_id: BotId) -> Result<BotStatus, BotBackendError> {
+        let state = self
+            .deployment
+            .observe(self.host.as_ref(), &bot_id)
+            .await
+            .map_err(|err| BotBackendError::Io(err.to_string()))?;
+        match state {
+            ncd_deploy::DeploymentState::Running => {
+                // 从 deployment 拿不到精确 pid/started_at,返回 running 用 0 占位
+                // BotManager 只看 state 字段做决策,pid 在 start 时已经拿到了
+                Ok(BotStatus::running(bot_id, 0, 0))
+            }
+            _ => Ok(BotStatus::stopped(bot_id)),
+        }
+    }
+
+    async fn tail_log(
+        &self,
+        bot_id: BotId,
+        opts: TailOpts,
+    ) -> Result<LogSnapshot, BotBackendError> {
+        Ok(self.deployment.tail_log(&bot_id, opts.lines).await)
+    }
+}
+
+/// 从 BotManager 已准备好的 BotRuntimeConfig 抽出 spawn 命令。
+/// launch_command 为空（如 SnowLuma daemon 路径）时返回 None，走原 translate。
+fn native_launch_command_from_runtime(cfg: &BotRuntimeConfig) -> Option<NativeLaunchCommand> {
+    let (program, args) = cfg.launch_command.split_first()?;
+    if program.is_empty() {
+        return None;
+    }
+    Some(NativeLaunchCommand {
+        program: program.clone(),
+        args: args.to_vec(),
+        working_dir: cfg.working_dir.clone(),
+        environment: cfg.environment.clone(),
+    })
+}

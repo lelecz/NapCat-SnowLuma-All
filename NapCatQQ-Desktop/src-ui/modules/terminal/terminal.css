@@ -1,0 +1,259 @@
+/* 终端面板。xterm 自己的样式在 @xterm/xterm/css/xterm.css，这里只补外壳和命令标记。 */
+
+.ncd-term-host {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+}
+
+/* 内边距挂在 .xterm 上：FitAddon 算行列时减的是它的内边距；左边留宽一点放命令标记 */
+.ncd-term-host > .xterm {
+    height: 100%;
+    padding: 6px 0 2px 16px;
+}
+
+/* viewport 铺满整个 .xterm（连内边距一起），xterm 自带样式给它刷的是黑底，
+   主题色只刷到内容区，不改的话左边和底下各露一条黑边 */
+.ncd-term-host .xterm .xterm-viewport {
+    background-color: var(--ncd-term-bg);
+}
+
+.ncd-term-host .xterm:focus,
+.ncd-term-host .xterm-helper-textarea:focus {
+    outline: none;
+}
+
+/* 命令标记：挂在提示符那一行，挪进左边的内边距里，成功绿、失败红 */
+.xterm-screen .xterm-decoration-container .xterm-decoration.ncd-term-mark {
+    width: 3px !important;
+    margin-left: -10px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--state-success) 75%, transparent);
+    pointer-events: auto;
+    cursor: default;
+}
+
+.xterm-screen .xterm-decoration-container .xterm-decoration.ncd-term-mark.is-fail {
+    background: var(--state-danger);
+}
+
+/* 拖文件进来时的提示层 */
+.ncd-term-drop {
+    position: absolute;
+    inset: 6px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed color-mix(in srgb, var(--accent-500) 70%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent-500) 10%, transparent);
+    color: var(--text-primary);
+    font-size: 13px;
+    pointer-events: none;
+}
+
+/* 面板里的小动效。面板本身的开合、最大化由 TerminalDock 用 GSAP 做；这里是挂上时放一次的 CSS 动画，
+   只动 transform / opacity，用 backwards 填充，放完不留 transform。
+   面板根上 data-motion='on' 才放（跟着设置里的动效开关和系统的减少动态效果） */
+@keyframes ncd-term-fade-up {
+    from {
+        opacity: 0;
+        transform: translateY(4px) scale(0.96);
+    }
+}
+
+@keyframes ncd-term-fade {
+    from {
+        opacity: 0.35;
+    }
+}
+
+@keyframes ncd-term-slide-left {
+    from {
+        opacity: 0;
+        transform: translateX(14px);
+    }
+}
+
+@keyframes ncd-term-slide-down {
+    from {
+        opacity: 0;
+        transform: translateY(-6px);
+    }
+}
+
+@keyframes ncd-term-pop {
+    from {
+        opacity: 0;
+        transform: scale(0.88);
+    }
+    60% {
+        opacity: 1;
+        transform: scale(1.04);
+    }
+}
+
+@keyframes ncd-term-dot-pop {
+    from {
+        transform: scale(0);
+    }
+    70% {
+        transform: scale(1.5);
+    }
+}
+
+.ncd-term[data-motion="on"] .ncd-term-tab {
+    animation: ncd-term-fade-up 180ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+/* 切标签：新的一组淡进来，不位移，免得终端文字晃 */
+.ncd-term[data-motion="on"] .ncd-term-group {
+    animation: ncd-term-fade 140ms ease-out backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-pane-in {
+    animation: ncd-term-slide-left 220ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-pane-in[data-split="column"] {
+    animation-name: ncd-term-slide-down;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-slide-in {
+    animation: ncd-term-slide-left 200ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+/* 文件栏换目录：进子目录从右边滑进来，回上级从左边 */
+@keyframes ncd-term-nav-from-right {
+    from {
+        opacity: 0;
+        transform: translateX(18px);
+    }
+}
+
+@keyframes ncd-term-nav-from-left {
+    from {
+        opacity: 0;
+        transform: translateX(-18px);
+    }
+}
+
+.ncd-term[data-motion="on"] .ncd-term-nav-in {
+    animation: ncd-term-nav-from-right 200ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-nav-out {
+    animation: ncd-term-nav-from-left 200ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-drop-down {
+    animation: ncd-term-slide-down 160ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-pop {
+    animation: ncd-term-pop 260ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-dot {
+    animation: ncd-term-dot-pop 320ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-drop {
+    animation: ncd-term-fade 120ms ease-out backwards;
+}
+
+/* 当前标签的底色块：落位后切标签才滑；第一次落位 data-instant 不带过渡 */
+.ncd-term-tab-indicator {
+    opacity: 0;
+}
+
+.ncd-term[data-motion="on"] .ncd-term-tab-indicator[data-instant="false"] {
+    transition:
+        transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+        width 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+        opacity 120ms ease-out;
+}
+
+/* 面板顶边的拖动条：看不见，鼠标放上去才出现一条线。面板是圆角裁切的，条要放在里面 */
+.ncd-term-resize {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 6px;
+    z-index: 30;
+    cursor: row-resize;
+}
+
+.ncd-term-resize::after {
+    content: "";
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    top: 0;
+    height: 2px;
+    background: transparent;
+    transition: background-color 120ms ease-out;
+}
+
+.ncd-term-resize:hover::after,
+.ncd-term-resize[data-dragging="true"]::after {
+    background: color-mix(in srgb, var(--accent-500) 60%, transparent);
+}
+
+/* 文件栏左边缘的拖动条，和面板顶边那条一样平时看不见。文件栏横向裁切，条放在里面 */
+.ncd-term-files-resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 6px;
+    z-index: 15;
+    cursor: col-resize;
+}
+
+.ncd-term-files-resize::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 2px;
+    background: transparent;
+    transition: background-color 120ms ease-out;
+}
+
+.ncd-term-files-resize:hover::after,
+.ncd-term-files-resize[data-dragging="true"]::after {
+    background: color-mix(in srgb, var(--accent-500) 60%, transparent);
+}
+
+/* 分屏中间的分隔条 */
+.ncd-term-divider {
+    flex: none;
+    position: relative;
+    z-index: 10;
+    background: var(--border-subtle);
+}
+
+.ncd-term-divider[data-split="row"] {
+    width: 1px;
+    cursor: col-resize;
+}
+
+.ncd-term-divider[data-split="column"] {
+    height: 1px;
+    cursor: row-resize;
+}
+
+.ncd-term-divider::before {
+    content: "";
+    position: absolute;
+    inset: -3px;
+}
+
+.ncd-term-divider:hover,
+.ncd-term-divider[data-dragging="true"] {
+    background: color-mix(in srgb, var(--accent-500) 60%, transparent);
+}

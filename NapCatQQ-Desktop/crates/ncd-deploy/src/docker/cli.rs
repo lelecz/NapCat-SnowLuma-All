@@ -1,0 +1,1377 @@
+//! DockerCli:docker 命令封装,跑在任意 Host 上(Linux)
+//!
+//! 设计:只持有 &dyn Host,每个方法拼一条 docker 命令交给 host.run_to_string
+//! 命令参数全部走 HostCommand::arg 分开传,由 shell 层做转义,杜绝把用户输入
+//! (容器名 / 端口)拼进命令字符串导致注入
+//!
+//! 解析策略:用 --format '{{json .}}' 让 docker 自己吐 JSON,逐行 serde 解析,
+//! 不靠脆弱的列宽切分
+
+use serde::Deserialize;
+use std::collections::HashMap;
+
+use ncd_domain::{ContainerInfo, ContainerState, DockerPullLayerSnapshot, DockerStatus, ImageInfo};
+use ncd_host::{Host, HostCommand, HostError, HostPath, StreamSource};
+use tracing::{info, warn};
+
+#[path = "compose_provider.rs"]
+mod compose_provider;
+#[path = "engine_identity.rs"]
+mod engine_identity;
+#[path = "management.rs"]
+mod management;
+
+/// DockerCli 操作错误
+#[derive(Debug, thiserror::Error)]
+pub enum DockerCliError {
+    #[error(
+        "检测到 docker 命令由 podman-docker 提供，它是 Podman 的兼容入口。请在“容器部署”中选择 Podman 引擎，以管理当前用户的容器和镜像。"
+    )]
+    PodmanCompatibilityShim,
+    #[error("invalid docker argument: {0}")]
+    InvalidArgument(String),
+    /// host 层调用失败(SSH 中断 / 进程起不来)
+    #[error("host error: {0}")]
+    Host(#[from] HostError),
+
+    /// docker 命令跑了但退出码非 0,stderr 给上层拼错误文案
+    #[error("docker command failed: {command}: exit={exit_code:?}: {stderr}")]
+    CommandFailed {
+        command: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+
+    /// Docker runtime 未达到部署要求
+    #[error("docker runtime unavailable: {status:?}")]
+    RuntimeUnavailable { status: DockerStatus },
+
+    /// 解析 docker 输出失败(JSON 格式不对等)
+    #[error("failed to parse docker output: {0}")]
+    ParseFailed(String),
+}
+
+/// docker CLI 封装轻量,每个操作拼一条命令交给 host
+///
+/// 提权:远端用户常不在 docker 组(装完没重登 / usermod 没生效),裸 docker
+/// 命令会 permission denied 连不上 /var/run/docker.sock,probe() 会探一次
+/// 「裸 docker 行不行,不行但 sudo 行」,把结果记在 elevated 里;之后所有命令
+/// 按它决定要不要 .elevated()(提权密码由 Host 层注入);
+/// 用 AtomicBool 是因为操作方法都是 &self,且要跨 await 保持 Send
+pub struct DockerCli<'h> {
+    host: &'h dyn Host,
+    engine: super::engine::ContainerEngine,
+    elevated: std::sync::atomic::AtomicBool,
+    podman_compose: tokio::sync::OnceCell<compose_provider::PodmanComposeProbe>,
+    docker_is_podman: tokio::sync::OnceCell<bool>,
+}
+
+impl<'h> DockerCli<'h> {
+    pub fn new(host: &'h dyn Host) -> Self {
+        Self::for_engine(host, None)
+    }
+
+    pub fn for_bot(host: &'h dyn Host, config: &ncd_domain::BotConfig) -> Self {
+        Self::for_engine(host, Some(super::engine::engine_for_bot(host, config)))
+    }
+
+    pub fn for_engine(host: &'h dyn Host, engine: Option<super::engine::ContainerEngine>) -> Self {
+        Self {
+            host,
+            engine: engine.unwrap_or_else(|| super::engine::engine_for(host)),
+            elevated: std::sync::atomic::AtomicBool::new(false),
+            podman_compose: tokio::sync::OnceCell::new(),
+            docker_is_podman: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub fn engine(&self) -> super::engine::ContainerEngine {
+        self.engine
+    }
+
+    /// 按当前提权标志构造命令；调用前先 ensure_ready / ensure_daemon_ready。
+    /// elevated=true 时打 .elevated() 标,
+    /// Host 层用注入的 sudo 密码走 sudo -S/-n;否则裸 docker,所有 docker 操作
+    /// 都经这里,保证「探测判定要 sudo」,后续操作就一致地 sudo,不会探测过了部署却挂
+    pub fn command(&self) -> HostCommand {
+        let cmd = HostCommand::new(self.engine.program());
+        if self.elevated.load(std::sync::atomic::Ordering::Relaxed) {
+            cmd.elevated()
+        } else {
+            cmd
+        }
+    }
+
+    fn docker_cmd(&self) -> HostCommand {
+        self.command()
+    }
+
+    /// 探测 docker 是否可用,任何一步失败都退化成"未装/未就绪",不报错——
+    /// 探测本身不该把"没装 docker"当异常
+    pub async fn probe(&self) -> DockerStatus {
+        if self.verify_selected_engine().await.is_err() {
+            return DockerStatus::absent();
+        }
+        // docker 客户端版本(不连 daemon,普通用户就能跑),拿不到直接判定未装
+        let version = match self.docker_client_version().await {
+            Some(v) => v,
+            None => return DockerStatus::absent(),
+        };
+
+        // 探 daemon,裸 docker info 能过最好(用户已在 docker 组);permission denied
+        // 但 sudo 能过 → daemon 其实在跑,只是当前会话没 socket 权限(没重登/没进组),
+        // 记下 elevated 让后续命令都走 sudo,两者都不过才是 daemon 真没起
+        let daemon_running = self.probe_daemon_with_elevation().await;
+
+        // compose v2 插件(按已定的 elevated 标志跑)
+        let compose_available = self.docker_compose_ok().await;
+
+        DockerStatus {
+            compose_diagnostic: self.compose_diagnostic().await,
+            installed: true,
+            version,
+            compose_available,
+            daemon_running,
+        }
+    }
+
+    /// 确保当前 Host 上 docker + daemon + compose 都可用,并刷新提权决策
+    ///
+    /// Deployment 的 install / launch / observe / stop 各自会新建 DockerCli,每个
+    /// operation 入口先调用这里,就算上一次 probe 的 elevated 标志没有跨对象保存,
+    /// 本次命令也会重新定夺 sudo 路径
+    pub async fn ensure_ready(&self) -> Result<DockerStatus, DockerCliError> {
+        let status = self.probe_checked().await?;
+        if status.ready_to_deploy() {
+            Ok(status)
+        } else {
+            Err(DockerCliError::RuntimeUnavailable { status })
+        }
+    }
+
+    /// 确保 docker daemon 可用并刷新提权决策,但不要求 compose 插件
+    ///
+    /// 容器管理面(list / start / stop / restart / remove / logs)只需要 daemon,
+    /// 不需要 compose;它们必须先走这里 probe 一次,否则后续裸 docker 命令在"装了
+    /// docker 但当前会话没 socket 权限(没重登 / 没进 docker 组)"的远端会 permission
+    /// denied 而不会自动 sudo,部署 / compose down 仍用 ensure_ready(额外要 compose)
+    pub async fn ensure_daemon_ready(&self) -> Result<(), DockerCliError> {
+        self.verify_selected_engine().await?;
+        self.management_probe_daemon().await
+    }
+
+    /// Docker 使用 Client.Version；Linux Podman 使用不初始化运行时的 --version。
+    /// 客户端版本不连 daemon,无需提权,固定裸跑——它是"装没装 docker"的判据
+    async fn docker_client_version(&self) -> Option<String> {
+        // 先尝试普通命令
+        let cmd = self.client_version_command();
+        if let Ok(out) = self.host.run_to_string(cmd).await {
+            let v = self.client_version_text(&out.stdout);
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+
+        // sudo fallback 只对 Linux 远端有意义(刚装完 PATH 未刷新 / docker 组未生效);
+        // Windows 本机没有 sudo 语义,裸 docker 失败就该直接判未装,
+        // 再发 elevated 会真的去 ShellExecute "docker",找不到文件只会白弹提权链路
+        if self.host.os() == ncd_host::Os::Windows
+            || self.engine == super::engine::ContainerEngine::Podman
+        {
+            return None;
+        }
+
+        // fallback: 尝试 sudo(刚安装完 PATH 可能未刷新)
+        let cmd_sudo = HostCommand::new(self.engine.program())
+            .arg("version")
+            .arg("--format")
+            .arg("{{.Client.Version}}")
+            .elevated()
+            .timeout(std::time::Duration::from_secs(15));
+        let out = self.host.run_to_string(cmd_sudo).await.ok()?;
+        if !out.success() {
+            return None;
+        }
+        let v = out.stdout.trim();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    }
+
+    /// 优先当前用户的 context，避免 sudo 切到另一个 daemon（例如 rootless Docker）。
+    async fn probe_daemon_with_elevation(&self) -> bool {
+        self.management_probe_daemon().await.is_ok()
+    }
+
+    /// docker compose version,compose v2 插件存在时退出码 0,按 elevated 标志跑
+    async fn docker_compose_ok(&self) -> bool {
+        if self.is_linux_podman() {
+            return self.podman_compose_available().await;
+        }
+        let cmd = self
+            .docker_cmd()
+            .arg("compose")
+            .arg("version")
+            .timeout(std::time::Duration::from_secs(15));
+        matches!(self.host.run_to_string(cmd).await, Ok(out) if out.success())
+    }
+}
+
+impl<'h> DockerCli<'h> {
+    /// 列所有容器(含已停止),docker ps -a --format '{{json .}}' 逐行 JSON
+    pub async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("ps")
+            .arg("-a")
+            .arg("--no-trunc")
+            .arg("--format")
+            .arg(if self.engine == super::engine::ContainerEngine::Podman { r#"{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"Ports":{{json .Ports}}}"# } else { "{{json .}}" })
+            .timeout(std::time::Duration::from_secs(30));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: "docker ps -a".to_string(),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        parse_ps_json(&out.stdout)
+    }
+
+    /// 列本地镜像(含悬空),docker images --format '{{json .}}' 逐行 JSON
+    pub async fn list_images(&self) -> Result<Vec<ImageInfo>, DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("images")
+            .arg("--no-trunc")
+            .arg("--format")
+            .arg(if self.engine == super::engine::ContainerEngine::Podman { r#"{"ID":{{json .ID}},"Repository":{{json .Repository}},"Tag":{{json .Tag}},"Size":{{json .Size}},"CreatedSince":{{json .CreatedSince}}}"# } else { "{{json .}}" })
+            .timeout(std::time::Duration::from_secs(30));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: "docker images".to_string(),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        parse_images_json(&out.stdout)
+    }
+
+    /// 删除本地镜像,image_ref 可为 repo:tag 或 id;force 时加 -f
+    pub async fn remove_image(&self, image_ref: &str, force: bool) -> Result<(), DockerCliError> {
+        Self::validate_reference(image_ref)?;
+        let mut cmd = self.docker_cmd().arg("rmi");
+        if force {
+            cmd = cmd.arg("-f");
+        }
+        let cmd = cmd
+            .arg("--")
+            .arg(image_ref)
+            .timeout(std::time::Duration::from_secs(60));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker rmi{} {image_ref}", if force { " -f" } else { "" }),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 对单个容器执行 start / stop / restart,命令名固定,容器名走 arg 转义
+    pub async fn lifecycle(&self, action: &str, container: &str) -> Result<(), DockerCliError> {
+        Self::validate_reference(container)?;
+        if !matches!(action, "start" | "stop" | "restart" | "pause" | "unpause") {
+            return Err(DockerCliError::InvalidArgument(
+                "unsupported container action".into(),
+            ));
+        }
+        let cmd = self
+            .docker_cmd()
+            .arg(action)
+            .arg("--")
+            .arg(container)
+            .timeout(std::time::Duration::from_secs(60));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker {action} {container}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 删除容器默认带 -f 强制删(运行中也删),避免用户先 stop 再 remove 两步
+    pub async fn remove(&self, container: &str) -> Result<(), DockerCliError> {
+        let cmd = self.docker_cmd().arg("rm").arg("-f").arg(container);
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker rm -f {container}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 取容器最近 tail 行日志,stdout + stderr 合并返回(docker logs 两路都吐)
+    pub async fn logs(&self, container: &str, tail: u32) -> Result<String, DockerCliError> {
+        Self::validate_reference(container)?;
+        let cmd = self
+            .docker_cmd()
+            .arg("logs")
+            .arg("--tail")
+            .arg(tail.clamp(1, 2000).to_string())
+            .arg("--")
+            .arg(container)
+            .timeout(std::time::Duration::from_secs(30));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker logs --tail {tail} {container}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        // docker logs 把容器 stdout 走 stdout,stderr 走 stderr;合并保留时序近似
+        let mut combined = out.stdout;
+        if !out.stderr.trim().is_empty() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(&out.stderr);
+        }
+        Ok(combined)
+    }
+
+    /// 跟随容器日志直到命令结束(容器停或 SSH 断),每行回调一次
+    pub async fn logs_follow<F>(&self, container: &str, on_line: F) -> Result<(), DockerCliError>
+    where
+        F: FnMut(StreamSource, String) + Send + 'static,
+    {
+        let cmd = self
+            .docker_cmd()
+            .arg("logs")
+            .arg("-f")
+            .arg("--since")
+            .arg("0")
+            .arg(container);
+        let out = self
+            .host
+            .run_streaming(cmd, Box::new(on_line))
+            .await
+            .map_err(DockerCliError::Host)?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker logs -f {container}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'h> DockerCli<'h> {
+    /// 镜像在组件页预拉并验证；启动不隐式联网拉取不同版本。
+    pub async fn compose_up(&self, project_dir: &str) -> Result<(), DockerCliError> {
+        let mut cmd = self
+            .compose_command()
+            .await?
+            .arg("up")
+            .arg("-d")
+            .arg("--remove-orphans")
+            .working_dir(ncd_host::HostPath::from_posix(project_dir))
+            .timeout(std::time::Duration::from_secs(900));
+        // podman-compose 的 --pull 是布尔开关；Podman 在生成的 YAML 中声明 never。
+        if self.engine == super::engine::ContainerEngine::Docker {
+            cmd = cmd.args(["--pull", "never"]);
+        }
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker compose up -d (in {project_dir})"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// docker compose down,可选 -v 连卷一起删(彻底清理时用)
+    pub async fn compose_down(
+        &self,
+        project_dir: &str,
+        remove_volumes: bool,
+    ) -> Result<(), DockerCliError> {
+        let mut cmd = self
+            .compose_command()
+            .await?
+            .arg("down")
+            .working_dir(ncd_host::HostPath::from_posix(project_dir))
+            .timeout(std::time::Duration::from_secs(300));
+        if remove_volumes {
+            cmd = cmd.arg("-v");
+        }
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker compose down (in {project_dir})"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 单源硬上限:有进度时允许拉很久(大镜像 / 慢网)
+    pub const PULL_PER_CANDIDATE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30 * 60);
+    /// 无任何输出超过此时长 → 判定卡死,换下一个源(不是用户取消)
+    pub const PULL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8 * 60);
+
+    ///
+    /// 超时策略:
+    /// - 硬上限 [PULL_PER_CANDIDATE_TIMEOUT](有进度可拉满)
+    /// - 无输出超过 [PULL_STALL_TIMEOUT] → 杀进程并返回「无进度」错误以便换源
+    /// - 用户 cancel → HostError::Cancelled,上层停止换源
+    pub async fn pull_streaming_with_cancel(
+        &self,
+        image: &str,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+        mut on_line: impl FnMut(StreamSource, String) + Send + 'static,
+    ) -> Result<(), DockerCliError> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+
+        // 用户 cancel 用 child_token 联动,避免再 spawn 桥接任务泄漏
+        // stall 只 cancel 子 token,不会误标用户取消
+        let kill_token = match cancel.as_ref() {
+            Some(user) => user.child_token(),
+            None => tokio_util::sync::CancellationToken::new(),
+        };
+        let stalled = Arc::new(AtomicBool::new(false));
+        let last_activity_ms = Arc::new(AtomicU64::new(now_ms()));
+
+        {
+            let kill = kill_token.clone();
+            let stalled_flag = Arc::clone(&stalled);
+            let activity = Arc::clone(&last_activity_ms);
+            let stall_ms = Self::PULL_STALL_TIMEOUT.as_millis() as u64;
+            tokio::spawn(async move {
+                let tick = std::time::Duration::from_secs(5);
+                loop {
+                    tokio::select! {
+                        _ = kill.cancelled() => break,
+                        _ = tokio::time::sleep(tick) => {
+                            let idle = now_ms().saturating_sub(activity.load(Ordering::Relaxed));
+                            if idle >= stall_ms {
+                                stalled_flag.store(true, Ordering::Relaxed);
+                                kill.cancel();
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let activity_cb = Arc::clone(&last_activity_ms);
+        let wrapped = move |src: StreamSource, line: String| {
+            activity_cb.store(now_ms(), Ordering::Relaxed);
+            on_line(src, line);
+        };
+
+        let pull_image = super::engine::image_reference(self.engine, image);
+        let cmd = self
+            .docker_cmd()
+            .arg("pull")
+            .arg(pull_image)
+            .timeout(Self::PULL_PER_CANDIDATE_TIMEOUT)
+            .cancel_token(kill_token.clone());
+
+        let stall_err = || DockerCliError::CommandFailed {
+            command: format!("docker pull {image}"),
+            exit_code: None,
+            stderr: format!(
+                "镜像源超过 {} 秒无进度，尝试下一个源",
+                Self::PULL_STALL_TIMEOUT.as_secs()
+            ),
+        };
+
+        let out = match self.host.run_streaming(cmd, Box::new(wrapped)).await {
+            Ok(o) => o,
+            Err(HostError::Cancelled) => {
+                // 结束 stall 监视任务(cancel 子 token 不会牵连用户 token)
+                kill_token.cancel();
+                // 用户取消优先于 stall(两者可能同时成立)
+                if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    return Err(DockerCliError::Host(HostError::Cancelled));
+                }
+                if stalled.load(Ordering::Relaxed) {
+                    return Err(stall_err());
+                }
+                return Err(DockerCliError::Host(HostError::Cancelled));
+            }
+            Err(e) => {
+                kill_token.cancel();
+                return Err(DockerCliError::Host(e));
+            }
+        };
+
+        // 正常结束也停 stall 监视,避免成功后仍挂 8 分钟
+        kill_token.cancel();
+
+        if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(DockerCliError::Host(HostError::Cancelled));
+        }
+        if stalled.load(Ordering::Relaxed) {
+            return Err(stall_err());
+        }
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker pull {image}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn pull_with_fallback_cancel<F, L, M>(
+        &self,
+        candidates: &[String],
+        official_image: &str,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+        mut new_line_cb: F,
+        mut on_mirror_fail: Option<M>,
+    ) -> Result<String, DockerCliError>
+    where
+        F: FnMut(usize, &str) -> L,
+        L: FnMut(StreamSource, String) + Send + 'static,
+        M: FnMut(usize, &str, &DockerCliError),
+    {
+        let mut last_err: Option<DockerCliError> = None;
+        for (idx, image) in candidates.iter().enumerate() {
+            if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                return Err(DockerCliError::CommandFailed {
+                    command: "docker pull".to_string(),
+                    exit_code: None,
+                    stderr: "已取消".to_string(),
+                });
+            }
+            let on_line = new_line_cb(idx, image);
+            match self
+                .pull_streaming_with_cancel(image, cancel.clone(), on_line)
+                .await
+            {
+                Ok(()) => {
+                    if image != official_image {
+                        self.retag(image, official_image).await?;
+                    }
+                    self.ensure_image_compatible(official_image).await?;
+                    info!(
+                        target: "ncd_deploy::docker",
+                        index = idx,
+                        total = candidates.len(),
+                        pulled = %image,
+                        official = %official_image,
+                        "docker pull 成功"
+                    );
+                    return Ok(image.clone());
+                }
+                Err(e) => {
+                    // 用户取消:不再试下一个源(无进度换源走 CommandFailed,会继续)
+                    if matches!(&e, DockerCliError::Host(HostError::Cancelled))
+                        || cancel.as_ref().is_some_and(|c| c.is_cancelled())
+                    {
+                        return Err(DockerCliError::Host(HostError::Cancelled));
+                    }
+                    warn!(
+                        target: "ncd_deploy::docker",
+                        index = idx,
+                        total = candidates.len(),
+                        image = %image,
+                        err = %e,
+                        "docker pull 候选失败，尝试下一个"
+                    );
+                    if let Some(ref mut cb) = on_mirror_fail {
+                        cb(idx, image, &e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| DockerCliError::CommandFailed {
+            command: "docker pull".to_string(),
+            exit_code: None,
+            stderr: "没有可用的镜像候选".to_string(),
+        }))
+    }
+
+    /// 本地是否已有指定镜像引用(docker image inspect 成功即视为存在)
+    pub async fn image_exists(&self, image_ref: &str) -> Result<bool, DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("image")
+            .arg("inspect")
+            .arg(super::engine::image_reference(self.engine, image_ref));
+        let out = self.host.run_to_string(cmd).await?;
+        Ok(out.success())
+    }
+
+    /// 验证实际 daemon 和已拉取镜像的平台，避免错误架构到启动时才报 exec format error。
+    pub async fn ensure_image_compatible(&self, image_ref: &str) -> Result<(), DockerCliError> {
+        let daemon = self
+            .management_output(
+                self.command()
+                    .args([
+                        "info",
+                        "--format",
+                        if self.engine == super::engine::ContainerEngine::Podman {
+                            "{{.Host.OS}}/{{.Host.Arch}}"
+                        } else {
+                            "{{.OSType}}/{{.Architecture}}"
+                        },
+                    ])
+                    .timeout(std::time::Duration::from_secs(15)),
+            )
+            .await?;
+        let image = self
+            .management_output(
+                self.command()
+                    .args([
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{.Os}}/{{.Architecture}}",
+                        "--",
+                        &super::engine::image_reference(self.engine, image_ref),
+                    ])
+                    .timeout(std::time::Duration::from_secs(15)),
+            )
+            .await?;
+        fn platform(value: &str) -> (&str, &str) {
+            let (os, arch) = value.trim().split_once('/').unwrap_or(("", ""));
+            let arch = match arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            (os, arch)
+        }
+        let daemon_platform = platform(&daemon);
+        let image_platform = platform(&image);
+        if daemon_platform.0 != "linux"
+            || daemon_platform.1.is_empty()
+            || image_platform != daemon_platform
+        {
+            return Err(DockerCliError::InvalidArgument(format!(
+                "镜像 {image_ref} 平台 {} 与 Docker daemon {} 不兼容，需要原生 Linux 镜像",
+                image.trim(),
+                daemon.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 容器内端口在宿主机上实际映射到哪个口。network_mode=host 时就是容器内端口;
+    /// 没映射返回 None。导入的容器不一定按桌面端的偏移规则映射,连 WebUI 前以这里为准。
+    pub async fn published_host_port(
+        &self,
+        container: &str,
+        container_port: u16,
+    ) -> Result<Option<u16>, DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("inspect")
+            .arg("--format")
+            .arg(ncd_domain::docker::DOCKER_INSPECT_PORTS_FORMAT)
+            .arg(container);
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker inspect {container}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        ncd_domain::docker::parse_published_host_port(&out.stdout, container_port)
+            .map_err(DockerCliError::ParseFailed)
+    }
+
+    pub fn is_elevated(&self) -> bool {
+        self.elevated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 从容器拷文件到宿主机路径。`docker cp` 对已停止容器可用。
+    /// `src` 是容器内 POSIX 路径；`dest` 是宿主机 POSIX 路径。
+    /// 容器名与路径走独立 arg，不拼进 shell 字符串。
+    ///
+    /// 提权 `docker cp` 写出的文件属主是 root，随后 chmod 644，否则 SFTP 读不到。
+    pub async fn copy_from_container(
+        &self,
+        container: &str,
+        src: &str,
+        dest: &str,
+    ) -> Result<(), DockerCliError> {
+        let spec = format!("{container}:{src}");
+        let cmd = self.docker_cmd().arg("cp").arg(&spec).arg(dest);
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker cp {container}:{src} {dest}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        if self.is_elevated() {
+            let chmod = HostCommand::new("chmod").arg("644").arg(dest).elevated();
+            let chmod_out = self.host.run_to_string(chmod).await?;
+            if !chmod_out.success() {
+                return Err(DockerCliError::CommandFailed {
+                    command: format!("chmod 644 {dest}"),
+                    exit_code: chmod_out.exit_code,
+                    stderr: chmod_out.stderr.trim().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// 把宿主机文件写入容器（运行中或已停止均可），沿用 daemon 探测出的提权方式。
+    pub async fn copy_to_container(
+        &self,
+        container: &str,
+        src: &str,
+        dest: &str,
+    ) -> Result<(), DockerCliError> {
+        let target = format!("{container}:{dest}");
+        let out = self
+            .host
+            .run_to_string(self.docker_cmd().arg("cp").arg(src).arg(&target))
+            .await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker cp {src} {target}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// `docker exec <container> cat <path>`，返回文件文本。只对运行中的容器有效。
+    /// 读凭据类文件（webui.json）用这个而不是 `docker cp`：走 stdout 不落临时文件，
+    /// token 不会经过全局可读的 /tmp
+    pub async fn exec_read_file(
+        &self,
+        container: &str,
+        path: &str,
+    ) -> Result<String, DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("exec")
+            .arg(container)
+            .arg("cat")
+            .arg(path);
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker exec {container} cat {path}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(out.stdout)
+    }
+
+    /// 删掉 `copy_from_container` 的临时文件。提权拷出来的要用 sudo rm。
+    pub async fn remove_copied_file(&self, dest: &str) {
+        if self.is_elevated() {
+            let _ = self
+                .host
+                .run_to_string(HostCommand::new("rm").arg("-f").arg(dest).elevated())
+                .await;
+        } else {
+            let _ = self.host.remove_file(&HostPath::from_posix(dest)).await;
+        }
+    }
+
+    /// docker tag <src> <dst>,给镜像打一个别名引用,不重新拉取
+    async fn retag(&self, src: &str, dst: &str) -> Result<(), DockerCliError> {
+        let cmd = self
+            .docker_cmd()
+            .arg("tag")
+            .arg(super::engine::image_reference(self.engine, src))
+            .arg(super::engine::image_reference(self.engine, dst));
+        let out = self.host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Err(DockerCliError::CommandFailed {
+                command: format!("docker tag {src} {dst}"),
+                exit_code: out.exit_code,
+                stderr: out.stderr.trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// docker pull 输出里单个 layer 的阶段
+/// docker 在非 TTY 下每行格式:<layerId>: <phase text>
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerPhase {
+    PullingFsLayer,
+    Waiting,
+    Downloading,
+    VerifyingChecksum,
+    DownloadComplete,
+    Extracting,
+    PullComplete,
+    /// 见过但不认识的 phase 文本,保留原始字符串
+    Unknown(String),
+}
+
+impl LayerPhase {
+    fn from_text(s: &str) -> Self {
+        let t = s.trim();
+        if t.starts_with("Downloading") {
+            return Self::Downloading;
+        }
+        if t.starts_with("Extracting") {
+            return Self::Extracting;
+        }
+        if t.starts_with("Verifying Checksum") {
+            return Self::VerifyingChecksum;
+        }
+        match t {
+            "Pulling fs layer" => Self::PullingFsLayer,
+            "Waiting" => Self::Waiting,
+            "Download complete" => Self::DownloadComplete,
+            "Pull complete" => Self::PullComplete,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// 用于进度条:下载完或整层拉完都算「完成」,避免 UI 长期 0/N
+    fn counts_toward_progress_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::DownloadComplete | Self::PullComplete | Self::Extracting
+        )
+    }
+
+    fn user_label(&self) -> String {
+        match self {
+            Self::PullingFsLayer => "准备层".into(),
+            Self::Waiting => "等待".into(),
+            Self::Downloading => "下载中".into(),
+            Self::VerifyingChecksum => "校验".into(),
+            Self::DownloadComplete => "下载完成".into(),
+            Self::Extracting => "解压中".into(),
+            Self::PullComplete => "完成".into(),
+            Self::Unknown(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    "处理中".into()
+                } else {
+                    t.chars().take(48).collect()
+                }
+            }
+        }
+    }
+
+    /// 下载/解压行上的进度后缀,供 UI 展示 [====] 12MB/50MB
+    fn detail_from_line(phase: &Self, phase_text: &str) -> Option<String> {
+        match phase {
+            Self::Downloading => phase_text
+                .strip_prefix("Downloading")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            Self::Extracting => phase_text
+                .strip_prefix("Extracting")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            _ => None,
+        }
+    }
+
+    /// 加权进度 0–100,下载中也会前进,不会长期停在 0%
+    fn weight_percent(&self) -> u8 {
+        match self {
+            Self::PullComplete => 100,
+            Self::DownloadComplete => 92,
+            Self::Extracting => 88,
+            Self::VerifyingChecksum => 75,
+            Self::Downloading => 45,
+            Self::PullingFsLayer => 8,
+            Self::Waiting => 4,
+            Self::Unknown(_) => 15,
+        }
+    }
+}
+
+/// docker pull 进度状态维护一张 layerId → phase 表,提供 (completed, total)
+/// 计数供调用方换算百分比
+///
+/// 用法:每收到一行就调 update(line),然后读 summary() / layer_snapshots()
+pub struct PullProgress {
+    layers: HashMap<String, (LayerPhase, Option<String>)>,
+}
+
+impl PullProgress {
+    pub fn new() -> Self {
+        Self {
+            layers: HashMap::new(),
+        }
+    }
+
+    /// 解析一行 docker pull 输出,更新内部状态
+    /// 支持短 id / sha256: 前缀,以及带进度后缀的 Downloading 行
+    pub fn update(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let Some(colon_pos) = line.find(": ") else {
+            return;
+        };
+        let id_raw = line[..colon_pos].trim();
+        if id_raw.eq_ignore_ascii_case("status")
+            || id_raw.eq_ignore_ascii_case("digest")
+            || id_raw.eq_ignore_ascii_case("latest")
+        {
+            return;
+        }
+        let id = normalize_pull_layer_id(id_raw);
+        if id.is_empty() {
+            return;
+        }
+        let phase_text = line[colon_pos + 2..].trim();
+        let phase = LayerPhase::from_text(phase_text);
+        let detail = LayerPhase::detail_from_line(&phase, phase_text);
+        self.layers.insert(id, (phase, detail));
+    }
+
+    /// 返回 (completed_layers, total_layers, last_message, percent_0_100)
+    pub fn summary(&self) -> (usize, usize, String, u8) {
+        let total = self.layers.len();
+        let completed = self
+            .layers
+            .values()
+            .filter(|(p, _)| p.counts_toward_progress_complete())
+            .count();
+        let percent = self.weighted_percent();
+        let msg = if total == 0 {
+            "拉取中…".to_string()
+        } else {
+            format!("镜像层 {completed}/{total} · {percent}%")
+        };
+        (completed, total, msg, percent)
+    }
+
+    fn weighted_percent(&self) -> u8 {
+        let total = self.layers.len();
+        if total == 0 {
+            return 0;
+        }
+        let sum: u32 = self
+            .layers
+            .values()
+            .map(|(p, _)| u32::from(p.weight_percent()))
+            .sum();
+        ((sum / total as u32).min(100)) as u8
+    }
+
+    /// 按层 id 排序的稳定快照,供 IPC 推到前端
+    pub fn layer_snapshots(&self) -> Vec<DockerPullLayerSnapshot> {
+        let mut entries: Vec<(&String, &(LayerPhase, Option<String>))> =
+            self.layers.iter().collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries
+            .into_iter()
+            .map(|(id, (phase, detail))| DockerPullLayerSnapshot {
+                id: id.clone(),
+                phase: phase.user_label(),
+                detail: detail.clone(),
+                done: phase.counts_toward_progress_complete(),
+            })
+            .collect()
+    }
+}
+
+fn normalize_pull_layer_id(id_raw: &str) -> String {
+    let s = id_raw.trim();
+    if let Some(rest) = s.strip_prefix("sha256:") {
+        let hex: String = rest
+            .chars()
+            .take(64)
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        if hex.len() >= 6 {
+            return hex.chars().take(12).collect();
+        }
+        return hex;
+    }
+    if s.chars().all(|c| c.is_ascii_hexdigit()) && !s.is_empty() && s.len() <= 64 {
+        return s.chars().take(12).collect();
+    }
+    String::new()
+}
+
+impl Default for PullProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 解析 docker ps --format '{{json .}}' 的多行 JSON 输出
+/// 每行一个容器对象;空行跳过;单行解析失败时整体报 ParseFailed
+fn parse_ps_json(stdout: &str) -> Result<Vec<ContainerInfo>, DockerCliError> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw: PsLine = serde_json::from_str(line)
+            .map_err(|e| DockerCliError::ParseFailed(format!("{e}: {line}")))?;
+        out.push(raw.into_info());
+    }
+    Ok(out)
+}
+
+fn string_or_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Array(values) => Ok(values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(",")),
+        _ => Err(serde::de::Error::custom(
+            "expected a string or list of strings",
+        )),
+    }
+}
+fn podman_ports<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Array(values) => Ok(values
+            .iter()
+            .map(|v| {
+                let host = v["host_ip"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("0.0.0.0");
+                format!(
+                    "{host}:{}->{}/{}",
+                    v["host_port"],
+                    v["container_port"],
+                    v["protocol"].as_str().unwrap_or("tcp")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")),
+        _ => Err(serde::de::Error::custom("expected port mappings")),
+    }
+}
+
+/// docker ps --format '{{json .}}' 单行的字段子集,docker 这个格式的字段名
+/// 是固定的(ID / Names / Image / State / Status / Ports)
+#[derive(serde::Deserialize)]
+struct PsLine {
+    #[serde(rename = "ID", alias = "Id")]
+    id: String,
+    #[serde(rename = "Names")]
+    #[serde(deserialize_with = "string_or_list")]
+    names: String,
+    #[serde(rename = "Image")]
+    image: String,
+    #[serde(rename = "State")]
+    state: String,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Ports", default, deserialize_with = "podman_ports")]
+    ports: String,
+}
+
+impl PsLine {
+    fn into_info(self) -> ContainerInfo {
+        // Ports 形如 "0.0.0.0:6099->6099/tcp, :::6099->6099/tcp";按逗号拆开,
+        // 去重空白,Names 多名时 docker 用逗号分隔,取第一个作主名
+        let ports: Vec<String> = self
+            .ports
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let name = self
+            .names
+            .split(',')
+            .next()
+            .unwrap_or(&self.names)
+            .trim()
+            .to_string();
+        ContainerInfo {
+            id: self.id,
+            name,
+            image: self.image,
+            state: ContainerState::parse(&self.state),
+            status: self.status,
+            ports,
+        }
+    }
+}
+
+/// 解析 docker images --format '{{json .}}' 的多行 JSON 输出
+fn parse_images_json(stdout: &str) -> Result<Vec<ImageInfo>, DockerCliError> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw: ImagesLine = serde_json::from_str(line)
+            .map_err(|e| DockerCliError::ParseFailed(format!("{e}: {line}")))?;
+        out.push(raw.into_info());
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+struct ImagesLine {
+    #[serde(rename = "ID", alias = "Id")]
+    id: String,
+    #[serde(rename = "Repository")]
+    repository: String,
+    #[serde(rename = "Tag")]
+    tag: String,
+    #[serde(rename = "Size")]
+    size: String,
+    #[serde(rename = "CreatedSince")]
+    created_since: String,
+}
+
+impl ImagesLine {
+    fn into_info(self) -> ImageInfo {
+        ImageInfo {
+            id: self.id,
+            repository: self.repository,
+            tag: self.tag,
+            size: self.size,
+            created_since: self.created_since,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_podman_container_report_arrays() {
+        let rows = parse_ps_json(r#"{"Id":"podman123","Names":["napcat","alias"],"Image":"docker.io/mlikiowa/napcat-docker:latest","State":"running","Status":"Up 2 seconds","Ports":[{"host_ip":"127.0.0.1","host_port":6099,"container_port":6099,"protocol":"tcp"}]}"#).unwrap();
+        assert_eq!(rows[0].name, "napcat");
+        assert_eq!(rows[0].ports, ["127.0.0.1:6099->6099/tcp"]);
+    }
+
+    #[test]
+    fn parse_images_json_single_line() {
+        let line = r#"{"ID":"abc123","Repository":"nginx","Tag":"latest","Size":"192MB","CreatedSince":"2 weeks ago"}"#;
+        let parsed = parse_images_json(line).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].repository, "nginx");
+        assert_eq!(parsed[0].tag, "latest");
+    }
+
+    #[test]
+    fn parse_ps_json_single_running_container() {
+        let line = r#"{"ID":"abc123def456","Names":"napcat","Image":"mlikiowa/napcat-docker:latest","State":"running","Status":"Up 3 hours","Ports":"0.0.0.0:6099->6099/tcp, :::6099->6099/tcp"}"#;
+        let parsed = parse_ps_json(line).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let c = &parsed[0];
+        assert_eq!(c.id, "abc123def456");
+        assert_eq!(c.name, "napcat");
+        assert_eq!(c.state, ContainerState::Running);
+        assert_eq!(c.ports.len(), 2);
+    }
+
+    #[test]
+    fn parse_ps_json_multiple_lines_and_blanks() {
+        let stdout = "\n\
+{\"ID\":\"a1\",\"Names\":\"napcat\",\"Image\":\"img:1\",\"State\":\"running\",\"Status\":\"Up\",\"Ports\":\"\"}\n\
+\n\
+{\"ID\":\"b2\",\"Names\":\"snowluma\",\"Image\":\"img:2\",\"State\":\"exited\",\"Status\":\"Exited (0)\",\"Ports\":\"\"}\n";
+        let parsed = parse_ps_json(stdout).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "napcat");
+        assert_eq!(parsed[1].state, ContainerState::Exited);
+        // 空 Ports 字段解析成空 vec,不是 [""]
+        assert!(parsed[0].ports.is_empty());
+    }
+
+    #[test]
+    fn parse_ps_json_empty_output_is_empty_vec() {
+        assert!(parse_ps_json("").unwrap().is_empty());
+        assert!(parse_ps_json("\n\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_ps_json_bad_line_errors() {
+        let err = parse_ps_json("not json at all").unwrap_err();
+        assert!(matches!(err, DockerCliError::ParseFailed(_)));
+    }
+
+    #[test]
+    fn parse_ps_json_takes_first_name_when_multiple() {
+        let line = r#"{"ID":"x","Names":"primary,alias","Image":"i","State":"created","Status":"Created","Ports":""}"#;
+        let parsed = parse_ps_json(line).unwrap();
+        assert_eq!(parsed[0].name, "primary");
+        assert_eq!(parsed[0].state, ContainerState::Created);
+    }
+
+    // ---- PullProgress 解析器测试 ----
+
+    #[test]
+    fn pull_progress_empty_has_zero_counts() {
+        let p = PullProgress::new();
+        let (completed, total, _, _) = p.summary();
+        assert_eq!(completed, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn pull_progress_single_layer_lifecycle() {
+        let mut p = PullProgress::new();
+        p.update("a1b2c3d4e5f6: Pulling fs layer");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 0);
+
+        p.update("a1b2c3d4e5f6: Downloading");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 0);
+
+        p.update("a1b2c3d4e5f6: Pull complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn pull_progress_multiple_layers_out_of_order() {
+        let mut p = PullProgress::new();
+        // 3 个 layer,乱序到达
+        p.update("aabbccdd1122: Pulling fs layer");
+        p.update("112233445566: Waiting");
+        p.update("deadbeef0000: Pulling fs layer");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 3);
+        assert_eq!(c, 0);
+
+        p.update("aabbccdd1122: Pull complete");
+        p.update("deadbeef0000: Pull complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 3);
+        assert_eq!(c, 2);
+
+        p.update("112233445566: Pull complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 3);
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn pull_progress_ignores_digest_and_status_lines() {
+        let mut p = PullProgress::new();
+        p.update("Digest: sha256:abc123");
+        p.update("Status: Downloaded newer image for napcat:latest");
+        p.update("");
+        p.update("  ");
+        let (_, t, _, _) = p.summary();
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn pull_progress_ignores_non_hex_id_lines() {
+        let mut p = PullProgress::new();
+        // "latest: Pulling from ..." 这类行 id 含非 hex 字符,应忽略
+        p.update("latest: Pulling from mlikiowa/napcat-docker");
+        p.update("Status: Image is up to date for napcat:latest");
+        let (_, t, _, _) = p.summary();
+        assert_eq!(t, 0);
+    }
+
+    #[test]
+    fn pull_progress_download_complete_counts_as_done() {
+        let mut p = PullProgress::new();
+        p.update("a1b2c3d4e5f6: Pulling fs layer");
+        p.update("a1b2c3d4e5f6: Download complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn pull_progress_downloading_with_suffix_parses_layer() {
+        let mut p = PullProgress::new();
+        p.update("deadbeefcafe: Downloading [====>    ] 12.5MB/50MB");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 0);
+        p.update("deadbeefcafe: Download complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn pull_progress_sha256_prefix_id() {
+        let mut p = PullProgress::new();
+        p.update("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789: Download complete");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 1);
+    }
+
+    #[test]
+    fn pull_progress_summary_message_format() {
+        let mut p = PullProgress::new();
+        p.update("aabbccdd1122: Pull complete");
+        p.update("112233445566: Downloading");
+        let (_, _, msg, _) = p.summary();
+        assert!(msg.contains("1/2"), "expected '1/2' in '{msg}'");
+    }
+
+    #[test]
+    fn pull_progress_unknown_phase_still_counts_as_layer() {
+        let mut p = PullProgress::new();
+        p.update("aabbccdd1122: Some Future Phase");
+        let (c, t, _, _) = p.summary();
+        assert_eq!(t, 1);
+        assert_eq!(c, 0);
+    }
+}

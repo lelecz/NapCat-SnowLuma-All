@@ -1,0 +1,801 @@
+//! NeoBot 类型化配置：两份 TOML 的对接相关键。
+//!
+//! - `app/data/config.toml` 的 `[adapter]`：反向 WS 监听地址 / 口 / token（对接必需）
+//! - `app/data/plugins_data/dashboard/config.toml`：面板监听地址 / 口（WebUI 口与 OneBot 口是两个口，
+//!   桌面端要拿真实面板口去开隧道，读不到就会拿实例口去连、必然失败）
+//!
+//! 只声明**对接与开 WebUI 需要**的键，上游其余几百个配置键原样留在文件里不动
+//! （差量写：`toml_patch::patch` 只改有变化的键，保注释与未知键）。
+//!
+//! 主配置的 adapter 由 `adapter_supervisor` 在热重载时重建监听。
+//! 面板 host / port 在启动时绑定，上游 `dashboard/hot_reload.py` 将其标为需重启。
+
+use ncd_domain::{AppConfigDocument, AppConfigFormat, AppConfigIssue};
+use ncd_host::{Host, HostPath};
+use ncd_traits::AppFrameworkError;
+use serde::{Deserialize, Serialize};
+
+use crate::adapter::apply_with_backup_ex;
+use crate::config_doc::{DocumentSnapshot, read_documents};
+use crate::toml_patch;
+
+use super::manifest::{
+    ADAPTER_MODE_ONEBOT, KEY_ADAPTER, KEY_ADAPTER_MODE, KEY_DASHBOARD_HOST, KEY_DASHBOARD_PORT,
+    KEY_REVERSE_WS_ACCESS_TOKEN, KEY_REVERSE_WS_HOST, KEY_REVERSE_WS_PORT, NEOBOT_CONFIG_TOML,
+    NEOBOT_CONFIG_TOML_LEGACY, NEOBOT_DASHBOARD_CONFIG, NEOBOT_DEFAULT_DASHBOARD_PORT,
+    NEOBOT_DEFAULT_ONEBOT_PORT,
+};
+
+pub const DOC_ADAPTER: &str = "adapter";
+pub const DOC_DASHBOARD: &str = "dashboard";
+
+/// 协议 Bot 连过来的反向 WS 设置（`app/data/config.toml` 的 `[adapter]`）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeoBotAdapterConfig {
+    /// onebot 或 local；只有 onebot 才有反向 WS 监听
+    pub mode: String,
+    pub reverse_ws_host: String,
+    pub reverse_ws_port: u16,
+    pub reverse_ws_access_token: String,
+}
+
+impl Default for NeoBotAdapterConfig {
+    fn default() -> Self {
+        Self {
+            mode: ADAPTER_MODE_ONEBOT.to_string(),
+            // 桌面端实例的默认监听地址：协议 Bot 与实例同机走回环，
+            // 跨机由编排层开隧道。上游出厂值是空串（= 0.0.0.0），这里不跟，
+            // 免得新实例默认对全网开放。
+            reverse_ws_host: "127.0.0.1".to_string(),
+            reverse_ws_port: NEOBOT_DEFAULT_ONEBOT_PORT,
+            reverse_ws_access_token: String::new(),
+        }
+    }
+}
+
+/// 网页面板设置（`app/data/plugins_data/dashboard/config.toml`，平铺键）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeoBotDashboardConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for NeoBotDashboardConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: NEOBOT_DEFAULT_DASHBOARD_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeoBotInstanceConfig {
+    pub adapter: NeoBotAdapterConfig,
+    pub dashboard: NeoBotDashboardConfig,
+}
+
+impl Default for NeoBotInstanceConfig {
+    fn default() -> Self {
+        Self {
+            adapter: NeoBotAdapterConfig::default(),
+            dashboard: NeoBotDashboardConfig::default(),
+        }
+    }
+}
+
+impl NeoBotInstanceConfig {
+    pub fn validate(&self) -> Vec<AppConfigIssue> {
+        let mut issues = Vec::new();
+        if self.adapter.reverse_ws_port == 0 {
+            issues.push(AppConfigIssue {
+                path: "adapter/reverse_ws_port".to_string(),
+                message: "OneBot 反向 WS 端口不能为 0".to_string(),
+            });
+        }
+        if self.dashboard.port == 0 {
+            issues.push(AppConfigIssue {
+                path: "dashboard/port".to_string(),
+                message: "面板端口不能为 0".to_string(),
+            });
+        }
+        if self.adapter.reverse_ws_port != 0 && self.adapter.reverse_ws_port == self.dashboard.port
+        {
+            issues.push(AppConfigIssue {
+                path: "dashboard/port".to_string(),
+                message: format!("面板口不能与 OneBot 口相同（都是 {}）", self.dashboard.port),
+            });
+        }
+        if self.adapter.mode.trim() != ADAPTER_MODE_ONEBOT {
+            issues.push(AppConfigIssue {
+                path: "adapter/mode".to_string(),
+                message: format!(
+                    "只有 \"{ADAPTER_MODE_ONEBOT}\" 模式才有反向 WS 监听（现在是 {:?}）",
+                    self.adapter.mode
+                ),
+            });
+        }
+        if self.adapter.reverse_ws_host.trim().is_empty() {
+            issues.push(AppConfigIssue {
+                path: "adapter/reverse_ws_host".to_string(),
+                message: "反向 WS 监听地址不能为空（留空会落到 0.0.0.0）".to_string(),
+            });
+        }
+        if self.dashboard.host.trim().is_empty() {
+            issues.push(AppConfigIssue {
+                path: "dashboard/host".to_string(),
+                message: "面板监听地址不能为空（留空会落到 0.0.0.0）".to_string(),
+            });
+        }
+        issues
+    }
+}
+
+pub fn neobot_config_documents() -> Vec<AppConfigDocument> {
+    vec![
+        config_doc(DOC_ADAPTER, NEOBOT_CONFIG_TOML, AppConfigFormat::Toml),
+        config_doc(
+            DOC_DASHBOARD,
+            NEOBOT_DASHBOARD_CONFIG,
+            AppConfigFormat::Toml,
+        ),
+    ]
+}
+
+fn config_doc(id: &str, rel: &str, format: AppConfigFormat) -> AppConfigDocument {
+    AppConfigDocument {
+        id: id.to_string(),
+        label: match id {
+            DOC_ADAPTER => "OneBot 对接（app/data/config.toml）".to_string(),
+            _ => "网页面板（app/data/plugins_data/dashboard/config.toml）".to_string(),
+        },
+        rel_path: rel.to_string(),
+        format,
+        // config.reload 是显式命令；直接改文件不会进入该重载链路。
+        hot_reload: false,
+        reload_note: Some(if id == DOC_ADAPTER {
+            "直接保存文件不会自动重载；请在 NeoBot 执行 /reload，或重启实例。启动项仍需重启。"
+                .into()
+        } else {
+            "权限等部分配置会按请求重读；监听地址、端口等启动项需重启实例。".into()
+        }),
+    }
+}
+
+fn parse_table(text: Option<&str>) -> Result<toml::Table, AppFrameworkError> {
+    match text {
+        None => Ok(toml::Table::new()),
+        Some(t) if t.trim().is_empty() => Ok(toml::Table::new()),
+        Some(t) => t.parse::<toml::Table>().map_err(|e| {
+            AppFrameworkError::ConfigInvalid(vec![AppConfigIssue {
+                path: String::new(),
+                message: format!("TOML 解析失败：{e}"),
+            }])
+        }),
+    }
+}
+
+pub fn parse_neobot_config(
+    snaps: &[DocumentSnapshot],
+) -> Result<NeoBotInstanceConfig, AppFrameworkError> {
+    let adapter_text = snaps
+        .iter()
+        .find(|s| s.doc.id == DOC_ADAPTER)
+        .and_then(|s| s.text.as_deref());
+    let dashboard_text = snaps
+        .iter()
+        .find(|s| s.doc.id == DOC_DASHBOARD)
+        .and_then(|s| s.text.as_deref());
+    if adapter_text.is_none() && dashboard_text.is_none() {
+        return Err(AppFrameworkError::Integration(
+            "NeoBot 实例没有 app/data/config.toml 也没有面板配置".to_string(),
+        ));
+    }
+    let adapter_table = parse_table(adapter_text)?;
+    let dashboard_table = parse_table(dashboard_text)?;
+
+    let adapter_tbl = adapter_table.get(KEY_ADAPTER).and_then(|v| v.as_table());
+    let mut adapter = NeoBotAdapterConfig::default();
+    if let Some(t) = adapter_tbl {
+        // 键在就采信（值本身可能是空串），只有类型不对才当没读到
+        if let Some(s) = t.get(KEY_ADAPTER_MODE).and_then(|v| v.as_str()) {
+            adapter.mode = s.to_string();
+        }
+        if let Some(s) = t.get(KEY_REVERSE_WS_HOST).and_then(|v| v.as_str()) {
+            adapter.reverse_ws_host = s.to_string();
+        }
+        if let Some(p) = t
+            .get(KEY_REVERSE_WS_PORT)
+            .and_then(|v| v.as_integer())
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p > 0)
+        {
+            adapter.reverse_ws_port = p;
+        }
+        if let Some(v) = t.get(KEY_REVERSE_WS_ACCESS_TOKEN).and_then(|v| v.as_str()) {
+            adapter.reverse_ws_access_token = v.to_string();
+        }
+    }
+    // 上游语义：reverse_ws_host 留空 = 落到 0.0.0.0。
+    // 文件里显式写了空串时按上游解释，而不是当校验错误——那是用户/上游的合法配置。
+    if adapter.reverse_ws_host.trim().is_empty() {
+        adapter.reverse_ws_host = "0.0.0.0".to_string();
+    }
+
+    let mut dashboard = NeoBotDashboardConfig::default();
+    if let Some(v) = dashboard_table
+        .get(KEY_DASHBOARD_HOST)
+        .and_then(|v| v.as_str())
+    {
+        dashboard.host = v.to_string();
+    }
+    if let Some(p) = dashboard_table
+        .get(KEY_DASHBOARD_PORT)
+        .and_then(|v| v.as_integer())
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)
+    {
+        dashboard.port = p;
+    }
+
+    Ok(NeoBotInstanceConfig { adapter, dashboard })
+}
+
+pub async fn read_neobot_config(
+    host: &dyn Host,
+    install_dir: &HostPath,
+) -> Result<(NeoBotInstanceConfig, Vec<DocumentSnapshot>), AppFrameworkError> {
+    let snaps = read_documents(host, install_dir, &neobot_config_documents()).await?;
+    parse_neobot_config(&snaps).map(|config| (config, snaps))
+}
+
+/// 对接（apply_link）路径的写入：面板配置只在文件已存在时写。受管实例首装已
+/// seed 面板文件，照常差量更新；领养项目没装面板插件时不替它新建
+/// `app/data/plugins_data/dashboard/config.toml`——新建的文件 rollback 还原不掉，属污染用户目录。
+pub async fn write_link_config(
+    host: &dyn Host,
+    install_dir: &HostPath,
+    config: &NeoBotInstanceConfig,
+    write_sidecar: bool,
+) -> Result<(NeoBotInstanceConfig, Vec<DocumentSnapshot>), AppFrameworkError> {
+    write_config_docs(host, install_dir, config, write_sidecar, false).await
+}
+
+async fn write_config_docs(
+    host: &dyn Host,
+    install_dir: &HostPath,
+    config: &NeoBotInstanceConfig,
+    write_sidecar: bool,
+    create_dashboard: bool,
+) -> Result<(NeoBotInstanceConfig, Vec<DocumentSnapshot>), AppFrameworkError> {
+    let issues = config.validate();
+    if !issues.is_empty() {
+        return Err(AppFrameworkError::ConfigInvalid(issues));
+    }
+    let dashboard_path = install_dir.join(NEOBOT_DASHBOARD_CONFIG);
+    let dashboard_writable = create_dashboard
+        || host
+            .exists(&dashboard_path)
+            .await
+            .map_err(|e| AppFrameworkError::Host(e.to_string()))?;
+    let mut pending: Vec<(HostPath, String)> = Vec::with_capacity(2);
+    let adapter_path = install_dir.join(NEOBOT_CONFIG_TOML);
+    if let Some(out) = plan_write(host, &adapter_path, &adapter_patch(config)).await? {
+        pending.push((adapter_path, out));
+    }
+    if dashboard_writable {
+        if let Some(out) = plan_write(host, &dashboard_path, &dashboard_patch(config)).await? {
+            pending.push((dashboard_path, out));
+        }
+    }
+    if !pending.is_empty() {
+        // 两份收进同一次备份写：任一失败全部还原。分开写会在第一份生效、
+        // 第二份失败时留下半更新——rollback 只还原本体配置，盖不住面板文件
+        let paths: Vec<HostPath> = pending.iter().map(|(p, _)| p.clone()).collect();
+        apply_with_backup_ex(host, &paths, write_sidecar, || async {
+            for (path, out) in &pending {
+                host.write_file(path, out.as_bytes())
+                    .await
+                    .map_err(|e| AppFrameworkError::Integration(e.to_string()))?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    read_neobot_config(host, install_dir).await
+}
+
+/// 首装后补 `[adapter].reverse_ws_access_token` 键（空串占位，正式 token 由对接写）。
+/// 只补缺失键：键已存在就什么都不做；写入走差量，保住注释与键序。
+/// 文件不存在或没有 `[adapter]` 表时不新建——那不是首装该有的形状。
+pub async fn ensure_token_key(
+    host: &dyn Host,
+    install_dir: &HostPath,
+    write_sidecar: bool,
+) -> Result<(), AppFrameworkError> {
+    let path = install_dir.join(NEOBOT_CONFIG_TOML);
+    let Some(text) = read_optional_text(host, &path).await? else {
+        return Ok(());
+    };
+    let table = parse_table(Some(&text))?;
+    let needs_token = table
+        .get(KEY_ADAPTER)
+        .and_then(|v| v.as_table())
+        .is_some_and(|t| !t.contains_key(KEY_REVERSE_WS_ACCESS_TOKEN));
+    if !needs_token {
+        return Ok(());
+    }
+    let mut token = toml::Table::new();
+    token.insert(
+        KEY_REVERSE_WS_ACCESS_TOKEN.to_string(),
+        toml::Value::String(String::new()),
+    );
+    let mut patch = toml::Table::new();
+    patch.insert(KEY_ADAPTER.to_string(), toml::Value::Table(token));
+    write_one(host, &path, &patch, write_sidecar).await
+}
+
+/// 旧版桌面端把对接写进了 `data/config.toml`，NeoBot 从来不读那份。启动前把那里的
+/// 对接键搬进 `app/data/config.toml`，已对接的实例升级后不用手动改绑。
+///
+/// 只在旧文件有非空 token、新文件还没有 token 时搬（搬过一次新文件就有 token，不会重复搬，
+/// 也不会盖掉用户之后在新文件里改的值）。口以实例口为准，和 apply_link 一致。
+/// 旧文件原样留着。返回是否写了。
+pub async fn carry_legacy_link(
+    host: &dyn Host,
+    install_dir: &HostPath,
+    instance_port: u16,
+) -> Result<bool, AppFrameworkError> {
+    let legacy_path = install_dir.join(NEOBOT_CONFIG_TOML_LEGACY);
+    let Some(legacy_text) = read_optional_text(host, &legacy_path).await? else {
+        return Ok(false);
+    };
+    let legacy = parse_table(Some(&legacy_text))?;
+    let Some(old) = legacy.get(KEY_ADAPTER).and_then(|v| v.as_table()) else {
+        return Ok(false);
+    };
+    let Some(token) = old
+        .get(KEY_REVERSE_WS_ACCESS_TOKEN)
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let path = install_dir.join(NEOBOT_CONFIG_TOML);
+    let current = parse_table(read_optional_text(host, &path).await?.as_deref())?;
+    let has_token = current
+        .get(KEY_ADAPTER)
+        .and_then(|v| v.get(KEY_REVERSE_WS_ACCESS_TOKEN))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| !t.trim().is_empty());
+    if has_token {
+        return Ok(false);
+    }
+
+    let mut adapter = toml::Table::new();
+    for key in [KEY_ADAPTER_MODE, KEY_REVERSE_WS_HOST] {
+        if let Some(v) = old.get(key).filter(|v| v.is_str()) {
+            adapter.insert(key.to_string(), v.clone());
+        }
+    }
+    let port = Some(i64::from(instance_port))
+        .filter(|p| *p > 0)
+        .or_else(|| old.get(KEY_REVERSE_WS_PORT).and_then(|v| v.as_integer()));
+    if let Some(port) = port {
+        adapter.insert(KEY_REVERSE_WS_PORT.to_string(), toml::Value::Integer(port));
+    }
+    adapter.insert(
+        KEY_REVERSE_WS_ACCESS_TOKEN.to_string(),
+        toml::Value::String(token.to_string()),
+    );
+    let mut patch = toml::Table::new();
+    patch.insert(KEY_ADAPTER.to_string(), toml::Value::Table(adapter));
+    // NeoBot 还没在 app/data 下跑过时目录不存在；远端 Host 写文件不替人建父目录
+    if let Some(parent) = path.parent() {
+        host.create_dir_all(&parent)
+            .await
+            .map_err(|e| AppFrameworkError::Host(e.to_string()))?;
+    }
+    // 不落 .ncd.bak：这一步发生在启动前，失败只是没搬成，下次启动再试
+    write_one(host, &path, &patch, false).await?;
+    Ok(true)
+}
+
+/// `[adapter]` 的期望值（差量写只动这几个键）
+fn adapter_patch(config: &NeoBotInstanceConfig) -> toml::Table {
+    let mut adapter = toml::Table::new();
+    adapter.insert(
+        KEY_ADAPTER_MODE.to_string(),
+        toml::Value::String(config.adapter.mode.clone()),
+    );
+    adapter.insert(
+        KEY_REVERSE_WS_HOST.to_string(),
+        toml::Value::String(config.adapter.reverse_ws_host.clone()),
+    );
+    adapter.insert(
+        KEY_REVERSE_WS_PORT.to_string(),
+        toml::Value::Integer(i64::from(config.adapter.reverse_ws_port)),
+    );
+    adapter.insert(
+        KEY_REVERSE_WS_ACCESS_TOKEN.to_string(),
+        toml::Value::String(config.adapter.reverse_ws_access_token.clone()),
+    );
+    let mut root = toml::Table::new();
+    root.insert(KEY_ADAPTER.to_string(), toml::Value::Table(adapter));
+    root
+}
+
+/// 面板配置是平铺表，没有子表
+fn dashboard_patch(config: &NeoBotInstanceConfig) -> toml::Table {
+    let mut root = toml::Table::new();
+    root.insert(
+        KEY_DASHBOARD_HOST.to_string(),
+        toml::Value::String(config.dashboard.host.clone()),
+    );
+    root.insert(
+        KEY_DASHBOARD_PORT.to_string(),
+        toml::Value::Integer(i64::from(config.dashboard.port)),
+    );
+    root
+}
+
+/// 单文件差量写出的计划：读原文 → 合并期望值 → 渲染新文本。
+/// 没有改动返回 None：不落盘、不动 mtime，也不进备份名单
+async fn plan_write(
+    host: &dyn Host,
+    path: &HostPath,
+    patch: &toml::Table,
+) -> Result<Option<String>, AppFrameworkError> {
+    let original = read_optional_text(host, path).await?.unwrap_or_default();
+    let before = parse_table(Some(&original))?;
+    let mut after = before.clone();
+    merge_tables(&mut after, patch);
+    // 没有改动就不落盘：免得白动一次 mtime，也免得把纯注释差异写成内容变更
+    if toml_patch::changes(&before, &after).is_empty() {
+        return Ok(None);
+    }
+    let mut doc = original.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        AppFrameworkError::Integration(format!("{} 解析失败：{e}", path.as_posix()))
+    })?;
+    // 差量写：只动变了的地方，保住注释、键序和 Desktop 不认识的键
+    toml_patch::apply(&mut doc, &before, &after, &toml_patch::no_identity);
+    Ok(Some(doc.to_string()))
+}
+
+/// 备份 → 差量写 → 失败还原（单文件；ensure_token_key 用）
+async fn write_one(
+    host: &dyn Host,
+    path: &HostPath,
+    patch: &toml::Table,
+    write_sidecar: bool,
+) -> Result<(), AppFrameworkError> {
+    let Some(out) = plan_write(host, path, patch).await? else {
+        return Ok(());
+    };
+    apply_with_backup_ex(host, std::slice::from_ref(path), write_sidecar, || async {
+        host.write_file(path, out.as_bytes())
+            .await
+            .map_err(|e| AppFrameworkError::Integration(e.to_string()))
+    })
+    .await
+}
+
+/// 把 `patch` 覆盖到 `base` 上（同名表递归合并，叶子整值替换）
+fn merge_tables(base: &mut toml::Table, patch: &toml::Table) {
+    for (key, value) in patch {
+        match (base.get_mut(key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_tables(existing, incoming);
+            }
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+pub async fn read_optional_text(
+    host: &dyn Host,
+    path: &HostPath,
+) -> Result<Option<String>, AppFrameworkError> {
+    let bytes = match host.read_file(path).await {
+        Ok(bytes) => bytes,
+        Err(ncd_host::HostError::PathNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(AppFrameworkError::Host(error.to_string())),
+    };
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn optional_config_reads_once_and_preserves_permission_failures() {
+        let host = crate::config_backup::tests::TestHost::new("remote:config");
+        let path = HostPath::from_posix("/app/config.toml");
+        assert!(
+            read_optional_text(host.as_ref(), &path)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        host.put("/app/config.toml", b"[bot]\n");
+        assert_eq!(
+            read_optional_text(host.as_ref(), &path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[bot]\n")
+        );
+        assert_eq!(host.access_counts("/app/config.toml"), (0, 2));
+        host.deny_read("/app/config.toml");
+        assert!(read_optional_text(host.as_ref(), &path).await.is_err());
+    }
+
+    fn snap(id: &str, text: &str) -> DocumentSnapshot {
+        let doc = neobot_config_documents()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        DocumentSnapshot {
+            doc,
+            text: Some(text.to_string()),
+            revision: "r".to_string(),
+        }
+    }
+
+    #[test]
+    fn parses_upstream_shaped_config() {
+        let snaps = vec![
+            snap(
+                DOC_ADAPTER,
+                "\n[adapter]\nmode = \"onebot\"\nreverse_ws_host = \"127.0.0.1\"\nreverse_ws_port = 8080\nreverse_ws_access_token = \"tok\"\n",
+            ),
+            snap(DOC_DASHBOARD, "host = \"127.0.0.1\"\nport = 9981\n"),
+        ];
+        let cfg = parse_neobot_config(&snaps).unwrap();
+        assert_eq!(cfg.adapter.mode, "onebot");
+        assert_eq!(cfg.adapter.reverse_ws_port, 8080);
+        assert_eq!(cfg.adapter.reverse_ws_access_token, "tok");
+        assert_eq!(cfg.dashboard.port, 9981);
+        assert_eq!(cfg.dashboard.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn missing_keys_fall_back_to_defaults() {
+        let snaps = vec![snap(DOC_ADAPTER, "[adapter]\n"), snap(DOC_DASHBOARD, "")];
+        let cfg = parse_neobot_config(&snaps).unwrap();
+        assert_eq!(cfg.adapter.mode, "onebot", "缺 mode 按上游默认 onebot");
+        assert_eq!(cfg.adapter.reverse_ws_port, 8080);
+        assert_eq!(
+            cfg.adapter.reverse_ws_host, "127.0.0.1",
+            "键缺失时用桌面端默认（回环）；跟上游空串=0.0.0.0 是两回事，见下一个用例"
+        );
+        assert_eq!(cfg.dashboard.port, 9981);
+    }
+
+    /// 上游语义：文件里**显式**写空串 = 落到 0.0.0.0。这是合法配置，不是校验错误。
+    /// 与「键缺失」区分开：缺失用桌面端默认（回环），显式空串按上游解释。
+    #[test]
+    fn explicit_empty_host_means_upstream_wildcard() {
+        let snaps = vec![
+            snap(DOC_ADAPTER, "[adapter]\nreverse_ws_host = \"\"\n"),
+            snap(DOC_DASHBOARD, ""),
+        ];
+        let cfg = parse_neobot_config(&snaps).unwrap();
+        assert_eq!(cfg.adapter.reverse_ws_host, "0.0.0.0");
+        assert!(cfg.validate().is_empty(), "这是上游合法配置，不该报错");
+    }
+
+    #[test]
+    fn empty_files_are_rejected() {
+        let snaps = vec![
+            DocumentSnapshot {
+                doc: neobot_config_documents()[0].clone(),
+                text: None,
+                revision: "missing".to_string(),
+            },
+            DocumentSnapshot {
+                doc: neobot_config_documents()[1].clone(),
+                text: None,
+                revision: "missing".to_string(),
+            },
+        ];
+        assert!(matches!(
+            parse_neobot_config(&snaps),
+            Err(AppFrameworkError::Integration(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_and_collision() {
+        let mut cfg = NeoBotInstanceConfig::default();
+        assert!(cfg.validate().is_empty());
+
+        cfg.adapter.reverse_ws_port = 0;
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| i.path == "adapter/reverse_ws_port"));
+
+        let mut cfg = NeoBotInstanceConfig::default();
+        cfg.dashboard.port = cfg.adapter.reverse_ws_port;
+        let issues = cfg.validate();
+        assert!(
+            issues.iter().any(|i| i.path == "dashboard/port"),
+            "面板口与 OneBot 口相同要报"
+        );
+
+        let mut cfg = NeoBotInstanceConfig::default();
+        cfg.adapter.mode = "local".to_string();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|i| i.path == "adapter/mode"));
+    }
+
+    #[test]
+    fn patch_only_touches_known_keys() {
+        let existing: toml::Table = "\n[adapter]\nmode = \"onebot\"\nlocal_port = 8090\nreverse_ws_port = 1\n\n[bot]\nqq = 10001\n"
+            .parse()
+            .unwrap();
+        let cfg = NeoBotInstanceConfig::default();
+        let mut patched = existing.clone();
+        merge_tables(&mut patched, &adapter_patch(&cfg));
+        let adapter = patched.get(KEY_ADAPTER).and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            adapter.get("local_port").and_then(|v| v.as_integer()),
+            Some(8090),
+            "不认识的键要留着"
+        );
+        assert_eq!(
+            adapter
+                .get(KEY_REVERSE_WS_PORT)
+                .and_then(|v| v.as_integer()),
+            Some(8080)
+        );
+        assert_eq!(
+            patched
+                .get("bot")
+                .and_then(|v| v.get("qq"))
+                .and_then(|v| v.as_integer()),
+            Some(10001),
+            "别的分区不能被碰"
+        );
+    }
+
+    #[test]
+    fn documents_cover_both_files() {
+        let docs = neobot_config_documents();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].rel_path, "app/data/config.toml");
+        assert_eq!(
+            docs[1].rel_path,
+            "app/data/plugins_data/dashboard/config.toml"
+        );
+        assert!(docs.iter().all(|d| d.format == AppConfigFormat::Toml));
+        assert!(!docs[0].hot_reload, "原文保存不会自动触发重载");
+        assert!(docs[0].reload_note.as_deref().unwrap().contains("/reload"));
+        assert!(!docs[1].hot_reload, "面板监听设置需重启进程");
+    }
+
+    // ---- 旧版桌面端写进 data/config.toml 的对接，启动前搬到 app/data ----
+
+    use crate::config_backup::tests::TestHost;
+
+    const LEGACY_LINKED: &str = "[adapter]\nmode = \"onebot\"\nreverse_ws_host = \"127.0.0.1\"\nreverse_ws_port = 36909\nreverse_ws_access_token = \"tok\"\n";
+
+    async fn adapter_of(host: &TestHost, path: &str) -> toml::Table {
+        let bytes = host.read_file(&HostPath::from_posix(path)).await.unwrap();
+        let table: toml::Table = String::from_utf8_lossy(&bytes).parse().unwrap();
+        table
+            .get(KEY_ADAPTER)
+            .and_then(|v| v.as_table())
+            .cloned()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_link_moves_into_real_config_and_keeps_user_keys() {
+        let host = TestHost::new("carry");
+        host.put("/n1/data/config.toml", LEGACY_LINKED.as_bytes());
+        host.put(
+            "/n1/app/data/config.toml",
+            "# 上游生成\n[bot]\nqq = 10001\n\n[adapter]\nmode = \"onebot\"\nreverse_ws_port = 8085\nreverse_ws_access_token = \"\"\n".as_bytes(),
+        );
+        let root = HostPath::from_posix("/n1");
+        assert!(
+            carry_legacy_link(host.as_ref(), &root, 36909)
+                .await
+                .unwrap()
+        );
+        let adapter = adapter_of(&host, "/n1/app/data/config.toml").await;
+        assert_eq!(
+            adapter
+                .get(KEY_REVERSE_WS_PORT)
+                .and_then(|v| v.as_integer()),
+            Some(36909)
+        );
+        assert_eq!(
+            adapter
+                .get(KEY_REVERSE_WS_ACCESS_TOKEN)
+                .and_then(|v| v.as_str()),
+            Some("tok")
+        );
+        let text = String::from_utf8_lossy(
+            &host
+                .read_file(&HostPath::from_posix("/n1/app/data/config.toml"))
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(
+            text.contains("# 上游生成") && text.contains("qq = 10001"),
+            "{text}"
+        );
+
+        // 搬过一次新文件就有 token，再启动不重复写
+        assert!(
+            !carry_legacy_link(host.as_ref(), &root, 36909)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_link_creates_real_config_when_neobot_never_ran_there() {
+        let host = TestHost::new("carry");
+        host.put("/n1/data/config.toml", LEGACY_LINKED.as_bytes());
+        let root = HostPath::from_posix("/n1");
+        assert!(carry_legacy_link(host.as_ref(), &root, 0).await.unwrap());
+        let adapter = adapter_of(&host, "/n1/app/data/config.toml").await;
+        assert_eq!(
+            adapter
+                .get(KEY_REVERSE_WS_PORT)
+                .and_then(|v| v.as_integer()),
+            Some(36909),
+            "实例口未知时沿用旧文件里的口"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_link_is_skipped_without_token_or_when_already_linked() {
+        let root = HostPath::from_posix("/n1");
+
+        let unlinked = TestHost::new("carry");
+        unlinked.put(
+            "/n1/data/config.toml",
+            "[adapter]\nreverse_ws_port = 36909\nreverse_ws_access_token = \"\"\n".as_bytes(),
+        );
+        assert!(
+            !carry_legacy_link(unlinked.as_ref(), &root, 36909)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !unlinked
+                .exists(&HostPath::from_posix("/n1/app/data/config.toml"))
+                .await
+                .unwrap(),
+            "没对接过就没东西可搬，不替它建文件"
+        );
+
+        let linked = TestHost::new("carry");
+        linked.put("/n1/data/config.toml", LEGACY_LINKED.as_bytes());
+        linked.put(
+            "/n1/app/data/config.toml",
+            "[adapter]\nreverse_ws_port = 40000\nreverse_ws_access_token = \"new\"\n".as_bytes(),
+        );
+        assert!(
+            !carry_legacy_link(linked.as_ref(), &root, 36909)
+                .await
+                .unwrap()
+        );
+        let adapter = adapter_of(&linked, "/n1/app/data/config.toml").await;
+        assert_eq!(
+            adapter
+                .get(KEY_REVERSE_WS_ACCESS_TOKEN)
+                .and_then(|v| v.as_str()),
+            Some("new"),
+            "新文件已有 token 时不能被旧值盖掉"
+        );
+    }
+}

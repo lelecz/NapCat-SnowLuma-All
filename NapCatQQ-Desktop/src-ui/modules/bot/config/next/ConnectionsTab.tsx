@@ -1,0 +1,535 @@
+// 协议连接列表：行内编辑走 Dialog，新增条贴底。
+
+import { lazy, Suspense, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Plus, Trash2, Pencil, Lock, Link2, CloudDownload } from 'lucide-react';
+import { ActionMotionIcon, EMPHASIS_MOTION } from '../../../../shared/ui/motion';
+import {
+    Button,
+    Badge,
+    Tooltip,
+    TooltipProvider,
+    TooltipTrigger,
+    TooltipContent,
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogDescription,
+    DialogFooter,
+    FormSection,
+} from '../../../../shared/ui';
+import {
+    CONNECTION_KINDS,
+    CONNECTION_GROUP_KEY,
+    type ConnectionKind,
+    type ConnectionConfig,
+    createDefaultConnection,
+    summarizeConnection,
+    collectAllNames,
+    getKindMeta,
+    isAppLinkConnectionName,
+} from '../../../../core/domain/bot/connections';
+import type { ConnectConfig } from '../../../../core/ipc/generated/domain/ConnectConfig';
+import type { BackendType } from '../../../../core/ipc/generated/domain/BackendType';
+import type { OneBotLinkEndpoint } from '../../../../core/ipc/generated/domain/OneBotLinkEndpoint';
+import { ConnectionEditor } from './ConnectionEditor';
+import { useFeatureEnabled } from '../../../../hooks/preferences/featureTogglesStore';
+
+function upsertByName<T extends { name: string }>(list: readonly T[], item: T): T[] {
+    const next = list.slice();
+    const idx = next.findIndex((c) => c.name === item.name);
+    if (idx < 0) next.push(item);
+    else next[idx] = item;
+    return next;
+}
+
+// 对接对话框与应用端页共用；按需加载，不让 Bot 配置页首屏背上应用端 chunk。
+const AppLinkDialog = lazy(() =>
+    import('../../../apps/AppLinkDialog').then((m) => ({ default: m.AppLinkDialog })),
+);
+
+interface ConnectionsTabProps {
+    data: ConnectConfig;
+    onChange: (patch: Partial<ConnectConfig>) => void;
+    backendType: BackendType;
+    dockerDeployment?: boolean;
+    /** 已保存 Bot 的 QQ 号；新建（尚未保存）时为 null，「对接应用端」入口不可用。 */
+    botId?: string | null;
+    /** 已保存的远端 Bot 才给；不给就不显示「从远端读取」 */
+    onPullRemote?: () => void;
+    pullingRemote?: boolean;
+}
+
+type EditingKey =
+    | { type: 'edit'; kind: ConnectionKind; idx: number; draft: ConnectionConfig }
+    | { type: 'create'; kind: ConnectionKind; draft: ConnectionConfig }
+    | null;
+
+interface DeleteTarget {
+    kind: ConnectionKind;
+    idx: number;
+    name: string;
+}
+
+const KIND_BADGE: Record<ConnectionKind, string> = {
+    httpServer: 'HTTP',
+    httpSseServer: 'SSE',
+    httpClient: 'Webhook',
+    websocketServer: 'WS-Server',
+    websocketClient: 'WS-Client',
+};
+
+export function ConnectionsTab({
+    data,
+    onChange,
+    backendType,
+    dockerDeployment = false,
+    botId = null,
+    onPullRemote,
+    pullingRemote = false,
+}: ConnectionsTabProps) {
+    const [editing, setEditing] = useState<EditingKey>(null);
+    /// 退场动画结束后再清，避免 open=false 时立刻卸掉表单导致收起动画闪空。
+    const [editingMount, setEditingMount] = useState<EditingKey>(null);
+    const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
+    const [linkOpen, setLinkOpen] = useState(false);
+    /// 首次打开后保持挂载，让关闭时的退场动画能播完。
+    const [linkMounted, setLinkMounted] = useState(false);
+    useEffect(() => {
+        if (linkOpen) setLinkMounted(true);
+    }, [linkOpen]);
+
+    /// 对接由后端直接落盘 + 热推；这里把同一条连接同步进未保存的表单草稿，
+    /// 否则用户随后点「保存」会用旧草稿把它覆盖掉。反向进 WS 客户端表，正向进 WS 服务端表。
+    const syncLinkedConnection = (connection: OneBotLinkEndpoint) => {
+        if (connection.kind === 'ws_client') {
+            const { kind: _kind, ...client } = connection;
+            onChange({ websocketClients: upsertByName(data.websocketClients, client) });
+        } else {
+            const { kind: _kind, ...server } = connection;
+            onChange({ websocketServers: upsertByName(data.websocketServers, server) });
+        }
+    };
+
+    useEffect(() => {
+        if (editing !== null) {
+            setEditingMount(editing);
+        }
+    }, [editing]);
+
+    const startCreate = (kind: ConnectionKind) => {
+        const draft = createDefaultConnection(kind);
+        setEditing({ type: 'create', kind, draft });
+    };
+
+    const startEdit = (kind: ConnectionKind, idx: number) => {
+        const list = data[CONNECTION_GROUP_KEY[kind]] as ConnectionConfig[];
+        const item = list[idx];
+        if (!item) return;
+        setEditing({ type: 'edit', kind, idx, draft: item });
+    };
+
+    const cancelEdit = () => setEditing(null);
+
+    const saveEdit = (next: ConnectionConfig) => {
+        if (!editing) return;
+        const groupKey = CONNECTION_GROUP_KEY[editing.kind];
+        const list = (data[groupKey] as ConnectionConfig[]).slice();
+        if (editing.type === 'create') {
+            list.push(next);
+        } else {
+            list[editing.idx] = next;
+        }
+        onChange({ [groupKey]: list } as Partial<ConnectConfig>);
+        setEditing(null);
+    };
+
+    const confirmDelete = () => {
+        if (!deleteTarget) return;
+        const groupKey = CONNECTION_GROUP_KEY[deleteTarget.kind];
+        const list = (data[groupKey] as ConnectionConfig[]).slice();
+        list.splice(deleteTarget.idx, 1);
+        onChange({ [groupKey]: list } as Partial<ConnectConfig>);
+        setDeleteTarget(null);
+    };
+
+    const total = totalCount(data);
+
+    return (
+        <TooltipProvider delayDuration={200}>
+            {dockerDeployment && (
+                <p className="mb-4 rounded-md border border-border-subtle bg-field/35 px-4 py-3 text-xs leading-relaxed text-text-secondary">
+                    新增或修改监听端口后，保存会自动更新 Docker 映射；可在「容器」中调整宿主机端口。
+                    容器内监听请使用 0.0.0.0，回环地址会自动转换。运行中的容器可能短暂重建。
+                </p>
+            )}
+            {total === 0 ? (
+                <div className="flex min-h-[52vh] flex-1 items-center justify-center">
+                    <div className="flex w-full max-w-xs flex-col items-center rounded-md border border-dashed border-border-subtle bg-field/30 px-5 py-7 text-center">
+                        <span className="mb-2.5 flex h-9 w-9 items-center justify-center rounded-full bg-brand-soft/60 text-brand">
+                            <Link2 size={16} strokeWidth={2.2} />
+                        </span>
+                        <p className="text-sm font-medium text-text">暂无协议连接</p>
+                        <p className="mt-1 text-2xs leading-relaxed text-text-tertiary">
+                            从下方工具条添加连接或对接应用端后，Bot 才能与外部通信
+                        </p>
+                    </div>
+                </div>
+            ) : (
+                <div className="flex flex-col gap-8 pb-2">
+                    <FormSection
+                        title="协议连接"
+                        actions={<span className="text-2xs text-text-tertiary">{total} 项</span>}
+                    >
+                        <ConnectionList
+                            data={data}
+                            onStartEdit={startEdit}
+                            onDelete={(kind, idx, name) => setDeleteTarget({ kind, idx, name })}
+                        />
+                    </FormSection>
+                </div>
+            )}
+
+            {/* 浮动新增条：portal 到 BotConfigPage 提供的 dock，永远贴底 */}
+            <FloatingAddBarPortal
+                backendType={backendType}
+                onPick={startCreate}
+                canLinkApp={botId !== null}
+                onLinkApp={() => setLinkOpen(true)}
+                onPullRemote={onPullRemote}
+                pullingRemote={pullingRemote}
+            />
+
+            {botId !== null && linkMounted && (
+                <Suspense fallback={null}>
+                    <AppLinkDialog
+                        open={linkOpen}
+                        onOpenChange={setLinkOpen}
+                        botId={botId}
+                        onApplied={(plan) => syncLinkedConnection(plan.connection)}
+                    />
+                </Suspense>
+            )}
+
+            {/* 新建 / 编辑 共用同一个 Dialog */}
+            <Dialog
+                open={editing !== null}
+                onOpenChange={(o) => {
+                    if (!o) cancelEdit();
+                }}
+            >
+                <DialogContent
+                    size="lg"
+                    dismissOnOutsideClick={true}
+                    onExited={() => setEditingMount(null)}
+                    onPointerDownOutside={(e) => {
+                        // 只阻止点击遮罩层（data-dialog-overlay），
+                        // 允许点击其他 Portal 元素（Select 下拉等）
+                        const target = e.target as HTMLElement;
+                        if (target.hasAttribute('data-dialog-overlay')) {
+                            e.preventDefault();
+                        }
+                    }}
+                    onInteractOutside={(e) => {
+                        const target = e.target as HTMLElement;
+                        if (target.hasAttribute('data-dialog-overlay')) {
+                            e.preventDefault();
+                        }
+                    }}
+                >
+                    {editingMount && (
+                        <>
+                            <DialogHeader>
+                                <DialogTitle>
+                                    {editingMount.type === 'create' ? '新增' : '编辑'}{' '}
+                                    {getKindMeta(editingMount.kind).title}
+                                </DialogTitle>
+                                <DialogDescription>
+                                    {getKindMeta(editingMount.kind).description}
+                                </DialogDescription>
+                            </DialogHeader>
+                            <ConnectionEditor
+                                kind={editingMount.kind}
+                                initialData={editingMount.draft}
+                                existingNames={
+                                    editingMount.type === 'edit'
+                                        ? collectAllNames(data).filter(
+                                              (n) => n !== editingMount.draft.name,
+                                          )
+                                        : collectAllNames(data)
+                                }
+                                backendType={backendType}
+                                dockerDeployment={dockerDeployment}
+                                onSave={saveEdit}
+                                onCancel={cancelEdit}
+                            />
+                        </>
+                    )}
+                </DialogContent>
+            </Dialog>
+
+            {/* 删除二次确认 */}
+            <Dialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
+                <DialogContent size="sm">
+                    <DialogHeader>
+                        <DialogTitle>删除连接？</DialogTitle>
+                        <DialogDescription>
+                            删除连接 "{deleteTarget?.name}"，此操作不可撤销。
+                        </DialogDescription>
+                    </DialogHeader>
+                    <DialogFooter>
+                        <Button variant="ghost" size="sm" onClick={() => setDeleteTarget(null)}>
+                            取消
+                        </Button>
+                        <Button variant="danger" size="sm" onClick={confirmDelete}>
+                            确认删除
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
+        </TooltipProvider>
+    );
+}
+
+function totalCount(c: ConnectConfig): number {
+    return (
+        c.httpServers.length +
+        c.httpSseServers.length +
+        c.httpClients.length +
+        c.websocketServers.length +
+        c.websocketClients.length
+    );
+}
+
+interface FloatingAddBarProps {
+    backendType: BackendType;
+    onPick: (kind: ConnectionKind) => void;
+    canLinkApp: boolean;
+    onLinkApp: () => void;
+    onPullRemote?: () => void;
+    pullingRemote: boolean;
+}
+
+function FloatingAddBarPortal(props: FloatingAddBarProps) {
+    const [dock, setDock] = useState<HTMLElement | null>(null);
+    useEffect(() => {
+        setDock(document.getElementById('connections-add-dock'));
+    }, []);
+    if (!dock) return null;
+    return createPortal(<FloatingAddBar {...props} />, dock);
+}
+
+function FloatingAddBar({
+    backendType,
+    onPick,
+    canLinkApp,
+    onLinkApp,
+    onPullRemote,
+    pullingRemote,
+}: FloatingAddBarProps) {
+    // 设置里关了应用端就不给对接入口；已有的应用端连接照常列着、照常能改
+    const appsEnabled = useFeatureEnabled('apps');
+    const linkBtn = (
+        <Button variant="ghost" size="sm" disabled={!canLinkApp} onClick={onLinkApp}>
+            <ActionMotionIcon icon={Link2} size={12} strokeWidth={2.4} motion={EMPHASIS_MOTION} />
+            <span>对接应用端</span>
+        </Button>
+    );
+    return (
+        <div className="flex justify-center px-4 pb-3 sm:px-6">
+            <div className="inline-flex max-w-full flex-wrap items-center justify-center gap-1 rounded-2xl bg-elevated/95 px-2 py-1 shadow-popover ring-1 ring-border-subtle backdrop-blur-sm sm:rounded-pill">
+                {appsEnabled && (
+                    <>
+                        {canLinkApp ? (
+                            linkBtn
+                        ) : (
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <span>{linkBtn}</span>
+                                </TooltipTrigger>
+                                <TooltipContent>先保存 Bot，再对接应用端</TooltipContent>
+                            </Tooltip>
+                        )}
+                        <span className="mx-0.5 h-4 w-px bg-border-subtle" aria-hidden />
+                    </>
+                )}
+                {onPullRemote && (
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <Button
+                                variant="ghost"
+                                size="sm"
+                                disabled={pullingRemote}
+                                onClick={onPullRemote}
+                            >
+                                <ActionMotionIcon
+                                    icon={CloudDownload}
+                                    size={12}
+                                    strokeWidth={2.4}
+                                    motion={EMPHASIS_MOTION}
+                                />
+                                <span>{pullingRemote ? '读取中…' : '从远端读取'}</span>
+                            </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>在远端 WebUI 里改过连接时，先拉回来再保存</TooltipContent>
+                    </Tooltip>
+                )}
+                {onPullRemote && <span className="mx-0.5 h-4 w-px bg-border-subtle" aria-hidden />}
+                <span className="px-1 text-2xs font-medium uppercase tracking-wide text-text-tertiary">
+                    新增
+                </span>
+                {CONNECTION_KINDS.map((meta) => {
+                    const supported = meta.supportedBackends.includes(backendType);
+                    const btn = (
+                        <Button
+                            key={meta.kind}
+                            variant="ghost"
+                            size="sm"
+                            disabled={!supported}
+                            onClick={() => supported && onPick(meta.kind)}
+                        >
+                            {supported ? (
+                                <ActionMotionIcon
+                                    icon={Plus}
+                                    size={12}
+                                    strokeWidth={2.4}
+                                    motion={EMPHASIS_MOTION}
+                                />
+                            ) : (
+                                <ActionMotionIcon icon={Lock} size={12} />
+                            )}
+                            <span>{meta.title}</span>
+                        </Button>
+                    );
+                    if (supported) return btn;
+                    return (
+                        <Tooltip key={meta.kind}>
+                            <TooltipTrigger asChild>
+                                <span>{btn}</span>
+                            </TooltipTrigger>
+                            <TooltipContent>当前底座（{backendType}）不支持此类型</TooltipContent>
+                        </Tooltip>
+                    );
+                })}
+            </div>
+        </div>
+    );
+}
+
+interface ConnectionListProps {
+    data: ConnectConfig;
+    onStartEdit: (kind: ConnectionKind, idx: number) => void;
+    onDelete: (kind: ConnectionKind, idx: number, name: string) => void;
+}
+
+function ConnectionList({ data, onStartEdit, onDelete }: ConnectionListProps) {
+    const items = CONNECTION_KINDS.flatMap((meta) =>
+        (data[CONNECTION_GROUP_KEY[meta.kind]] as ConnectionConfig[]).map((item, idx) => ({
+            meta,
+            item,
+            idx,
+        })),
+    );
+    return (
+        <div className="flex flex-col gap-2.5">
+            {items.map(({ meta, item, idx }) => (
+                <ConnectionRow
+                    key={`${meta.kind}-${idx}-${item.name}`}
+                    kind={meta.kind}
+                    item={item}
+                    onStartEdit={() => onStartEdit(meta.kind, idx)}
+                    onDelete={() => onDelete(meta.kind, idx, item.name)}
+                />
+            ))}
+        </div>
+    );
+}
+
+interface ConnectionRowProps {
+    kind: ConnectionKind;
+    item: ConnectionConfig;
+    onStartEdit: () => void;
+    onDelete: () => void;
+}
+
+function ConnectionRow({ kind, item, onStartEdit, onDelete }: ConnectionRowProps) {
+    const summary = summarizeConnection(kind, item);
+
+    return (
+        <div className="group rounded-md border border-border-subtle/80 bg-field/40 transition-all hover:border-border hover:bg-field/70">
+            <div className="flex items-center justify-between gap-3 px-3.5 py-2.5">
+                <button
+                    type="button"
+                    onClick={onStartEdit}
+                    className="flex min-w-0 flex-1 flex-col gap-1 text-left cursor-pointer select-none"
+                >
+                    {/* 第一行：协议标识 + 连接名称 + 运行状态 */}
+                    <div className="flex items-center gap-2 min-w-0">
+                        <Badge
+                            tone="info"
+                            appearance="soft"
+                            className="font-mono text-[11px] shrink-0"
+                        >
+                            {KIND_BADGE[kind]}
+                        </Badge>
+                        <span className="truncate text-sm font-semibold text-text">
+                            {item.name}
+                        </span>
+                        {isAppLinkConnectionName(item.name) && (
+                            <Badge tone="brand" appearance="soft" className="shrink-0">
+                                应用端
+                            </Badge>
+                        )}
+                        {item.enable ? (
+                            <Badge tone="success" appearance="soft" dot className="shrink-0">
+                                启用
+                            </Badge>
+                        ) : (
+                            <Badge tone="neutral" appearance="soft" className="shrink-0">
+                                禁用
+                            </Badge>
+                        )}
+                    </div>
+
+                    {/* 第二行：端点 URL 与配置参数 */}
+                    <div className="flex items-center gap-2 text-2xs font-mono text-text-tertiary">
+                        <span className="truncate text-text-secondary" title={summary}>
+                            {summary}
+                        </span>
+                    </div>
+                </button>
+                <div className="flex shrink-0 items-center gap-1 opacity-80 group-hover:opacity-100 transition-opacity">
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                aria-label={`编辑连接 ${item.name}`}
+                                onClick={onStartEdit}
+                            >
+                                <ActionMotionIcon icon={Pencil} size={13} strokeWidth={2.2} />
+                            </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>编辑</TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-danger hover:text-danger"
+                                aria-label={`删除连接 ${item.name}`}
+                                onClick={onDelete}
+                            >
+                                <ActionMotionIcon icon={Trash2} size={13} strokeWidth={2.2} />
+                            </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>删除连接</TooltipContent>
+                    </Tooltip>
+                </div>
+            </div>
+        </div>
+    );
+}

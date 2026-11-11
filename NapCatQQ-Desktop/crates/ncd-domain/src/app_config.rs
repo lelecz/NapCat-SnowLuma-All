@@ -1,0 +1,1065 @@
+//! App 级配置类型
+//!
+//! - WebUiPollerSettings: NapCat WebUI 登录态轮询
+//! - SnowLumaAppConfig: SnowLuma daemon 密码与端口
+//! - AppSettings: 设置页聚合配置
+
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+use crate::snowluma_linux_package::SnowLumaLinuxPackage;
+
+use crate::app_framework::AppFrameworkId;
+use crate::macros::default_true;
+use crate::mcp::McpServerSettings;
+use crate::network_settings::NetworkSettings;
+use crate::offline_alert::{
+    OfflineEmailSettings, OfflineNotifyBehavior, OfflineOneBotSettings, OfflineWebhookSettings,
+};
+
+/// GitHub 版本 API 的请求方式；默认保持中转优先，直连只访问 GitHub 官方 API。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub enum GithubApiMode {
+    #[default]
+    Proxy,
+    Direct,
+}
+
+string_enum! {
+    /// 主窗口关闭按钮行为
+    ///
+    /// 未知值兜底为 Unknown(String), 保证旧配置文件里非标准值不会导致反序列化失败
+    #[derive(Debug, Clone, PartialEq, Eq, Default, TS)]
+    #[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+    pub enum CloseAction {
+        #[default]
+        Close => "close",
+        Tray => "tray",
+    }
+}
+
+string_enum! {
+    /// 关窗行为
+    #[derive(Debug, Clone, PartialEq, Eq, Default, TS)]
+    #[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+    pub enum AfterCloseUiBehavior {
+        Hide => "hide",
+        #[default]
+        DelayedLightweight => "delayed_lightweight",
+        ImmediateLightweight => "immediate_lightweight",
+    }
+}
+
+string_enum! {
+    /// 登录自启时 UI 模式；手动启动始终显示主窗口
+    #[derive(Debug, Clone, PartialEq, Eq, Default, TS)]
+    #[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+    pub enum UiModeOnStartup {
+        #[default]
+        Normal => "normal",
+        TrayOnly => "tray_only",
+    }
+}
+
+/// WebUiPollerSettings.bot_login_check_interval_ms 默认值(毫秒)
+pub fn default_login_interval() -> u64 {
+    5000
+}
+
+/// NapCat WebUI 登录态轮询设置
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct WebUiPollerSettings {
+    /// 登录态轮询间隔(毫秒),未登录时强制 1000ms
+    #[serde(rename = "botLoginCheckInterval", default = "default_login_interval")]
+    pub bot_login_check_interval_ms: u64,
+    /// 离线 webhook 通知开关
+    #[serde(rename = "botOfflineWebHookNotice", default)]
+    pub offline_webhook_notice: bool,
+    /// 离线邮件通知开关
+    #[serde(rename = "botOfflineEmailNotice", default)]
+    pub offline_email_notice: bool,
+    /// recovered / 防抖 / 历史容量
+    #[serde(rename = "offlineNotifyBehavior", default)]
+    pub offline_notify_behavior: OfflineNotifyBehavior,
+}
+
+impl Default for WebUiPollerSettings {
+    fn default() -> Self {
+        Self {
+            bot_login_check_interval_ms: default_login_interval(),
+            offline_webhook_notice: false,
+            offline_email_notice: false,
+            offline_notify_behavior: OfflineNotifyBehavior::default(),
+        }
+    }
+}
+
+/// SnowLumaAppConfig.webui_port 默认值
+pub fn default_snowluma_port() -> u16 {
+    5099
+}
+
+/// SnowLuma daemon 配置
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct SnowLumaAppConfig {
+    /// App 级 WebUI 密码覆盖,空字符串视为未设置
+    #[serde(default, rename = "snowlumaWebuiPasswordOverride")]
+    pub webui_password_override: String,
+    /// SnowLuma daemon WebUI 端口
+    #[serde(default = "default_snowluma_port", rename = "snowlumaWebuiPort")]
+    pub webui_port: u16,
+    #[serde(default = "default_true", rename = "snowlumaRemoteQrLoginEnabled")]
+    pub remote_qr_login_enabled: bool,
+    #[serde(default = "default_true", rename = "snowlumaLocalQrLoginEnabled")]
+    pub local_qr_login_enabled: bool,
+}
+
+impl Default for SnowLumaAppConfig {
+    fn default() -> Self {
+        Self {
+            webui_password_override: String::new(),
+            webui_port: default_snowluma_port(),
+            remote_qr_login_enabled: true,
+            local_qr_login_enabled: true,
+        }
+    }
+}
+
+/// AppSettings.performance_monitor_interval_ms 默认值
+pub fn default_perf_monitor_interval() -> u64 {
+    1200
+}
+
+fn default_bot_runtime_metrics_enabled() -> bool {
+    false
+}
+
+fn default_bot_runtime_metrics_interval_field() -> u64 {
+    crate::bot_runtime_metrics::default_bot_runtime_metrics_interval_ms()
+}
+
+fn default_bot_runtime_metrics_retention_field() -> u32 {
+    crate::bot_runtime_metrics::default_bot_runtime_metrics_retention_days()
+}
+
+/// 与前端 performanceSettings 一致:500–10000 ms
+pub const PERF_MONITOR_INTERVAL_MIN_MS: u64 = 500;
+pub const PERF_MONITOR_INTERVAL_MAX_MS: u64 = 10_000;
+
+pub fn clamp_perf_monitor_interval_ms(raw: u64) -> u64 {
+    raw.clamp(PERF_MONITOR_INTERVAL_MIN_MS, PERF_MONITOR_INTERVAL_MAX_MS)
+}
+
+/// 远程主机健康探活默认间隔(30s)
+pub fn default_remote_host_health_probe_interval_ms() -> u64 {
+    30_000
+}
+
+/// 远程主机健康探活间隔范围:10s ~ 5min
+pub const REMOTE_HOST_HEALTH_PROBE_INTERVAL_MIN_MS: u64 = 10_000;
+pub const REMOTE_HOST_HEALTH_PROBE_INTERVAL_MAX_MS: u64 = 300_000;
+
+pub fn clamp_remote_host_health_probe_interval_ms(raw: u64) -> u64 {
+    raw.clamp(
+        REMOTE_HOST_HEALTH_PROBE_INTERVAL_MIN_MS,
+        REMOTE_HOST_HEALTH_PROBE_INTERVAL_MAX_MS,
+    )
+}
+
+fn default_enter_lightweight_delay_secs() -> u32 {
+    300
+}
+
+/// 延迟轻量模式延迟范围:60s ~ 1800s,0 视为立即进入
+pub const LIGHTWEIGHT_DELAY_MIN_SECS: u32 = 60;
+pub const LIGHTWEIGHT_DELAY_MAX_SECS: u32 = 1800;
+
+pub fn clamp_lightweight_delay_secs(raw: u32) -> u32 {
+    if raw == 0 {
+        return 0;
+    }
+    raw.clamp(LIGHTWEIGHT_DELAY_MIN_SECS, LIGHTWEIGHT_DELAY_MAX_SECS)
+}
+
+fn default_ui_theme() -> String {
+    "auto".to_string()
+}
+
+fn default_ui_motion_level() -> String {
+    "standard".to_string()
+}
+
+fn default_ui_radius_style() -> String {
+    "standard".to_string()
+}
+
+fn default_ui_sidebar_style() -> String {
+    "floating".to_string()
+}
+
+fn default_ui_motion_speed() -> f64 {
+    0.5
+}
+
+fn default_infobar_dismiss_info_ms() -> u64 {
+    5000
+}
+
+fn default_infobar_dismiss_success_ms() -> u64 {
+    4000
+}
+
+fn default_infobar_dismiss_warning_ms() -> u64 {
+    6000
+}
+
+fn default_task_queue_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_task_queue_cleanup_linger_ms() -> u64 {
+    600_000
+}
+
+/// 任务队列终态条目保留时长下限(毫秒),0 = 关闭自动清理
+pub const TASK_QUEUE_CLEANUP_LINGER_MIN_MS: u64 = 3_000;
+/// 任务队列终态条目保留时长上限(毫秒)
+pub const TASK_QUEUE_CLEANUP_LINGER_MAX_MS: u64 = 3_600_000;
+
+pub fn clamp_task_queue_cleanup_linger_ms(raw: u64) -> u64 {
+    if raw == 0 {
+        return 0;
+    }
+    raw.clamp(
+        TASK_QUEUE_CLEANUP_LINGER_MIN_MS,
+        TASK_QUEUE_CLEANUP_LINGER_MAX_MS,
+    )
+}
+
+/// 外观偏好(与 WebView localStorage 同步)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct AppUiPreferences {
+    #[serde(rename = "theme", default = "default_ui_theme")]
+    pub theme: String,
+    #[serde(rename = "showMascot", default = "default_true")]
+    pub show_mascot: bool,
+    #[serde(rename = "motionEnabled", default = "default_true")]
+    pub motion_enabled: bool,
+    #[serde(rename = "motionLevel", default = "default_ui_motion_level")]
+    pub motion_level: String,
+    #[serde(rename = "motionSpeed", default = "default_ui_motion_speed")]
+    pub motion_speed: f64,
+    /// 原生 WebView 页面缩放倍率：1.0 / 1.25 / 1.5。
+    #[serde(rename = "uiScale", default = "default_ui_scale")]
+    pub ui_scale: f64,
+    #[serde(rename = "radiusStyle", default = "default_ui_radius_style")]
+    pub radius_style: String,
+    /// InfoBar info tone 自动关闭毫秒,0 = 不自动关
+    #[serde(
+        rename = "infoBarDismissInfoMs",
+        default = "default_infobar_dismiss_info_ms"
+    )]
+    pub info_bar_dismiss_info_ms: u64,
+    /// InfoBar success tone 自动关闭毫秒
+    #[serde(
+        rename = "infoBarDismissSuccessMs",
+        default = "default_infobar_dismiss_success_ms"
+    )]
+    pub info_bar_dismiss_success_ms: u64,
+    /// InfoBar warning tone 自动关闭毫秒,danger 始终不自动关
+    #[serde(
+        rename = "infoBarDismissWarningMs",
+        default = "default_infobar_dismiss_warning_ms"
+    )]
+    pub info_bar_dismiss_warning_ms: u64,
+    /// 侧栏形态：classic 贴边可折叠 / floating 悬浮卡片恒展开
+    #[serde(rename = "sidebarStyle", default = "default_ui_sidebar_style")]
+    pub sidebar_style: String,
+}
+
+impl Default for AppUiPreferences {
+    fn default() -> Self {
+        Self {
+            theme: default_ui_theme(),
+            show_mascot: true,
+            motion_enabled: true,
+            motion_level: default_ui_motion_level(),
+            motion_speed: default_ui_motion_speed(),
+            ui_scale: default_ui_scale(),
+            radius_style: default_ui_radius_style(),
+            sidebar_style: default_ui_sidebar_style(),
+            info_bar_dismiss_info_ms: default_infobar_dismiss_info_ms(),
+            info_bar_dismiss_success_ms: default_infobar_dismiss_success_ms(),
+            info_bar_dismiss_warning_ms: default_infobar_dismiss_warning_ms(),
+        }
+    }
+}
+
+fn default_ui_scale() -> f64 {
+    1.0
+}
+
+impl AppUiPreferences {
+    pub fn ui_scale_factor(&self) -> f64 {
+        match self.ui_scale {
+            1.25 => 1.25,
+            1.5 => 1.5,
+            _ => 1.0,
+        }
+    }
+}
+
+/// 可选功能模块开关（设置 · 功能）。关掉的模块从侧栏和各页入口里拿掉，默认全开；
+/// 只收能整块拿掉、不牵连主路径（装、配、启停 Bot）的模块
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct FeatureToggles {
+    /// 协议端 NapCat：组件页的 NapCat 行、新建 Bot 时的 NapCat 选项；关掉后不再探测它
+    #[serde(rename = "napcat", default = "default_true")]
+    pub napcat: bool,
+    /// 协议端 SnowLuma，同上。两个协议端至少留一个
+    #[serde(rename = "snowluma", default = "default_true")]
+    pub snowluma: bool,
+    /// 应用端（Karin / NoneBot2 / AstrBot / MaiBot）：应用端页、组件页的应用端组、
+    /// Bot 配置里的「对接应用端」；关掉时实例不再随桌面端启动
+    #[serde(rename = "apps", default = "default_true")]
+    pub apps: bool,
+    /// 应用端开着时单独藏掉的框架：组件页不列、新建和导入时不给选
+    #[serde(rename = "hiddenAppFrameworks", default)]
+    pub hidden_app_frameworks: Vec<AppFrameworkId>,
+    /// 容器页；开着时仍只在有远端主机 Docker 可用时出现。关掉后不再探测远端 Docker
+    #[serde(rename = "dockerPage", default = "default_true")]
+    pub docker_page: bool,
+    /// 远端值守 ncd-watch：组件页的 ncd-watch 行、设置 · 通知里的远端值守；
+    /// 关掉后不再给远端写心跳、不再探测它
+    #[serde(rename = "ncdWatch", default = "default_true")]
+    pub ncd_watch: bool,
+    /// 内嵌终端：标题栏开关、Ctrl+`、各卡片上的终端入口、设置 · 终端
+    #[serde(rename = "terminal", default = "default_true")]
+    pub terminal: bool,
+    /// OneBot 调试台：侧栏 / Bot 卡片的「调试」入口；关掉时连后端一起停
+    /// （接收器和在途调用收掉，`DebugManager::set_enabled` 按它走）
+    #[serde(rename = "apiDebug", default = "default_true")]
+    pub api_debug: bool,
+    #[serde(default = "default_true")]
+    pub chat: bool,
+}
+
+impl Default for FeatureToggles {
+    fn default() -> Self {
+        Self {
+            napcat: true,
+            snowluma: true,
+            apps: true,
+            hidden_app_frameworks: Vec::new(),
+            docker_page: true,
+            ncd_watch: true,
+            terminal: true,
+            api_debug: true,
+            chat: true,
+        }
+    }
+}
+
+impl FeatureToggles {
+    /// 两个协议端都关了就把 NapCat 打开（一个都没有就建不了 Bot）；框架名单去重
+    pub fn normalize(&mut self) {
+        if !self.napcat && !self.snowluma {
+            self.napcat = true;
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.hidden_app_frameworks
+            .retain(|id| !id.as_str().is_empty() && seen.insert(id.clone()));
+    }
+}
+
+/// 设置页 App 级配置聚合
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct AppSettings {
+    /// WebUI 登录轮询设置
+    #[serde(default)]
+    pub poller: WebUiPollerSettings,
+    /// GitHub API 请求方式；PAT 单独存储在 SecretStore。
+    #[serde(rename = "githubApiMode", default)]
+    pub github_api_mode: GithubApiMode,
+    #[serde(default)]
+    pub network: NetworkSettings,
+    /// 主页性能监控开关
+    #[serde(rename = "performanceMonitorEnabled", default = "default_true")]
+    pub performance_monitor_enabled: bool,
+    /// 主页性能监控采样间隔(毫秒)
+    #[serde(
+        rename = "performanceMonitorInterval",
+        default = "default_perf_monitor_interval"
+    )]
+    pub performance_monitor_interval_ms: u64,
+
+    /// Bot 实例运行时指标（内存/网络节点）开关；默认关；启动注入下次生效
+    #[serde(
+        rename = "botRuntimeMetricsEnabled",
+        default = "default_bot_runtime_metrics_enabled"
+    )]
+    pub bot_runtime_metrics_enabled: bool,
+    /// 实例指标采样间隔(毫秒)
+    #[serde(
+        rename = "botRuntimeMetricsIntervalMs",
+        default = "default_bot_runtime_metrics_interval_field"
+    )]
+    pub bot_runtime_metrics_interval_ms: u64,
+    /// 实例指标历史保留天数(默认 7)
+    #[serde(
+        rename = "botRuntimeMetricsRetentionDays",
+        default = "default_bot_runtime_metrics_retention_field"
+    )]
+    pub bot_runtime_metrics_retention_days: u32,
+
+    /// 远程主机健康探活开关
+    #[serde(rename = "remoteHostHealthProbeEnabled", default = "default_true")]
+    pub remote_host_health_probe_enabled: bool,
+
+    /// 远程主机健康探活间隔(毫秒)
+    #[serde(
+        rename = "remoteHostHealthProbeIntervalMs",
+        default = "default_remote_host_health_probe_interval_ms"
+    )]
+    pub remote_host_health_probe_interval_ms: u64,
+
+    /// 任务队列终态自动清理开关
+    #[serde(
+        rename = "taskQueueCleanupEnabled",
+        default = "default_task_queue_cleanup_enabled"
+    )]
+    pub task_queue_cleanup_enabled: bool,
+    /// 终态后保留时长(毫秒)
+    #[serde(
+        rename = "taskQueueCleanupLingerMs",
+        default = "default_task_queue_cleanup_linger_ms"
+    )]
+    pub task_queue_cleanup_linger_ms: u64,
+    /// 主窗口关闭按钮行为: close 退出程序, tray 隐藏到托盘
+    #[serde(rename = "closeAction", default)]
+    pub close_action: CloseAction,
+    /// 关窗行为: hide / delayed_lightweight / immediate_lightweight
+    #[serde(rename = "afterCloseUiBehavior", default)]
+    pub after_close_ui_behavior: AfterCloseUiBehavior,
+    #[serde(
+        rename = "enterLightweightDelaySecs",
+        default = "default_enter_lightweight_delay_secs"
+    )]
+    pub enter_lightweight_delay_secs: u32,
+    #[serde(rename = "uiModeOnStartup", default)]
+    pub ui_mode_on_startup: UiModeOnStartup,
+    /// 登录当前用户后自动启动本程序(Windows HKCU Run / Linux XDG,无需管理员)
+    #[serde(rename = "launchOnStartup", default)]
+    pub launch_on_startup: bool,
+    /// 桌面端启动时自动启动已安装的应用端实例（按实例 auto_start 字段）。默认 true。
+    #[serde(rename = "appInstancesAutoStart", default = "default_true")]
+    pub app_instances_auto_start: bool,
+    #[serde(rename = "minimizeToTrayCountsAsHidden", default = "default_true")]
+    pub minimize_to_tray_counts_as_hidden: bool,
+    /// 桌面 Toast:NapCat 登录态离线
+    #[serde(rename = "notifyOnOffline", default = "default_true")]
+    pub notify_on_offline: bool,
+    /// 桌面 Toast:Bot 进程异常退出
+    #[serde(rename = "notifyOnBotCrashed", default = "default_true")]
+    pub notify_on_bot_crashed: bool,
+    /// 桌面 Toast:QQ 被踢下线
+    #[serde(rename = "notifyOnLoginKicked", default = "default_true")]
+    pub notify_on_login_kicked: bool,
+    /// 离线 Webhook 通道参数(开关在 poller.offline_webhook_notice)
+    #[serde(rename = "WebHook", default)]
+    pub offline_webhook: OfflineWebhookSettings,
+    /// 离线邮件通道参数(开关在 poller.offline_email_notice)
+    #[serde(rename = "Email", default)]
+    pub offline_email: OfflineEmailSettings,
+    /// 用其它 Bot 的 OneBot HTTP 发告警
+    #[serde(rename = "onebotOfflineNotice", default)]
+    pub offline_onebot: OfflineOneBotSettings,
+    /// 外观偏好
+    #[serde(rename = "uiPreferences", default)]
+    pub ui_preferences: AppUiPreferences,
+    /// 可选功能模块开关
+    #[serde(rename = "features", default)]
+    pub features: FeatureToggles,
+    /// OneBot 调试台的 MCP 服务（本机 JSON-RPC 接口，给外部 agent 用）
+    #[serde(rename = "mcp", default)]
+    pub mcp: McpServerSettings,
+    /// SnowLuma 本地 Node.js 运行环境指定路径（None 或空表示自动按优先级解析：自定义 > 内置 > 组件 > PATH）
+    #[serde(rename = "snowlumaNodePath", default)]
+    pub snowluma_node_path: Option<String>,
+    /// SnowLuma 本地安装包类型偏好
+    #[serde(rename = "snowlumaPackage", default)]
+    pub snowluma_package: Option<SnowLumaLinuxPackage>,
+    /// Linux:让 WebKitGTK 使用硬件合成(默认关闭,以兼容渲染兜底)。启动时读取,改动重启生效。
+    #[serde(rename = "linuxWebviewAcceleration", default)]
+    pub linux_webview_acceleration: bool,
+}
+
+/// 桌面通知开关集合
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct DesktopNotifySettings {
+    #[serde(rename = "notifyOnOffline", default = "default_true")]
+    pub notify_on_offline: bool,
+    #[serde(rename = "notifyOnBotCrashed", default = "default_true")]
+    pub notify_on_bot_crashed: bool,
+    #[serde(rename = "notifyOnLoginKicked", default = "default_true")]
+    pub notify_on_login_kicked: bool,
+}
+
+impl Default for DesktopNotifySettings {
+    fn default() -> Self {
+        Self {
+            notify_on_offline: true,
+            notify_on_bot_crashed: true,
+            notify_on_login_kicked: true,
+        }
+    }
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            poller: WebUiPollerSettings::default(),
+            github_api_mode: GithubApiMode::default(),
+            network: NetworkSettings::default(),
+            performance_monitor_enabled: true,
+            performance_monitor_interval_ms: default_perf_monitor_interval(),
+            bot_runtime_metrics_enabled: false,
+            bot_runtime_metrics_interval_ms: default_bot_runtime_metrics_interval_field(),
+            bot_runtime_metrics_retention_days: default_bot_runtime_metrics_retention_field(),
+            remote_host_health_probe_enabled: true,
+            remote_host_health_probe_interval_ms: default_remote_host_health_probe_interval_ms(),
+            task_queue_cleanup_enabled: default_task_queue_cleanup_enabled(),
+            offline_webhook: OfflineWebhookSettings::default(),
+            offline_email: OfflineEmailSettings::default(),
+            offline_onebot: OfflineOneBotSettings::default(),
+            task_queue_cleanup_linger_ms: default_task_queue_cleanup_linger_ms(),
+            close_action: CloseAction::default(),
+            after_close_ui_behavior: AfterCloseUiBehavior::default(),
+            enter_lightweight_delay_secs: default_enter_lightweight_delay_secs(),
+            ui_mode_on_startup: UiModeOnStartup::default(),
+            launch_on_startup: false,
+            app_instances_auto_start: true,
+            minimize_to_tray_counts_as_hidden: true,
+            notify_on_offline: true,
+            notify_on_bot_crashed: true,
+            notify_on_login_kicked: true,
+            ui_preferences: AppUiPreferences::default(),
+            features: FeatureToggles::default(),
+            mcp: McpServerSettings::default(),
+            snowluma_node_path: None,
+            snowluma_package: None,
+            linux_webview_acceleration: false,
+        }
+    }
+}
+
+impl AppSettings {
+    /// 设置页保存和配置导入写盘前都走这一个口，各字段的收敛规则不会两边各抄一份
+    pub fn normalize(&mut self) {
+        self.normalize_performance_monitor();
+        self.normalize_bot_runtime_metrics();
+        self.normalize_task_queue_cleanup();
+        self.normalize_lightweight_prefs();
+        self.normalize_remote_host_health_probe();
+        self.network.normalize();
+        self.features.normalize();
+        self.offline_webhook.normalize();
+        self.offline_onebot.normalize();
+        self.poller.offline_notify_behavior.normalize();
+        self.ui_preferences.ui_scale = self.ui_preferences.ui_scale_factor();
+    }
+
+    /// 冷启动时要不要按实例的 auto_start 拉起应用端实例：全局开关开着、应用端功能也没关
+    pub fn app_instances_auto_start_effective(&self) -> bool {
+        self.app_instances_auto_start && self.features.apps
+    }
+
+    /// 本机 SnowLuma 的自定义 Node 路径;只填了空白当没设。
+    /// 启动、保存设置、组件探测都按这一个口径读
+    pub fn snowluma_node_override(&self) -> Option<&str> {
+        self.snowluma_node_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+    }
+
+    /// 规范化性能监控采样间隔
+    pub fn normalize_performance_monitor(&mut self) {
+        self.performance_monitor_interval_ms =
+            clamp_perf_monitor_interval_ms(self.performance_monitor_interval_ms);
+    }
+
+    /// 规范化 Bot 运行时指标间隔与保留天数
+    pub fn normalize_bot_runtime_metrics(&mut self) {
+        self.bot_runtime_metrics_interval_ms =
+            crate::bot_runtime_metrics::clamp_bot_runtime_metrics_interval_ms(
+                self.bot_runtime_metrics_interval_ms,
+            );
+        self.bot_runtime_metrics_retention_days =
+            crate::bot_runtime_metrics::clamp_bot_runtime_metrics_retention_days(
+                self.bot_runtime_metrics_retention_days,
+            );
+    }
+
+    pub fn desktop_notify_flags(&self) -> DesktopNotifySettings {
+        DesktopNotifySettings {
+            notify_on_offline: self.notify_on_offline,
+            notify_on_bot_crashed: self.notify_on_bot_crashed,
+            notify_on_login_kicked: self.notify_on_login_kicked,
+        }
+    }
+
+    pub fn normalize_lightweight_prefs(&mut self) {
+        if matches!(
+            self.after_close_ui_behavior,
+            AfterCloseUiBehavior::Unknown(_)
+        ) {
+            self.after_close_ui_behavior = AfterCloseUiBehavior::default();
+        }
+        if self.after_close_ui_behavior == AfterCloseUiBehavior::DelayedLightweight {
+            self.enter_lightweight_delay_secs =
+                clamp_lightweight_delay_secs(self.enter_lightweight_delay_secs);
+            if self.enter_lightweight_delay_secs == 0 {
+                self.enter_lightweight_delay_secs = default_enter_lightweight_delay_secs();
+            }
+        }
+        if matches!(self.ui_mode_on_startup, UiModeOnStartup::Unknown(_)) {
+            self.ui_mode_on_startup = UiModeOnStartup::default();
+        }
+    }
+
+    /// 规范化任务队列自动清理偏好
+    pub fn normalize_task_queue_cleanup(&mut self) {
+        if !self.task_queue_cleanup_enabled {
+            self.task_queue_cleanup_linger_ms = 0;
+        } else {
+            self.task_queue_cleanup_linger_ms =
+                clamp_task_queue_cleanup_linger_ms(self.task_queue_cleanup_linger_ms);
+            if self.task_queue_cleanup_linger_ms == 0 {
+                self.task_queue_cleanup_linger_ms = default_task_queue_cleanup_linger_ms();
+            }
+        }
+    }
+
+    /// 规范化远程主机健康探活间隔
+    pub fn normalize_remote_host_health_probe(&mut self) {
+        self.remote_host_health_probe_interval_ms =
+            clamp_remote_host_health_probe_interval_ms(self.remote_host_health_probe_interval_ms);
+    }
+}
+
+/// 设置页 IPC 边界 DTO
+#[derive(Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/domain/")]
+pub struct AppSettingsDto {
+    pub settings: AppSettings,
+    /// GitHub PAT,空串视为清除
+    #[serde(rename = "githubPat", default)]
+    pub github_pat: String,
+    /// 仅经 IPC 传递，持久化交给 SecretStore；空串视为清除。
+    #[serde(rename = "proxyPassword", default)]
+    pub proxy_password: String,
+    #[serde(
+        rename = "networkError",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional)]
+    pub network_error: Option<String>,
+}
+
+impl std::fmt::Debug for AppSettingsDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppSettingsDto").finish_non_exhaustive()
+    }
+}
+
+// SystemResourceSnapshot 原在 system_resource.rs, 合并到 app_config:
+// 它是概览页性能监控的 IPC 边界 DTO, 属于 AppSettings 的下游消费方
+
+/// 当前时刻的全局 CPU,内存占用百分比(0–100)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../src-ui/core/ipc/generated/")]
+pub struct SystemResourceSnapshot {
+    #[serde(rename = "cpuPercent")]
+    pub cpu_percent: f64,
+    #[serde(rename = "ramPercent")]
+    pub ram_percent: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_node_path_setting_means_unset() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.snowluma_node_override(), None);
+        settings.snowluma_node_path = Some("   ".into());
+        assert_eq!(settings.snowluma_node_override(), None);
+        settings.snowluma_node_path = Some("  D:\\node\\node.exe ".into());
+        assert_eq!(
+            settings.snowluma_node_override(),
+            Some("D:\\node\\node.exe")
+        );
+    }
+
+    #[test]
+    fn ui_preferences_missing_sidebar_style_defaults_floating() {
+        // 旧配置（无 sidebarStyle 键）覆盖更新后自动获得悬浮侧栏，0 成本迁移。
+        let prefs: AppUiPreferences =
+            serde_json::from_str(r#"{"theme":"auto","showMascot":true}"#).unwrap();
+        assert_eq!(prefs.sidebar_style, "floating");
+        let round: AppUiPreferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(round, prefs);
+        assert_eq!(AppUiPreferences::default().sidebar_style, "floating");
+        assert_eq!(prefs.ui_scale, 1.0);
+    }
+
+    #[test]
+    fn ui_scale_allowed_values_round_trip_and_invalid_values_normalize_to_default() {
+        for factor in [1.0, 1.25, 1.5] {
+            let mut settings = AppSettings::default();
+            settings.ui_preferences.ui_scale = factor;
+            settings.normalize();
+            let json = serde_json::to_string(&settings).unwrap();
+            let restored: AppSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.ui_preferences.ui_scale, factor);
+            assert_eq!(restored.ui_preferences.ui_scale_factor(), factor);
+        }
+        for factor in [0.0, -1.0, 1.1, 2.0, f64::NAN, f64::INFINITY] {
+            let mut settings = AppSettings::default();
+            settings.ui_preferences.ui_scale = factor;
+            assert_eq!(settings.ui_preferences.ui_scale_factor(), 1.0);
+            settings.normalize();
+            assert_eq!(settings.ui_preferences.ui_scale, 1.0);
+        }
+    }
+
+    /// Legacy PySide6 版本规范 JSON
+    const LEGACY_CANONICAL_JSON: &str = r#"{"botLoginCheckInterval":5000,"botOfflineWebHookNotice":false,"botOfflineEmailNotice":false}"#;
+
+    /// 字节级 round-trip
+    #[test]
+    fn round_trip_matches_legacy_canonical_json() {
+        let parsed: WebUiPollerSettings = serde_json::from_str(LEGACY_CANONICAL_JSON).unwrap();
+
+        assert_eq!(parsed.bot_login_check_interval_ms, 5000);
+        assert!(!parsed.offline_webhook_notice);
+        assert!(!parsed.offline_email_notice);
+
+        // 新增 offlineNotifyBehavior 后不再要求与旧三字段 JSON 字节级全等
+        assert_eq!(parsed.bot_login_check_interval_ms, 5000);
+        assert!(!parsed.offline_webhook_notice);
+        assert!(!parsed.offline_email_notice);
+        assert_eq!(
+            parsed.offline_notify_behavior,
+            OfflineNotifyBehavior::default()
+        );
+    }
+
+    /// 缺字段时回落到默认值
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        let parsed: WebUiPollerSettings = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(parsed, WebUiPollerSettings::default());
+        assert_eq!(parsed.bot_login_check_interval_ms, default_login_interval());
+        assert!(!parsed.offline_webhook_notice);
+        assert!(!parsed.offline_email_notice);
+    }
+
+    /// 部分字段缺失时使用 per-field 默认值
+    #[test]
+    fn partial_fields_use_per_field_defaults() {
+        let parsed: WebUiPollerSettings = serde_json::from_str(
+            r#"{"botOfflineWebHookNotice":true,"botOfflineEmailNotice":true}"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.bot_login_check_interval_ms, default_login_interval());
+        assert!(parsed.offline_webhook_notice);
+        assert!(parsed.offline_email_notice);
+    }
+
+    /// 非默认值字节级 round-trip
+    #[test]
+    fn round_trip_preserves_non_default_values() {
+        let canonical = r#"{"botLoginCheckInterval":2500,"botOfflineWebHookNotice":true,"botOfflineEmailNotice":true}"#;
+        let parsed: WebUiPollerSettings = serde_json::from_str(canonical).unwrap();
+        assert_eq!(parsed.bot_login_check_interval_ms, 2500);
+        assert!(parsed.offline_webhook_notice);
+        assert!(parsed.offline_email_notice);
+
+        assert_eq!(parsed.bot_login_check_interval_ms, 2500);
+        assert!(parsed.offline_webhook_notice);
+        assert!(parsed.offline_email_notice);
+    }
+
+    /// SnowLuma 默认 JSON 字面量
+    const SNOWLUMA_DEFAULT_CANONICAL_JSON: &str = r#"{"snowlumaWebuiPasswordOverride":"","snowlumaWebuiPort":5099,"snowlumaRemoteQrLoginEnabled":true,"snowlumaLocalQrLoginEnabled":true}"#;
+
+    /// SnowLuma 默认值字节稳定
+    #[test]
+    fn snowluma_default_matches_canonical_json() {
+        let cfg = SnowLumaAppConfig::default();
+        assert_eq!(cfg.webui_password_override, "");
+        assert_eq!(cfg.webui_port, default_snowluma_port());
+        assert_eq!(cfg.webui_port, 5099);
+
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(
+            serialized.as_bytes(),
+            SNOWLUMA_DEFAULT_CANONICAL_JSON.as_bytes(),
+            "实际 = {serialized}"
+        );
+
+        let parsed: SnowLumaAppConfig =
+            serde_json::from_str(SNOWLUMA_DEFAULT_CANONICAL_JSON).unwrap();
+        assert_eq!(parsed, SnowLumaAppConfig::default());
+    }
+
+    /// SnowLuma 空对象回落到默认值
+    #[test]
+    fn snowluma_missing_fields_fall_back_to_defaults() {
+        let parsed: SnowLumaAppConfig = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(parsed, SnowLumaAppConfig::default());
+        assert_eq!(parsed.webui_password_override, "");
+        assert_eq!(parsed.webui_port, default_snowluma_port());
+    }
+
+    /// 自定义 password override + 端口走默认覆盖
+    /// #[serde(default)] 单独缺失 + 字符串字段非空两种条件
+    #[test]
+    fn snowluma_custom_password_override_with_default_port_round_trips() {
+        let canonical = r#"{"snowlumaWebuiPasswordOverride":"hunter2!@#","snowlumaWebuiPort":5099,"snowlumaRemoteQrLoginEnabled":false,"snowlumaLocalQrLoginEnabled":true}"#;
+        let parsed: SnowLumaAppConfig = serde_json::from_str(canonical).expect("反序列化失败");
+        assert_eq!(parsed.webui_password_override, "hunter2!@#");
+        assert_eq!(parsed.webui_port, 5099);
+        assert_eq!(parsed.webui_port, default_snowluma_port());
+
+        let serialized = serde_json::to_string(&parsed).expect("serialize 不应失败");
+        assert_eq!(
+            serialized.as_bytes(),
+            canonical.as_bytes(),
+            "serialize 输出与 canonical JSON 字节不一致：实际 = {serialized}"
+        );
+
+        // 仅给 password override,端口走 default = "default_snowluma_port"
+        let partial: SnowLumaAppConfig =
+            serde_json::from_str(r#"{"snowlumaWebuiPasswordOverride":"hunter2!@#"}"#)
+                .expect("缺失 snowlumaWebuiPort 仍应反序列化");
+        assert_eq!(partial.webui_password_override, "hunter2!@#");
+        assert_eq!(partial.webui_port, default_snowluma_port());
+    }
+
+    /// 默认 password override + 自定义端口(6000)覆盖
+    /// #[serde(default = "...")] 单独缺失 + 端口字段被显式设置两种条件
+    #[test]
+    fn snowluma_default_password_override_with_custom_port_round_trips() {
+        let canonical = r#"{"snowlumaWebuiPasswordOverride":"","snowlumaWebuiPort":6000,"snowlumaRemoteQrLoginEnabled":false,"snowlumaLocalQrLoginEnabled":true}"#;
+        let parsed: SnowLumaAppConfig = serde_json::from_str(canonical).expect("反序列化失败");
+        assert_eq!(parsed.webui_password_override, "");
+        assert_eq!(parsed.webui_port, 6000);
+
+        let serialized = serde_json::to_string(&parsed).expect("serialize 不应失败");
+        assert_eq!(
+            serialized.as_bytes(),
+            canonical.as_bytes(),
+            "serialize 输出与 canonical JSON 字节不一致：实际 = {serialized}"
+        );
+
+        // 仅给端口,password override 走 #[serde(default)](空字符串)
+        let partial: SnowLumaAppConfig = serde_json::from_str(r#"{"snowlumaWebuiPort":6000}"#)
+            .expect("缺失 snowlumaWebuiPasswordOverride 仍应反序列化");
+        assert_eq!(partial.webui_password_override, "");
+        assert_eq!(partial.webui_port, 6000);
+    }
+
+    // ---------------------------------------------------------------------
+    // AppSettings
+    // ---------------------------------------------------------------------
+
+    /// 空对象反序列化必须还原成 Default:保证旧用户没有 app-settings.json 时
+    /// 读到的就是一组合理默认值
+    #[test]
+    fn app_settings_empty_object_falls_back_to_defaults() {
+        let parsed: AppSettings = serde_json::from_str("{}").expect("空对象应能反序列化为默认值");
+        assert_eq!(parsed, AppSettings::default());
+        assert_eq!(parsed.github_api_mode, GithubApiMode::Proxy);
+        assert!(parsed.performance_monitor_enabled);
+        assert_eq!(parsed.performance_monitor_interval_ms, 1200);
+        assert_eq!(
+            parsed.poller.bot_login_check_interval_ms,
+            default_login_interval()
+        );
+    }
+
+    /// 非默认值整组写入的 round-trip:嵌套的 poller 用 legacy 驼峰字段名,
+    /// 顶层性能字段用各自 rename,序列化回来语义不丢
+    #[test]
+    fn app_settings_round_trips_non_default_values() {
+        let cfg = AppSettings {
+            poller: WebUiPollerSettings {
+                bot_login_check_interval_ms: 2500,
+                offline_webhook_notice: true,
+                offline_email_notice: false,
+                offline_notify_behavior: OfflineNotifyBehavior::default(),
+            },
+            performance_monitor_enabled: false,
+            performance_monitor_interval_ms: 3000,
+            github_api_mode: GithubApiMode::Direct,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize 不应失败");
+        assert!(json.contains(r#""githubApiMode":"direct""#));
+        assert!(!json.contains("githubPat"));
+        let back: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(back, cfg);
+    }
+
+    /// 缺失顶层性能字段时各自走 per-field default,poller 缺失走 Default
+    #[test]
+    fn app_settings_partial_fields_use_defaults() {
+        let parsed: AppSettings = serde_json::from_str(r#"{"performanceMonitorInterval":5000}"#)
+            .expect("仅给一个字段也应反序列化");
+        assert_eq!(parsed.performance_monitor_interval_ms, 5000);
+        assert!(parsed.performance_monitor_enabled);
+        assert_eq!(parsed.poller, WebUiPollerSettings::default());
+    }
+
+    #[test]
+    fn legacy_settings_gain_default_network_without_exposing_passwords() {
+        let parsed: AppSettings = serde_json::from_str(r#"{"githubApiMode":"direct"}"#).unwrap();
+        assert_eq!(parsed.network, NetworkSettings::default());
+        let dto: AppSettingsDto = serde_json::from_str(
+            r#"{"settings":{"network":{"proxyMode":"direct"}},"githubPat":"pat-value","proxyPassword":"  proxy-secret  "}"#,
+        )
+        .unwrap();
+        assert_eq!(dto.proxy_password, "  proxy-secret  ");
+        let saved = serde_json::to_string(&dto.settings).unwrap();
+        assert!(!saved.contains("proxyPassword"));
+        assert!(!saved.contains("proxy-secret"));
+        assert!(!saved.contains("pat-value"));
+        let debug = format!("{dto:?}");
+        assert!(!debug.contains("proxy-secret"));
+        assert!(!debug.contains("pat-value"));
+        let round_trip: AppSettingsDto =
+            serde_json::from_str(&serde_json::to_string(&dto).unwrap()).unwrap();
+        assert_eq!(round_trip, dto);
+        let legacy_dto: AppSettingsDto =
+            serde_json::from_str(r#"{"settings":{},"githubPat":""}"#).unwrap();
+        assert!(legacy_dto.proxy_password.is_empty());
+        assert!(legacy_dto.network_error.is_none());
+    }
+
+    #[test]
+    fn app_settings_normalize_network_fields() {
+        let mut settings = AppSettings::default();
+        settings.network.proxy_url = " http://127.0.0.1:7890 ".into();
+        settings.normalize();
+        assert_eq!(settings.network.proxy_url, "http://127.0.0.1:7890");
+    }
+
+    #[test]
+    fn app_settings_snowluma_package_round_trips_full() {
+        let cfg = AppSettings {
+            snowluma_package: Some(SnowLumaLinuxPackage::Full),
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize 不应失败");
+        assert!(json.contains(r#""snowlumaPackage":"full""#));
+        let back: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(back.snowluma_package, Some(SnowLumaLinuxPackage::Full));
+    }
+
+    #[test]
+    fn app_settings_snowluma_package_round_trips_lite() {
+        let cfg = AppSettings {
+            snowluma_package: Some(SnowLumaLinuxPackage::Lite),
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize 不应失败");
+        assert!(json.contains(r#""snowlumaPackage":"lite""#));
+        let back: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(back.snowluma_package, Some(SnowLumaLinuxPackage::Lite));
+    }
+
+    #[test]
+    fn app_settings_missing_snowluma_package_defaults_to_none() {
+        let parsed: AppSettings = serde_json::from_str("{}").expect("缺字段应能反序列化");
+        assert_eq!(parsed.snowluma_package, None);
+    }
+
+    #[test]
+    fn features_default_all_on_and_partial_keeps_others_on() {
+        let parsed: AppSettings = serde_json::from_str("{}").expect("缺字段应能反序列化");
+        assert_eq!(parsed.features, FeatureToggles::default());
+        assert!(
+            parsed.features.apps
+                && parsed.features.docker_page
+                && parsed.features.terminal
+                && parsed.features.api_debug
+                && parsed.features.chat
+        );
+
+        let parsed: AppSettings = serde_json::from_str(
+            r#"{"features":{"terminal":false,"apiDebug":false,"chat":false}}"#,
+        )
+        .expect("反序列化失败");
+        assert!(!parsed.features.terminal);
+        assert!(!parsed.features.api_debug);
+        assert!(!parsed.features.chat);
+        assert!(parsed.features.apps && parsed.features.docker_page);
+    }
+
+    #[test]
+    fn mcp_settings_missing_defaults_to_off() {
+        let parsed: AppSettings = serde_json::from_str("{}").expect("缺字段应能反序列化");
+        assert_eq!(parsed.mcp, McpServerSettings::default());
+        assert!(!parsed.mcp.enabled);
+
+        let parsed: AppSettings =
+            serde_json::from_str(r#"{"mcp":{"enabled":true}}"#).expect("反序列化失败");
+        assert!(parsed.mcp.enabled);
+        assert_eq!(parsed.mcp.port, 0);
+        assert!(!parsed.mcp.allow_dangerous);
+    }
+
+    #[test]
+    fn features_normalize_keeps_one_protocol_and_dedupes_frameworks() {
+        let mut f = FeatureToggles {
+            napcat: false,
+            snowluma: false,
+            hidden_app_frameworks: vec!["karin".into(), "karin".into(), "maibot".into()],
+            ..FeatureToggles::default()
+        };
+        f.normalize();
+        assert!(f.napcat && !f.snowluma);
+        assert_eq!(
+            f.hidden_app_frameworks,
+            vec!["karin".into(), "maibot".into()]
+        );
+
+        let json = serde_json::to_string(&f).expect("serialize 不应失败");
+        assert!(json.contains(r#""hiddenAppFrameworks":["karin","maibot"]"#));
+    }
+
+    #[test]
+    fn apps_feature_off_disables_instance_auto_start() {
+        let mut cfg = AppSettings::default();
+        assert!(cfg.app_instances_auto_start_effective());
+        cfg.features.apps = false;
+        assert!(!cfg.app_instances_auto_start_effective());
+    }
+}

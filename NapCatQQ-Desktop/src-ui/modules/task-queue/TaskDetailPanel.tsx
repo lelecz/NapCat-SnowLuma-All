@@ -1,0 +1,654 @@
+// 任务详情：状态摘要 + 进度 + 步骤日志。
+
+import React from 'react';
+import { cn } from '../../shared/utils/cn';
+import {
+    Badge,
+    Button,
+    ContextMenu,
+    ContextMenuTrigger,
+    ContextMenuContent,
+    ContextMenuItem,
+    ContextMenuLabel,
+    ContextMenuSeparator,
+} from '../../shared/ui';
+import type { TaskQueueItem } from '../../core/domain/task-queue/types';
+import {
+    canCancelTaskItem,
+    failureHint,
+    formatElapsedLong,
+    getTaskEndedAt,
+    isActiveTaskStatus,
+    isRunningTaskItem,
+    isTerminalTaskStatus,
+    kindBadgeTone,
+    kindLabel,
+    statusLabel,
+    statusTone,
+} from '../../core/domain/task-queue/display';
+import { useNowMs } from '../../hooks/ui/useNowMs';
+import { CircleAlert, Copy, Loader2, Trash2, XCircle } from 'lucide-react';
+import { MotionIcon } from '../../shared/ui/motion';
+import {
+    ProgressLine,
+    shouldShowProgressBar,
+    ProgressBarOverlay,
+} from '../../shared/components/progressView';
+import { DockerPullLayersPanel } from '../components/DockerPullLayersPanel';
+import {
+    shouldShowDockerPullLayersInTaskDetail,
+    shouldShowStepLogsInTaskDetail,
+} from '../../core/domain/components/dockerPullProgress';
+import type { ActionProgressView } from '../../core/domain/components/progress';
+import { useTaskQueueActions } from '../../hooks/task-queue/useTaskQueueActions';
+import { pushInfoBar } from '../../hooks/ui/globalInfoBarStore';
+import { pushErrorBar } from '../../hooks/ui/pushErrorBar';
+
+function DockerDeployProgressBlock({
+    item,
+    progress,
+    expanded = false,
+}: {
+    item: TaskQueueItem;
+    progress: ActionProgressView;
+    /** 无步骤日志时占满详情下半区 */
+    expanded?: boolean;
+}) {
+    const showLayers = shouldShowDockerPullLayersInTaskDetail(item.kind, progress);
+
+    if (progress.status === 'failed' || progress.status === 'cancelled') {
+        return (
+            <p className="text-[12px] text-text-tertiary">
+                {progress.status === 'cancelled' ? '已取消' : '失败 · 见上方失败原因'}
+            </p>
+        );
+    }
+    if (progress.status === 'success') {
+        return <p className="text-[12px] text-success">镜像已就绪</p>;
+    }
+
+    const rootClass = expanded ? 'flex min-h-0 flex-1 flex-col' : undefined;
+
+    return (
+        <div className={rootClass}>
+            <div className="flex shrink-0 min-w-0 items-center gap-2">
+                <MotionIcon
+                    icon={Loader2}
+                    motion="spin"
+                    playEnter={false}
+                    size={12}
+                    className="shrink-0 text-brand"
+                />
+                <span className="min-w-0 truncate text-[12px] text-text-secondary">
+                    {item.logHint?.includes('正在取消')
+                        ? item.logHint
+                        : progress.message || '拉取镜像…'}
+                </span>
+                <span className="ml-auto shrink-0 font-mono text-[11.5px] tabular-nums text-text-secondary">
+                    {progress.percent}%
+                </span>
+            </div>
+            {shouldShowProgressBar(progress) && (
+                <div className="relative mt-2 h-1.5 w-full shrink-0 overflow-hidden rounded-pill bg-inset/60">
+                    <ProgressBarOverlay
+                        progress={progress}
+                        determinate={progress.dockerLayers.length > 0}
+                    />
+                </div>
+            )}
+            {showLayers && (
+                <DockerPullLayersPanel
+                    progress={progress}
+                    fillHeight={expanded}
+                    showWaitingPlaceholder={
+                        progress.dockerLayers.length === 0 &&
+                        progress.status === 'running' &&
+                        progress.currentStep === 2
+                    }
+                />
+            )}
+        </div>
+    );
+}
+
+export interface TaskDetailPanelProps {
+    item: TaskQueueItem;
+}
+
+const LOG_SURFACE = 'bg-[color-mix(in_srgb,var(--surface-canvas)_76%,var(--surface-inset)_24%)]';
+
+function stopButtonLabel(status: TaskQueueItem['status']): string {
+    switch (status) {
+        case 'pending':
+        case 'paused':
+            return '取消排队';
+        default:
+            return '强制停止';
+    }
+}
+
+function nonCancellableHint(kind: TaskQueueItem['kind']): string {
+    switch (kind) {
+        case 'system_package':
+            return '系统包管理器任务不能安全强停，避免留下 apt/dnf 锁或半安装状态。';
+        case 'docker_install':
+            return 'Docker 安装正在修改系统服务与包源，不能安全强停。';
+        case 'docker_deploy':
+            return '镜像拉取通常可以停止；这里仍不可停止的话，重启应用再试。';
+        default:
+            return '该任务暂不支持强制停止。';
+    }
+}
+
+function StepLogBody({ item }: { item: TaskQueueItem }) {
+    const progress = item.progress;
+    const [selectedIndices, setSelectedIndices] = React.useState<Set<number>>(() => new Set());
+    const [lastClickedIndex, setLastClickedIndex] = React.useState<number | null>(null);
+    const [contextIndex, setContextIndex] = React.useState<number | null>(null);
+
+    if (!progress) {
+        return <p className="py-8 text-center text-[12px] text-text-tertiary">等待任务启动…</p>;
+    }
+    if (progress.logs.length === 0) {
+        return (
+            <p className="py-8 text-center text-[12px] text-text-tertiary">
+                {progress.status === 'running' ? '任务运行中，暂无步骤输出' : '暂无步骤日志'}
+            </p>
+        );
+    }
+
+    const formatLogLine = (log: { timestamp_ms: number; message: string }) => {
+        const time = new Date(log.timestamp_ms).toLocaleTimeString('zh-CN', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        });
+        return `[${time}] ${log.message}`;
+    };
+
+    const handleRowClick = (idx: number, e: React.MouseEvent) => {
+        if (e.shiftKey && lastClickedIndex !== null) {
+            const start = Math.min(lastClickedIndex, idx);
+            const end = Math.max(lastClickedIndex, idx);
+            const nextSet = new Set<number>();
+            for (let i = start; i <= end; i++) {
+                nextSet.add(i);
+            }
+            setSelectedIndices(nextSet);
+        } else if (e.ctrlKey || e.metaKey) {
+            setSelectedIndices((prev) => {
+                const next = new Set(prev);
+                if (next.has(idx)) {
+                    next.delete(idx);
+                } else {
+                    next.add(idx);
+                }
+                return next;
+            });
+            setLastClickedIndex(idx);
+        } else {
+            setSelectedIndices(new Set([idx]));
+            setLastClickedIndex(idx);
+        }
+        setContextIndex(idx);
+    };
+
+    const handleRowContextMenu = (idx: number) => {
+        setContextIndex(idx);
+        if (!selectedIndices.has(idx)) {
+            setSelectedIndices(new Set([idx]));
+            setLastClickedIndex(idx);
+        }
+    };
+
+    const onCopySelected = async () => {
+        const selected = progress.logs
+            .filter((_, idx) => selectedIndices.has(idx))
+            .map(formatLogLine)
+            .join('\n');
+        if (!selected) return;
+        try {
+            await navigator.clipboard.writeText(selected);
+            pushInfoBar({
+                tone: 'info',
+                title: '已复制选中步骤日志',
+                content: `共复制 ${selectedIndices.size} 行步骤日志`,
+                autoDismissMs: 2000,
+            });
+        } catch (err) {
+            console.warn('复制失败:', err);
+        }
+    };
+
+    const onCopyCurrentLine = async () => {
+        const idx = contextIndex ?? 0;
+        const target = progress.logs[idx];
+        if (!target) return;
+        try {
+            await navigator.clipboard.writeText(formatLogLine(target));
+            pushInfoBar({
+                tone: 'info',
+                title: '已复制单行步骤日志',
+                content: target.message,
+                autoDismissMs: 2000,
+            });
+        } catch (err) {
+            console.warn('复制失败:', err);
+        }
+    };
+
+    const onCopyAll = async () => {
+        const allText = progress.logs.map(formatLogLine).join('\n');
+        if (!allText) return;
+        try {
+            await navigator.clipboard.writeText(allText);
+            pushInfoBar({
+                tone: 'info',
+                title: '已复制全部步骤日志',
+                content: `共复制 ${progress.logs.length} 行步骤日志`,
+                autoDismissMs: 2000,
+            });
+        } catch (err) {
+            console.warn('复制失败:', err);
+        }
+    };
+
+    return (
+        <ContextMenu>
+            <ContextMenuTrigger asChild>
+                <div
+                    role="log"
+                    aria-live="off"
+                    aria-label="任务执行步骤日志"
+                    className="scrollbar-hide min-h-0 flex-1 overflow-y-auto px-3 py-3 font-mono text-[12px] leading-[1.55] antialiased select-none"
+                    style={{
+                        userSelect: 'none',
+                        WebkitUserSelect: 'none',
+                    }}
+                >
+                    {progress.logs.map((log, idx) => {
+                        const time = new Date(log.timestamp_ms).toLocaleTimeString('zh-CN', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                            hour12: false,
+                        });
+                        const isSelected = selectedIndices.has(idx);
+                        return (
+                            <div
+                                key={`${log.timestamp_ms}-${idx}`}
+                                onMouseDown={(e) => {
+                                    e.preventDefault();
+                                    window.getSelection()?.removeAllRanges();
+                                }}
+                                onClick={(e) => handleRowClick(idx, e)}
+                                onContextMenu={() => handleRowContextMenu(idx)}
+                                className={cn(
+                                    'grid min-w-0 grid-cols-[3.5rem_minmax(0,1fr)] gap-x-2 gap-y-0.5 px-1 py-0.5 cursor-pointer select-none rounded-xs transition-colors',
+                                    isSelected
+                                        ? 'bg-brand-soft/40 ring-1 ring-inset ring-brand/30 text-text'
+                                        : 'hover:bg-elevated/70 text-text-secondary',
+                                )}
+                                style={{
+                                    userSelect: 'none',
+                                    WebkitUserSelect: 'none',
+                                }}
+                            >
+                                <span className="tabular-nums text-[11px] text-text-tertiary select-none">
+                                    {time}
+                                </span>
+                                <span className="min-w-0 break-words text-text select-none">
+                                    {log.message}
+                                </span>
+                            </div>
+                        );
+                    })}
+                </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="w-56">
+                {selectedIndices.size > 1 ? (
+                    <ContextMenuItem onClick={onCopySelected} className="flex items-center gap-2">
+                        <Copy size={13} className="text-brand" />
+                        <span>复制选中日志</span>
+                        <span className="ml-auto text-2xs text-text-tertiary">
+                            {selectedIndices.size} 行
+                        </span>
+                    </ContextMenuItem>
+                ) : (
+                    <ContextMenuItem
+                        onClick={onCopyCurrentLine}
+                        disabled={progress.logs.length === 0}
+                        className="flex items-center gap-2"
+                    >
+                        <Copy size={13} className="text-text-tertiary" />
+                        <span>复制当前行</span>
+                    </ContextMenuItem>
+                )}
+                <ContextMenuItem
+                    onClick={onCopyAll}
+                    disabled={progress.logs.length === 0}
+                    className="flex items-center gap-2"
+                >
+                    <Copy size={13} className="text-text-tertiary" />
+                    <span>复制全部步骤日志</span>
+                    <span className="ml-auto text-2xs text-text-tertiary">
+                        {progress.logs.length} 行
+                    </span>
+                </ContextMenuItem>
+            </ContextMenuContent>
+        </ContextMenu>
+    );
+}
+
+export const TaskDetailPanel: React.FC<TaskDetailPanelProps> = ({ item }) => {
+    const progress = item.progress;
+    const failure = failureHint(item);
+    const endedAt = getTaskEndedAt(progress, item.endedAt);
+    const ticking = isActiveTaskStatus(item.status) && endedAt === undefined;
+    const nowMs = useNowMs(ticking);
+    const showStepLogs = shouldShowStepLogsInTaskDetail(item.kind);
+    const dockerPullExpanded = item.kind === 'docker_deploy' && !showStepLogs;
+    const active = isActiveTaskStatus(item.status);
+    const canCancel = canCancelTaskItem(item);
+    const running = isRunningTaskItem(item);
+    const canDelete = isTerminalTaskStatus(item.status);
+    // 失败/取消已经由顶部提示或状态徽标说清，进度区不再重复一行「失败 · 详见顶部提示」。
+    const hideProgress = item.status === 'failed' || item.status === 'cancelled';
+
+    const { cancelTask, deleteTask } = useTaskQueueActions();
+    const [cancelBusy, setCancelBusy] = React.useState(false);
+    const [cancelError, setCancelError] = React.useState<string | null>(null);
+
+    const handleCancel = () => {
+        if (cancelBusy) return;
+        setCancelBusy(true);
+        setCancelError(null);
+        void cancelTask(item.id)
+            .catch((err) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                setCancelError(msg || '取消失败');
+                pushErrorBar({
+                    title: '取消任务失败',
+                    raw: msg || '取消失败',
+                });
+            })
+            .finally(() => {
+                setCancelBusy(false);
+            });
+    };
+
+    const handleDelete = () => {
+        void deleteTask(item.id).catch((err) => {
+            console.error('[TaskQueue] delete failed:', err);
+        });
+    };
+
+    const handleCopyLogs = async () => {
+        if (!progress?.logs.length) return;
+        const text = progress.logs
+            .map((l) => {
+                const time = new Date(l.timestamp_ms).toLocaleTimeString('zh-CN', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    hour12: false,
+                });
+                return `[${time}] ${l.message}`;
+            })
+            .join('\n');
+        try {
+            await navigator.clipboard.writeText(text);
+            pushInfoBar({
+                tone: 'info',
+                title: '已复制步骤日志',
+                content: `共复制 ${progress.logs.length} 行日志`,
+                autoDismissMs: 2000,
+            });
+        } catch {
+            // ignore
+        }
+    };
+
+    const handleCopyTaskId = async () => {
+        try {
+            await navigator.clipboard.writeText(item.id);
+            pushInfoBar({
+                tone: 'info',
+                title: '已复制任务 ID',
+                content: item.id,
+                autoDismissMs: 2000,
+            });
+        } catch {
+            // ignore
+        }
+    };
+
+    const cancelling =
+        cancelBusy ||
+        (active &&
+            typeof item.logHint === 'string' &&
+            (item.logHint.includes('正在取消') || item.logHint.includes('取消中')));
+
+    return (
+        <ContextMenu>
+            <ContextMenuTrigger asChild>
+                <div className="flex h-full min-h-0 flex-1 flex-col">
+                    <div className="shrink-0 border-b border-border-subtle/70 px-4 py-4 sm:px-5">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <h2 className="font-display text-lg font-semibold leading-tight text-text">
+                                        {item.title}
+                                    </h2>
+                                    <Badge
+                                        tone={kindBadgeTone(item.kind)}
+                                        appearance="soft"
+                                        className="text-[11px]"
+                                    >
+                                        {kindLabel(item.kind)}
+                                    </Badge>
+                                    <Badge
+                                        tone={statusTone(item.status)}
+                                        appearance="soft"
+                                        className="text-[11px]"
+                                    >
+                                        {statusLabel(item.status)}
+                                    </Badge>
+                                </div>
+                                <p className="mt-2 text-[12px] text-text-secondary">
+                                    <span className="text-text-tertiary">主机</span>{' '}
+                                    <span className="font-medium text-text">{item.hostLabel}</span>
+                                    <span className="mx-2 text-text-disabled">|</span>
+                                    <span className="text-text-tertiary">耗时</span>{' '}
+                                    <span className="tabular-nums">
+                                        {formatElapsedLong(
+                                            item.startedAt,
+                                            endedAt,
+                                            endedAt === undefined ? nowMs : undefined,
+                                        )}
+                                    </span>
+                                </p>
+                            </div>
+                            {(active || canDelete) && (
+                                <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                                    {running && item.cancellable !== true && (
+                                        <Button
+                                            size="sm"
+                                            variant="secondary"
+                                            disabled
+                                            title={nonCancellableHint(item.kind)}
+                                        >
+                                            <XCircle size={13} />
+                                            不可停止
+                                        </Button>
+                                    )}
+                                    {canCancel && (
+                                        <Button
+                                            size="sm"
+                                            variant={
+                                                item.status === 'pending' ||
+                                                item.status === 'paused'
+                                                    ? 'secondary'
+                                                    : 'danger'
+                                            }
+                                            disabled={cancelling}
+                                            onClick={handleCancel}
+                                        >
+                                            <XCircle size={13} />
+                                            {cancelling
+                                                ? '正在停止…'
+                                                : stopButtonLabel(item.status)}
+                                        </Button>
+                                    )}
+                                    {canDelete && (
+                                        <Button size="sm" variant="ghost" onClick={handleDelete}>
+                                            <Trash2 size={13} />
+                                            删除
+                                        </Button>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+
+                        {failure && (
+                            <div
+                                role="alert"
+                                className="mt-3 flex items-start gap-2 rounded-md border border-danger/25 bg-danger-soft/30 px-3 py-2 text-[12px] leading-relaxed text-danger"
+                            >
+                                <CircleAlert
+                                    size={13}
+                                    strokeWidth={2.2}
+                                    aria-hidden
+                                    className="mt-[2px] shrink-0 opacity-80"
+                                />
+                                <p className="line-clamp-2 min-w-0 break-words" title={failure}>
+                                    {failure}
+                                </p>
+                            </div>
+                        )}
+
+                        {cancelError && (
+                            <div className="mt-3 flex items-start gap-2 rounded-md border border-danger/25 bg-danger-soft/30 px-3 py-2 text-[12px] leading-relaxed text-danger">
+                                <CircleAlert
+                                    size={13}
+                                    strokeWidth={2.2}
+                                    aria-hidden
+                                    className="mt-[2px] shrink-0 opacity-80"
+                                />
+                                <p className="line-clamp-2 min-w-0 break-words" title={cancelError}>
+                                    停止失败：{cancelError}
+                                </p>
+                            </div>
+                        )}
+
+                        {cancelling && !cancelError && (
+                            <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft/30 px-3 py-2.5 text-[12px] leading-relaxed text-text-secondary">
+                                正在取消…若远端 docker pull 卡住，可能需数秒结束
+                            </div>
+                        )}
+
+                        {item.kind === 'docker_install' && !progress && (
+                            <div className="mt-3 rounded-md border border-border-subtle bg-inset/50 px-3 py-2.5 text-[12px] text-text-secondary">
+                                {item.logHint ?? '正在安装 Docker…'}
+                            </div>
+                        )}
+
+                        {progress && !dockerPullExpanded && !hideProgress && (
+                            <div className="mt-3 overflow-hidden rounded-md border border-border-subtle/80 bg-surface/60 px-3 pb-3 pt-2">
+                                {item.kind === 'docker_deploy' ? (
+                                    <DockerDeployProgressBlock item={item} progress={progress} />
+                                ) : (
+                                    <>
+                                        <ProgressLine progress={progress} />
+                                        {shouldShowProgressBar(progress) && (
+                                            <div className="relative mt-2 h-1.5 w-full overflow-hidden rounded-pill bg-inset/60">
+                                                <ProgressBarOverlay
+                                                    progress={progress}
+                                                    determinate
+                                                />
+                                            </div>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    {dockerPullExpanded && progress && !hideProgress && (
+                        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4 pt-3 sm:px-5">
+                            <div
+                                className={cn(
+                                    'flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-border-subtle/50 px-3 pb-3 pt-2.5',
+                                    LOG_SURFACE,
+                                )}
+                            >
+                                <DockerDeployProgressBlock
+                                    item={item}
+                                    progress={progress}
+                                    expanded
+                                />
+                            </div>
+                        </div>
+                    )}
+
+                    {showStepLogs && (
+                        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4 pt-3 sm:px-5">
+                            <div className="flex shrink-0 pb-2">
+                                <span className="text-[11px] font-medium uppercase tracking-wider text-text-tertiary">
+                                    步骤日志
+                                </span>
+                            </div>
+
+                            <div
+                                className={cn(
+                                    'flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-border-subtle/50',
+                                    LOG_SURFACE,
+                                )}
+                            >
+                                <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                                    <StepLogBody item={item} />
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </ContextMenuTrigger>
+
+            <ContextMenuContent className="w-52">
+                <ContextMenuLabel className="font-mono text-2xs truncate">
+                    {item.title}
+                </ContextMenuLabel>
+                <ContextMenuSeparator />
+
+                {progress?.logs && progress.logs.length > 0 && (
+                    <ContextMenuItem onClick={handleCopyLogs}>
+                        <Copy size={13} />
+                        <span>复制步骤日志</span>
+                    </ContextMenuItem>
+                )}
+
+                <ContextMenuItem onClick={handleCopyTaskId}>
+                    <Copy size={13} />
+                    <span>复制任务 ID</span>
+                </ContextMenuItem>
+
+                {(canCancel || canDelete) && <ContextMenuSeparator />}
+
+                {canCancel && (
+                    <ContextMenuItem tone="danger" disabled={cancelling} onClick={handleCancel}>
+                        <XCircle size={13} className="text-danger" />
+                        <span>{cancelling ? '正在停止…' : stopButtonLabel(item.status)}</span>
+                    </ContextMenuItem>
+                )}
+
+                {canDelete && (
+                    <ContextMenuItem tone="danger" onClick={handleDelete}>
+                        <Trash2 size={13} className="text-danger" />
+                        <span>删除任务记录</span>
+                    </ContextMenuItem>
+                )}
+            </ContextMenuContent>
+        </ContextMenu>
+    );
+};

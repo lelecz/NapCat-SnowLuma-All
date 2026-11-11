@@ -1,0 +1,1901 @@
+//! 远端 Linux 安装库存：一次 SSH 探测、解析 HIT 行、选中路径。
+//!
+//! 禁止 `find` / `locate` / 扫盘。路径是真相。
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use base64::Engine as _;
+use ncd_domain::{
+    BackendType, DeploymentType, DiscoveredRemoteBot, DiscoveredRemoteBotSource,
+    REMOTE_INVENTORY_VERSION, RemoteInventory, RemoteInventoryItem, RemoteInventoryKind,
+    RemoteInventorySource, RemotePathOverrides, RemoteSelectedPaths, infer_snowluma_linux_package,
+    qq_bin as join_qq_bin, server_id_of_host,
+};
+
+pub use ncd_domain::{
+    is_qq_user_data_path, needs_sudo_for_qq, qq_install_base_from_qq_bin,
+    snowluma_workspace_from_dir,
+};
+use ncd_host::{Host, HostCommand};
+use ncd_server::{ServerManager, ServerProfile};
+use tokio::sync::Mutex;
+
+use crate::components::action_policy::{RemoteHostProbe, RemoteLayout};
+
+#[path = "inventory_windows.rs"]
+mod windows;
+
+#[cfg(test)]
+#[path = "inventory_snowluma_script_tests.rs"]
+mod snowluma_script_tests;
+
+/// 探测命令超时
+pub const INVENTORY_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 组件页打开时库存超过此时长则重探
+pub const INVENTORY_STALE_AFTER: Duration = Duration::from_secs(6 * 3600);
+const SNOWLUMA_MANIFEST_MAX_BYTES: usize = 64 * 1024;
+
+pub fn layout_from_selected(selected: &RemoteSelectedPaths) -> RemoteLayout {
+    if selected.needs_sudo {
+        RemoteLayout::System
+    } else {
+        RemoteLayout::Rootless
+    }
+}
+
+pub fn probe_from_inventory(inv: &RemoteInventory) -> RemoteHostProbe {
+    RemoteHostProbe {
+        home: Some(inv.home.clone()),
+        layout: layout_from_selected(&inv.selected),
+    }
+}
+
+pub fn inventory_is_stale(probed_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(probed_at) else {
+        return true;
+    };
+    let then = then.with_timezone(&chrono::Utc);
+    now.signed_duration_since(then)
+        .to_std()
+        .map(|d| d > INVENTORY_STALE_AFTER)
+        .unwrap_or(true)
+}
+
+fn inventory_matches_target(
+    inventory: &RemoteInventory,
+    host: &dyn Host,
+    overrides: Option<&RemotePathOverrides>,
+) -> bool {
+    if host.os() != ncd_host::Os::Windows {
+        return inventory.home.starts_with('/');
+    }
+    let Some(root) = host.target_managed_root() else {
+        return false;
+    };
+    windows::selection_matches(inventory, host, &root, overrides)
+}
+
+/// 从探测脚本 stdout 构建库存
+pub fn inventory_from_stdout(
+    stdout: &str,
+    previous: Option<&RemoteInventory>,
+    probed_at: impl Into<String>,
+) -> Result<RemoteInventory, String> {
+    let (home, items) = parse_inventory_stdout(stdout)?;
+    let items = dedupe_kind_root(items);
+    let selected = select_paths(&home, &items, previous.map(|p| &p.selected));
+    let bots = dedupe_discovered_bots(parse_bot_hits(stdout));
+    let snowluma_linux_package = Some(infer_snowluma_linux_package(Some(&selected)));
+    Ok(RemoteInventory {
+        v: REMOTE_INVENTORY_VERSION,
+        probed_at: probed_at.into(),
+        home,
+        items,
+        selected,
+        bots,
+        snowluma_linux_package,
+    })
+}
+
+fn parse_bot_hits(stdout: &str) -> Vec<DiscoveredRemoteBot> {
+    let mut bots = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        let Some(rest) = line.strip_prefix("HIT ") else {
+            continue;
+        };
+        if let Some(bot) = parse_bot_hit(rest) {
+            bots.push(bot);
+        }
+    }
+    bots
+}
+
+fn parse_bot_hit(rest: &str) -> Option<DiscoveredRemoteBot> {
+    let mut kind = None;
+    let mut backend = None;
+    let mut deployment = None;
+    let mut qq_id = None;
+    let mut source = None;
+    let mut docker_name = None;
+    for token in rest.split_whitespace() {
+        let Some((k, v)) = token.split_once('=') else {
+            continue;
+        };
+        match k {
+            "kind" => kind = Some(v),
+            "backend" => {
+                backend = match v {
+                    "napcat" => Some(BackendType::NapCat),
+                    "snowluma" => Some(BackendType::SnowLuma),
+                    _ => None,
+                }
+            }
+            "deployment" => {
+                deployment = match v {
+                    "native" => Some(DeploymentType::Native),
+                    "docker" => Some(DeploymentType::Docker),
+                    _ => None,
+                }
+            }
+            "qq" => qq_id = v.parse().ok().filter(|n: &u64| *n > 0),
+            "source" => {
+                source = match v {
+                    "configFile" => Some(DiscoveredRemoteBotSource::ConfigFile),
+                    "runtimeStatus" => Some(DiscoveredRemoteBotSource::RuntimeStatus),
+                    "dockerContainer" => Some(DiscoveredRemoteBotSource::DockerContainer),
+                    _ => None,
+                }
+            }
+            "dockerName" => docker_name = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    if kind != Some("bot") {
+        return None;
+    }
+    Some(DiscoveredRemoteBot {
+        qq_id: qq_id?,
+        backend: backend?,
+        deployment: deployment?,
+        source: source?,
+        docker_name,
+    })
+}
+
+fn dedupe_discovered_bots(bots: Vec<DiscoveredRemoteBot>) -> Vec<DiscoveredRemoteBot> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for bot in bots {
+        let key = (bot.backend, bot.deployment, bot.qq_id);
+        if seen.insert(key) {
+            out.push(bot);
+        }
+    }
+    out
+}
+
+pub fn parse_inventory_stdout(stdout: &str) -> Result<(String, Vec<RemoteInventoryItem>), String> {
+    let mut home = String::new();
+    let mut items = Vec::new();
+    for raw in stdout.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("NCD_INV_V=") {
+            let _ = rest;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HOME=") {
+            home = rest.trim().to_string();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("HIT ") {
+            if let Some(item) = parse_hit_line(rest) {
+                if item.kind == RemoteInventoryKind::Qq && is_qq_user_data_path(&item.root) {
+                    continue;
+                }
+                items.push(item);
+            }
+            continue;
+        }
+    }
+    if home.is_empty() {
+        return Err("无法探测远端 $HOME，请确认 SSH 用户家目录可用。".into());
+    }
+    Ok((home, items))
+}
+
+fn parse_hit_line(rest: &str) -> Option<RemoteInventoryItem> {
+    let mut kind = None;
+    let mut source = None;
+    let mut verified = false;
+    let mut root = String::new();
+    let mut qq_bin = None;
+    let mut napcat_mjs = None;
+    let mut load_napcat_js = None;
+    let mut index_mjs = None;
+    let mut runtime_json = None;
+    let mut node_bin = None;
+    let mut docker_name = None;
+    let mut package_json_base64 = None;
+
+    for token in rest.split_whitespace() {
+        let Some((k, v)) = token.split_once('=') else {
+            continue;
+        };
+        match k {
+            "kind" => kind = parse_kind(v),
+            "source" => source = parse_source(v),
+            "verified" => verified = v == "1" || v.eq_ignore_ascii_case("true"),
+            "root" => root = normalize_posix_path(v),
+            "qqBin" => qq_bin = Some(normalize_posix_path(v)),
+            "napcatMjs" => napcat_mjs = Some(normalize_posix_path(v)),
+            "loadNapcatJs" => load_napcat_js = Some(normalize_posix_path(v)),
+            "indexMjs" => index_mjs = Some(normalize_posix_path(v)),
+            "runtimeJson" => runtime_json = Some(normalize_posix_path(v)),
+            "nodeBin" => node_bin = Some(normalize_posix_path(v)),
+            "dockerName" => docker_name = Some(v.to_string()),
+            "packageJsonBase64" => package_json_base64 = Some(v),
+            _ => {}
+        }
+    }
+    let kind = kind?;
+    let source = source?;
+    if package_json_base64.is_some_and(|value| !snowluma_package_marker_valid(value)) {
+        return None;
+    }
+    if root.is_empty() {
+        return None;
+    }
+    Some(RemoteInventoryItem {
+        kind,
+        root,
+        source,
+        verified,
+        qq_bin,
+        napcat_mjs,
+        load_napcat_js,
+        index_mjs,
+        runtime_json,
+        node_bin,
+        docker_name,
+    })
+}
+
+fn snowluma_package_marker_valid(encoded: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct PackageIdentity {
+        name: String,
+    }
+
+    if encoded.len() > SNOWLUMA_MANIFEST_MAX_BYTES.div_ceil(3) * 4 {
+        return false;
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    bytes.len() <= SNOWLUMA_MANIFEST_MAX_BYTES
+        && serde_json::from_slice::<PackageIdentity>(&bytes)
+            .is_ok_and(|package| package.name == "@snowluma/runtime")
+}
+
+fn parse_kind(v: &str) -> Option<RemoteInventoryKind> {
+    match v {
+        "qq" => Some(RemoteInventoryKind::Qq),
+        "napcat" => Some(RemoteInventoryKind::NapCat),
+        "snowluma" => Some(RemoteInventoryKind::SnowLuma),
+        "nodejs" => Some(RemoteInventoryKind::NodeJs),
+        "ncd_watch" => Some(RemoteInventoryKind::NcdWatch),
+        "docker_container" => Some(RemoteInventoryKind::DockerContainer),
+        _ => None,
+    }
+}
+
+fn parse_source(v: &str) -> Option<RemoteInventorySource> {
+    match v {
+        "userOverride" => Some(RemoteInventorySource::UserOverride),
+        "desktopOwned" => Some(RemoteInventorySource::DesktopOwned),
+        "officialInstaller" => Some(RemoteInventorySource::OfficialInstaller),
+        "systemPackage" => Some(RemoteInventorySource::SystemPackage),
+        "pathLookup" => Some(RemoteInventorySource::PathLookup),
+        "process" => Some(RemoteInventorySource::Process),
+        _ => None,
+    }
+}
+
+fn dedupe_kind_root(items: Vec<RemoteInventoryItem>) -> Vec<RemoteInventoryItem> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let key = (item.kind, item.root.clone());
+        if seen.insert(key) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn source_rank(source: RemoteInventorySource) -> u8 {
+    match source {
+        RemoteInventorySource::UserOverride => 0,
+        RemoteInventorySource::DesktopOwned => 2,
+        RemoteInventorySource::OfficialInstaller => 3,
+        RemoteInventorySource::SystemPackage => 4,
+        RemoteInventorySource::PathLookup => 5,
+        RemoteInventorySource::Process => 6,
+    }
+}
+
+fn is_system_qq_root(root: &str) -> bool {
+    root == "/" || root == "/opt/QQ" || root.ends_with("/opt/QQ") && root.starts_with("/opt/")
+}
+
+pub fn select_paths(
+    home: &str,
+    items: &[RemoteInventoryItem],
+    previous: Option<&RemoteSelectedPaths>,
+) -> RemoteSelectedPaths {
+    let qq = pick(items, RemoteInventoryKind::Qq, previous, |p| {
+        p.qq_install_base.as_deref()
+    });
+    let napcat = pick(items, RemoteInventoryKind::NapCat, previous, |p| {
+        p.napcat_root.as_deref()
+    });
+    let snowluma = pick(items, RemoteInventoryKind::SnowLuma, previous, |p| {
+        p.snowluma_dir.as_deref()
+    });
+    let node = pick(items, RemoteInventoryKind::NodeJs, previous, |p| {
+        p.node_bin.as_deref()
+    });
+    let watch = pick(items, RemoteInventoryKind::NcdWatch, previous, |p| {
+        p.ncd_watch_root.as_deref()
+    });
+
+    let qq_install_base = qq.as_ref().map(|i| i.root.clone());
+    let qq_bin = qq
+        .as_ref()
+        .and_then(|i| i.qq_bin.clone())
+        .or_else(|| qq_install_base.as_ref().map(|b| join_qq_bin(b)))
+        .map(|p| normalize_posix_path(&p));
+    let napcat_root = napcat.as_ref().map(|i| i.root.clone());
+    let snowluma_dir = snowluma.as_ref().map(|i| i.root.clone());
+    let snowluma_workspace = snowluma_dir.as_deref().map(snowluma_workspace_from_dir);
+    let bundled_node = snowluma_dir.as_deref().and_then(|dir| {
+        items.iter().find(|i| {
+            i.kind == RemoteInventoryKind::NodeJs
+                && i.verified
+                && ncd_domain::is_bundled_snowluma_node(
+                    i.node_bin.as_deref().unwrap_or(&i.root),
+                    Some(dir),
+                )
+        })
+    });
+    let node_bin = bundled_node
+        .and_then(|i| i.node_bin.clone().or_else(|| Some(i.root.clone())))
+        .or_else(|| {
+            node.as_ref()
+                .and_then(|i| i.node_bin.clone())
+                .or_else(|| node.as_ref().map(|i| i.root.clone()))
+        });
+    let ncd_watch_root = watch.as_ref().map(|i| i.root.clone());
+    let needs_sudo = needs_sudo_for_qq(qq_install_base.as_deref(), qq_bin.as_deref());
+
+    RemoteSelectedPaths {
+        home: home.to_string(),
+        qq_install_base,
+        qq_bin,
+        napcat_root,
+        snowluma_dir,
+        snowluma_workspace,
+        node_bin,
+        ncd_watch_root,
+        needs_sudo,
+    }
+}
+
+fn pick(
+    items: &[RemoteInventoryItem],
+    kind: RemoteInventoryKind,
+    previous: Option<&RemoteSelectedPaths>,
+    prev_root: impl Fn(&RemoteSelectedPaths) -> Option<&str>,
+) -> Option<RemoteInventoryItem> {
+    let candidates: Vec<&RemoteInventoryItem> = items
+        .iter()
+        .filter(|i| i.kind == kind && i.verified)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let prev = previous.and_then(&prev_root);
+    let mut best = candidates[0];
+    let mut best_rank = effective_rank(best, prev);
+    for item in candidates.iter().skip(1) {
+        let rank = effective_rank(item, prev);
+        if rank < best_rank
+            || (rank == best_rank
+                && is_system_qq_root(&best.root)
+                && !is_system_qq_root(&item.root))
+        {
+            best = item;
+            best_rank = rank;
+        }
+    }
+    Some(best.clone())
+}
+
+fn effective_rank(item: &RemoteInventoryItem, previous_root: Option<&str>) -> u8 {
+    if previous_root == Some(item.root.as_str()) {
+        return 1;
+    }
+    source_rank(item.source)
+}
+
+fn posix_safe(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~'))
+}
+
+/// 归一化探测回收的远端 POSIX 路径：折叠重复斜杠、去掉尾部斜杠（根路径 "/" 保持）。
+/// 系统包 base 为 "/" 时拼 /opt/QQ/qq 会产出 //opt/QQ/qq，不归一化的话探测脚本里
+/// `[ "$exe" = "$qqbin" ]` 这类字符串比对会永远失配。
+fn normalize_posix_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        out.push(c);
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// 生成远端探测脚本（不含 find/locate）
+pub fn build_probe_script(overrides: Option<&RemotePathOverrides>) -> String {
+    build_probe_script_with_previous(overrides, None)
+}
+
+fn build_probe_script_with_previous(
+    overrides: Option<&RemotePathOverrides>,
+    previous_snowluma_dir: Option<&str>,
+) -> String {
+    let ov = overrides.cloned().unwrap_or_default();
+    let emit_ov = |name: &str, val: Option<&str>| {
+        val.filter(|p| posix_safe(p))
+            .map(|p| format!("{name}='{p}'\n"))
+            .unwrap_or_else(|| format!("{name}=''\n"))
+    };
+    let mut s = String::new();
+    s.push_str(&emit_ov("OV_QQ_BASE", ov.qq_install_base.as_deref()));
+    s.push_str(&emit_ov("OV_NAPCAT", ov.napcat_root.as_deref()));
+    s.push_str(&emit_ov("OV_SL", ov.snowluma_dir.as_deref()));
+    s.push_str(&emit_ov("OV_NODE", ov.node_bin.as_deref()));
+    s.push_str(&emit_ov("OV_WATCH", ov.ncd_watch_root.as_deref()));
+    s.push_str(&emit_ov("PREV_SL", previous_snowluma_dir));
+    s.push_str(PROBE_SCRIPT_BODY);
+    s
+}
+
+const PROBE_SCRIPT_BODY: &str = r#"
+echo NCD_INV_V=1
+echo HOME="$HOME"
+
+emit_qq() {
+  base="$1"; src="$2"
+  qq="$base/opt/QQ/qq"
+  pkg="$base/opt/QQ/resources/app/package.json"
+  if [ -x "$qq" ] && [ -f "$pkg" ]; then
+    echo "HIT kind=qq source=$src verified=1 root=$base qqBin=$qq"
+    app="$base/opt/QQ/resources/app"
+    mjs="$app/app_launcher/napcat/napcat.mjs"
+    load="$app/loadNapCat.js"
+    if [ -f "$mjs" ] && [ -f "$load" ]; then
+      echo "HIT kind=napcat source=$src verified=1 root=$app/app_launcher/napcat napcatMjs=$mjs loadNapcatJs=$load"
+      emit_nc_bots "$app/app_launcher/napcat"
+    fi
+  fi
+}
+
+emit_sl() {
+  dir="$1"; src="$2"
+  [ -f "$dir/index.mjs" ] || return 0
+  legacy=0; package=""
+  if [ -f "$dir/config/webui.json" ] || grep -q webuiPort "$dir/config/runtime.json" 2>/dev/null; then
+    legacy=1
+  elif [ -f "$dir/package.json" ]; then
+    # Rust validates the bounded manifest before selecting this directory or its Node.
+    manifest=$(head -c 65537 "$dir/package.json" | base64 | tr -d '\r\n')
+    [ -n "$manifest" ] || return 0
+    package=" packageJsonBase64=$manifest"
+  else
+    return 0
+  fi
+  rt=""
+  [ -f "$dir/config/runtime.json" ] && rt=" runtimeJson=$dir/config/runtime.json"
+  echo "HIT kind=snowluma source=$src verified=1 root=$dir indexMjs=$dir/index.mjs$rt$package"
+  if [ -f "$dir/node" ] && [ -x "$dir/node" ]; then
+    emit_node "$dir/node" desktopOwned "$package"
+  elif [ -x "$dir/node/bin/node" ]; then
+    emit_node "$dir/node/bin/node" desktopOwned "$package"
+  fi
+  [ "$legacy" = 1 ] && emit_sl_bots "$dir"
+}
+
+emit_nc_bots() {
+  cfg="$1/config"
+  [ -d "$cfg" ] || return 0
+  for f in "$cfg"/onebot11_*.json "$cfg"/napcat_*.json; do
+    [ -f "$f" ] || continue
+    base=${f##*/}
+    qq=${base#onebot11_}
+    qq=${qq#napcat_}
+    qq=${qq%.json}
+    case "$qq" in
+      *[!0-9]*|"") continue ;;
+    esac
+    echo "HIT kind=bot backend=napcat deployment=native qq=$qq source=configFile"
+  done
+}
+
+emit_sl_bots() {
+  dir="$1"
+  cfg="$dir/config"
+  if [ -d "$cfg" ]; then
+    for f in "$cfg"/onebot_*.json; do
+      [ -f "$f" ] || continue
+      base=${f##*/}
+      case "$base" in
+        onebot11_*) continue ;;
+      esac
+      qq=${base#onebot_}
+      qq=${qq%.json}
+      case "$qq" in
+        *[!0-9]*|"") continue ;;
+      esac
+      echo "HIT kind=bot backend=snowluma deployment=native qq=$qq source=configFile"
+    done
+  fi
+  ws="$dir"
+  case "$dir" in
+    */snowluma) ws="${dir%/snowluma}" ;;
+  esac
+  rt="$ws/runtime"
+  [ -d "$rt" ] || return 0
+  for f in "$rt"/status_bot_*.json "$rt"/pid_bot_*; do
+    [ -e "$f" ] || continue
+    base=${f##*/}
+    qq=${base#status_bot_}
+    qq=${qq#pid_bot_}
+    qq=${qq%.json}
+    case "$qq" in
+      *[!0-9]*|"") continue ;;
+    esac
+    echo "HIT kind=bot backend=snowluma deployment=native qq=$qq source=runtimeStatus"
+  done
+}
+
+emit_node() {
+  bin="$1"; src="$2"
+  if [ -x "$bin" ]; then
+    echo "HIT kind=nodejs source=$src verified=1 root=$bin nodeBin=$bin${3:-}"
+  fi
+}
+
+emit_watch() {
+  root="$1"; src="$2"
+  bin=""
+  if [ -x "$root/ncd-watch" ]; then bin="$root/ncd-watch"
+  elif [ -x "$root/bin/ncd-watch" ]; then bin="$root/bin/ncd-watch"
+  fi
+  if [ -n "$bin" ]; then
+    echo "HIT kind=ncd_watch source=$src verified=1 root=$root"
+  fi
+}
+
+if [ -n "$OV_QQ_BASE" ]; then emit_qq "$OV_QQ_BASE" userOverride; fi
+if [ -n "$OV_NAPCAT" ] && [ -f "$OV_NAPCAT/napcat.mjs" ]; then
+  load="$(dirname "$(dirname "$OV_NAPCAT")")/loadNapCat.js"
+  ver=0
+  [ -f "$load" ] && ver=1
+  echo "HIT kind=napcat source=userOverride verified=$ver root=$OV_NAPCAT napcatMjs=$OV_NAPCAT/napcat.mjs loadNapcatJs=$load"
+  emit_nc_bots "$OV_NAPCAT"
+fi
+if [ -n "$OV_SL" ]; then emit_sl "$OV_SL" userOverride; fi
+if [ -n "$OV_NODE" ]; then emit_node "$OV_NODE" userOverride; fi
+if [ -n "$OV_WATCH" ]; then emit_watch "$OV_WATCH" userOverride; fi
+
+emit_qq "$HOME/Napcat" officialInstaller
+emit_qq / systemPackage
+emit_sl "$HOME/snowluma-remote/workspace/snowluma" desktopOwned
+emit_sl "$HOME/Napcat/snowluma-workspace/snowluma" desktopOwned
+emit_sl /opt/snowluma systemPackage
+if [ -n "$PREV_SL" ]; then emit_sl "$PREV_SL" pathLookup; fi
+emit_node "$HOME/snowluma-remote/workspace/node/bin/node" desktopOwned
+emit_node "$HOME/Napcat/usr/node/bin/node" desktopOwned
+emit_watch "$HOME/ncd-watch" desktopOwned
+
+if command -v dpkg >/dev/null 2>&1; then
+  dpkg -L linuxqq 2>/dev/null | while IFS= read -r p; do
+    case "$p" in
+      */opt/QQ/qq)
+        if [ -x "$p" ]; then
+          case "$p" in
+            /opt/QQ/qq) emit_qq / systemPackage ;;
+            *)
+              base="${p%/opt/QQ/qq}"
+              [ -n "$base" ] && emit_qq "$base" systemPackage
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+elif command -v rpm >/dev/null 2>&1; then
+  rpm -ql linuxqq 2>/dev/null | while IFS= read -r p; do
+    case "$p" in
+      */opt/QQ/qq)
+        if [ -x "$p" ]; then
+          case "$p" in
+            /opt/QQ/qq) emit_qq / systemPackage ;;
+            *)
+              base="${p%/opt/QQ/qq}"
+              [ -n "$base" ] && emit_qq "$base" systemPackage
+              ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+fi
+
+if command -v node >/dev/null 2>&1; then
+  nb=$(command -v node)
+  emit_node "$nb" pathLookup
+fi
+if command -v qq >/dev/null 2>&1; then
+  qb=$(command -v qq)
+  case "$qb" in
+    */opt/QQ/qq)
+      base="${qb%/opt/QQ/qq}"
+      [ -z "$base" ] && base=/
+      emit_qq "$base" pathLookup
+      ;;
+  esac
+fi
+
+for d in /proc/[0-9]*; do
+  [ -r "$d/cmdline" ] || continue
+  cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    *napcat.mjs*|*loadNapCat.js*)
+      exe=$(readlink -f "$d/exe" 2>/dev/null || true)
+      case "$exe" in
+        */opt/QQ/qq)
+          base="${exe%/opt/QQ/qq}"
+          [ -z "$base" ] && base=/
+          emit_qq "$base" process
+          ;;
+      esac
+      cwd=$(readlink -f "$d/cwd" 2>/dev/null || true)
+      if [ -n "$cwd" ]; then
+        case "$cwd" in
+          */opt/QQ) emit_qq "$(dirname "$cwd" | sed 's|/opt$||')" process ;;
+        esac
+      fi
+      if [ -r "$d/environ" ]; then
+        wd=$(tr '\0' '\n' < "$d/environ" 2>/dev/null | grep '^NAPCAT_WORKDIR=' | head -n 1 | sed 's/^NAPCAT_WORKDIR=//')
+        if [ -n "$wd" ] && [ -f "$wd/napcat.mjs" ]; then
+          echo "HIT kind=napcat source=process verified=1 root=$wd napcatMjs=$wd/napcat.mjs"
+          emit_nc_bots "$wd"
+        fi
+      fi
+      ;;
+    *index.mjs*)
+      cwd=$(readlink -f "$d/cwd" 2>/dev/null || true)
+      [ -n "$cwd" ] && emit_sl "$cwd" process
+      ;;
+  esac
+done
+
+container_cli="${NCD_CONTAINER_CLI:-docker}"
+if command -v "$container_cli" >/dev/null 2>&1; then
+  "$container_cli" ps -a --filter name=ncbot- --format '{{.Names}}' 2>/dev/null | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    echo "HIT kind=docker_container source=pathLookup verified=1 root=$name dockerName=$name"
+    qq="${name#ncbot-}"
+    case "$qq" in *[!0-9]*|"") continue ;; esac
+    echo "HIT kind=bot backend=napcat deployment=docker qq=$qq source=dockerContainer dockerName=$name"
+  done
+  "$container_cli" ps -a --filter name=slbot- --format '{{.Names}}' 2>/dev/null | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    echo "HIT kind=docker_container source=pathLookup verified=1 root=$name dockerName=$name"
+    qq="${name#slbot-}"
+    case "$qq" in *[!0-9]*|"") continue ;; esac
+    echo "HIT kind=bot backend=snowluma deployment=docker qq=$qq source=dockerContainer dockerName=$name"
+  done
+fi
+"#;
+
+/// 在 Host 上跑探测脚本并选中路径
+pub async fn probe_remote_inventory(
+    host: &dyn Host,
+    overrides: Option<&RemotePathOverrides>,
+    previous: Option<&RemoteInventory>,
+) -> Result<RemoteInventory, String> {
+    if host.os() == ncd_host::Os::Windows {
+        return windows::probe(host, overrides).await;
+    }
+    let prev_sl = previous.and_then(|p| p.selected.snowluma_dir.as_deref());
+    let script = build_probe_script_with_previous(overrides, prev_sl);
+    let cmd = HostCommand::new("sh")
+        .arg("-c")
+        .arg(script)
+        .env(
+            "NCD_CONTAINER_CLI",
+            ncd_deploy::docker::engine::engine_for(host).program(),
+        )
+        .timeout(INVENTORY_PROBE_TIMEOUT);
+    let out = host
+        .run_to_string(cmd)
+        .await
+        .map_err(|e| format!("探测远端安装库存失败: {e}"))?;
+    if !out.success() {
+        return Err(format!(
+            "探测远端安装库存失败: exit={:?} stderr={}",
+            out.exit_code,
+            out.stderr.trim()
+        ));
+    }
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    inventory_from_stdout(&out.stdout, previous, probed_at)
+}
+
+/// 远端库存的内存副本：组件页探测、Bot 启动预检和组件动作共用一份。
+/// 同一台机器的 home / 布局很稳定，组件页一次并发 detect 七八个组件只该探一次
+pub struct RemoteInventoryService {
+    server_manager: Arc<ServerManager>,
+    /// server_id → 最近一次拿到的库存
+    cache: Mutex<HashMap<String, CachedInventory>>,
+    /// 安装失效代次只有同代探测成功才能确认，重探中不能提前信任旧缓存。
+    revisions: std::sync::Mutex<HashMap<String, InventoryRevision>>,
+    /// 每台机器一把探测锁：冷缓存时并发进来的调用排队，后到的拿锁后先看前一个探到的
+    probing: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+struct CachedInventory {
+    host: Weak<dyn Host>,
+    profile: ServerProfile,
+    inventory: RemoteInventory,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct InventoryRevision {
+    generation: u64,
+    dirty: bool,
+}
+
+impl CachedInventory {
+    fn matches(&self, host: &dyn Host, profile: &ServerProfile) -> bool {
+        self.profile.same_inventory_target(profile)
+            && self
+                .host
+                .upgrade()
+                .is_some_and(|owner| std::ptr::addr_eq(owner.as_ref(), host))
+    }
+}
+
+impl RemoteInventoryService {
+    pub fn new(server_manager: Arc<ServerManager>) -> Self {
+        Self {
+            server_manager,
+            cache: Mutex::new(HashMap::new()),
+            revisions: std::sync::Mutex::new(HashMap::new()),
+            probing: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 缓存只对同一连接和配置有效；Windows 新连接先重探目标。
+    pub async fn ensure(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+        force: bool,
+    ) -> Result<RemoteInventory, String> {
+        let owner = self
+            .server_manager
+            .get_host(server_id)
+            .await
+            .filter(|owner| std::ptr::addr_eq(owner.as_ref(), host));
+        self.ensure_for_owner(server_id, host, owner.as_ref(), force)
+            .await
+    }
+
+    async fn ensure_for_owner(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+        owner: Option<&Arc<dyn Host>>,
+        force: bool,
+    ) -> Result<RemoteInventory, String> {
+        if force {
+            self.invalidate(server_id).await;
+        }
+        let profile = self
+            .server_manager
+            .list_servers()
+            .await
+            .into_iter()
+            .find(|p| p.id == server_id)
+            .ok_or_else(|| format!("server not found: {server_id}"))?;
+        let overrides = profile.path_overrides.as_ref();
+        if !force {
+            if let Some(inv) = self
+                .fresh_cached(server_id, host, &profile)
+                .await
+                .filter(|inv| inventory_matches_target(inv, host, overrides))
+            {
+                return Ok(inv);
+            }
+        }
+        let lock = self.probe_lock(server_id);
+        let _probing = lock.lock().await;
+        for _ in 0..3 {
+            let profile = self
+                .server_manager
+                .list_servers()
+                .await
+                .into_iter()
+                .find(|p| p.id == server_id)
+                .ok_or_else(|| format!("server not found: {server_id}"))?;
+            let overrides = profile.path_overrides.as_ref();
+            let revision = self.revision(server_id);
+            let reuse = !force && !revision.dirty;
+            if reuse {
+                if let Some(inv) = self
+                    .fresh_cached(server_id, host, &profile)
+                    .await
+                    .filter(|inv| inventory_matches_target(inv, host, overrides))
+                {
+                    return Ok(inv);
+                }
+            }
+            let now = chrono::Utc::now();
+            let same_connection = self
+                .cache
+                .lock()
+                .await
+                .get(server_id)
+                .is_none_or(|cached| cached.matches(host, &profile));
+            // 老版持久 Windows 快照没有目标身份；新连接必须先读取真实目标。
+            let previous = profile
+                .inventory
+                .clone()
+                .filter(|_| {
+                    owner.is_some() && same_connection && host.os() != ncd_host::Os::Windows
+                })
+                .filter(|inv| inventory_matches_target(inv, host, overrides));
+            if reuse {
+                if let Some(inv) = previous
+                    .as_ref()
+                    .filter(|i| !inventory_is_stale(&i.probed_at, now))
+                {
+                    self.remember(server_id, owner, &profile, inv, revision.generation)
+                        .await;
+                    if self.confirm_revision(server_id, revision.generation) {
+                        return Ok(inv.clone());
+                    }
+                    continue;
+                }
+            }
+
+            let inv = probe_remote_inventory(host, overrides, previous.as_ref()).await?;
+            if let Some(current) = self.server_manager.get_host(server_id).await {
+                if !std::ptr::addr_eq(current.as_ref(), host) {
+                    return Err("探测期间主机连接已更换，请重新探测".into());
+                }
+            }
+            if self.revision(server_id).generation != revision.generation {
+                continue;
+            }
+            self.server_manager
+                .set_inventory_for_profile(&profile, inv.clone())
+                .await?;
+            self.remember(server_id, owner, &profile, &inv, revision.generation)
+                .await;
+            if self.confirm_revision(server_id, revision.generation) {
+                return Ok(inv);
+            }
+        }
+        Err("探测期间组件状态持续变化，请在组件操作完成后重新探测".into())
+    }
+
+    /// 装卸后强制重探，同时保留旧连接身份用于隔离库存路径。
+    pub async fn invalidate(&self, server_id: &str) {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = revisions.entry(server_id.to_string()).or_default();
+        revision.generation = revision.generation.wrapping_add(1);
+        revision.dirty = true;
+    }
+
+    async fn fresh_cached(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+        profile: &ServerProfile,
+    ) -> Option<RemoteInventory> {
+        let cache = self.cache.lock().await;
+        let revision = self.revision(server_id);
+        if revision.dirty {
+            return None;
+        }
+        cache
+            .get(server_id)
+            .filter(|c| c.generation == revision.generation)
+            .filter(|c| c.matches(host, profile))
+            .filter(|c| !inventory_is_stale(&c.inventory.probed_at, chrono::Utc::now()))
+            .map(|c| c.inventory.clone())
+    }
+
+    fn revision(&self, server_id: &str) -> InventoryRevision {
+        self.revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_dirty_for_test(&self, server_id: &str) -> bool {
+        self.revision(server_id).dirty
+    }
+
+    fn confirm_revision(&self, server_id: &str, generation: u64) -> bool {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = revisions.entry(server_id.to_string()).or_default();
+        if revision.generation != generation {
+            return false;
+        }
+        revision.dirty = false;
+        true
+    }
+
+    fn probe_lock(&self, server_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.probing.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(locks.entry(server_id.to_string()).or_default())
+    }
+
+    /// host_id 对应的 home / 布局 / 选中路径。本机没有库存；远端探不到时报错
+    pub async fn host_probe(
+        &self,
+        host_id: &str,
+        host: &dyn Host,
+    ) -> Result<(RemoteHostProbe, Option<RemoteSelectedPaths>), String> {
+        let Some(server_id) = server_id_of_host(host_id) else {
+            return Ok((RemoteHostProbe::local_default(), None));
+        };
+        let inv = self.ensure(server_id, host, false).await?;
+        Ok((probe_from_inventory(&inv), Some(inv.selected)))
+    }
+
+    /// 同 host_probe，远端探不到时回落本机默认，由组件构建自己报缺 home
+    pub async fn host_probe_or_default(
+        &self,
+        host_id: &str,
+        host: &dyn Host,
+    ) -> (RemoteHostProbe, Option<RemoteSelectedPaths>) {
+        self.host_probe(host_id, host)
+            .await
+            .unwrap_or_else(|_| (RemoteHostProbe::local_default(), None))
+    }
+
+    async fn remember(
+        &self,
+        server_id: &str,
+        owner: Option<&Arc<dyn Host>>,
+        profile: &ServerProfile,
+        inv: &RemoteInventory,
+        generation: u64,
+    ) {
+        let mut cache = self.cache.lock().await;
+        if let Some(owner) = owner {
+            cache.insert(
+                server_id.to_string(),
+                CachedInventory {
+                    host: Arc::downgrade(owner),
+                    profile: profile.clone(),
+                    inventory: inv.clone(),
+                    generation,
+                },
+            );
+        } else {
+            cache.remove(server_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit_qq(root: &str, source: &str) -> String {
+        format!("HIT kind=qq source={source} verified=1 root={root} qqBin={root}/opt/QQ/qq")
+    }
+
+    fn sample_stdout(home: &str, extra: &str) -> String {
+        format!("NCD_INV_V=1\nHOME={home}\n{extra}")
+    }
+
+    #[test]
+    fn parse_hit_line_normal_and_unknown_keys() {
+        let stdout = sample_stdout(
+            "/home/u",
+            "HIT kind=qq source=officialInstaller verified=1 root=/home/u/Napcat qqBin=/home/u/Napcat/opt/QQ/qq extra=ignored\n",
+        );
+        let (home, items) = parse_inventory_stdout(&stdout).unwrap();
+        assert_eq!(home, "/home/u");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, RemoteInventoryKind::Qq);
+        assert_eq!(items[0].source, RemoteInventorySource::OfficialInstaller);
+        assert_eq!(items[0].qq_bin.as_deref(), Some("/home/u/Napcat/opt/QQ/qq"));
+    }
+
+    #[test]
+    fn parse_skips_non_hit_and_missing_kind() {
+        let stdout = sample_stdout(
+            "/home/u",
+            "noise\nHIT source=process verified=1 root=/x\nHIT kind=qq source=nope verified=1 root=/y\n",
+        );
+        let (_, items) = parse_inventory_stdout(&stdout).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_home_is_error() {
+        let err =
+            parse_inventory_stdout("NCD_INV_V=1\nHIT kind=qq source=process verified=1 root=/x\n")
+                .unwrap_err();
+        assert!(err.contains("$HOME"));
+    }
+
+    #[test]
+    fn config_qq_is_not_install_root() {
+        assert!(is_qq_user_data_path("/home/u/.config/QQ"));
+        let stdout = sample_stdout(
+            "/home/u",
+            "HIT kind=qq source=process verified=1 root=/home/u/.config/QQ qqBin=/home/u/.config/QQ/opt/QQ/qq\n",
+        );
+        let (_, items) = parse_inventory_stdout(&stdout).unwrap();
+        assert!(items.is_empty());
+        assert!(qq_install_base_from_qq_bin("/home/u/.config/QQ/opt/QQ/qq").is_none());
+        assert_eq!(
+            qq_install_base_from_qq_bin("/opt/QQ/qq").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            qq_install_base_from_qq_bin("/home/u/Napcat/opt/QQ/qq").as_deref(),
+            Some("/home/u/Napcat")
+        );
+    }
+
+    #[test]
+    fn select_prefers_override_then_previous_then_rootless() {
+        let items = vec![
+            parse_hit_line("kind=qq source=systemPackage verified=1 root=/ qqBin=/opt/QQ/qq").unwrap(),
+            parse_hit_line(
+                "kind=qq source=officialInstaller verified=1 root=/home/u/Napcat qqBin=/home/u/Napcat/opt/QQ/qq",
+            )
+            .unwrap(),
+            parse_hit_line(
+                "kind=qq source=userOverride verified=1 root=/data/qq qqBin=/data/qq/opt/QQ/qq",
+            )
+            .unwrap(),
+        ];
+        let sel = select_paths("/home/u", &items, None);
+        assert_eq!(sel.qq_install_base.as_deref(), Some("/data/qq"));
+        assert!(!sel.needs_sudo);
+
+        let without_ov: Vec<_> = items
+            .into_iter()
+            .filter(|i| i.source != RemoteInventorySource::UserOverride)
+            .collect();
+        let sel = select_paths("/home/u", &without_ov, None);
+        assert_eq!(sel.qq_install_base.as_deref(), Some("/home/u/Napcat"));
+        assert!(!sel.needs_sudo);
+
+        let prev = RemoteSelectedPaths {
+            home: "/home/u".into(),
+            qq_install_base: Some("/".into()),
+            qq_bin: Some("/opt/QQ/qq".into()),
+            ..RemoteSelectedPaths::default()
+        };
+        let sel = select_paths("/home/u", &without_ov, Some(&prev));
+        assert_eq!(sel.qq_install_base.as_deref(), Some("/"));
+        assert!(sel.needs_sudo);
+    }
+
+    #[test]
+    fn process_fills_custom_prefix_when_whitelist_empty() {
+        let items =
+            vec![parse_hit_line(
+            "kind=snowluma source=process verified=1 root=/data/sl indexMjs=/data/sl/index.mjs",
+        )
+        .unwrap()];
+        let sel = select_paths("/home/u", &items, None);
+        assert_eq!(sel.snowluma_dir.as_deref(), Some("/data/sl"));
+        assert_eq!(sel.snowluma_workspace.as_deref(), Some("/data/sl"));
+    }
+
+    #[test]
+    fn workspace_parent_when_dir_ends_with_snowluma() {
+        assert_eq!(
+            snowluma_workspace_from_dir("/home/u/snowluma-remote/workspace/snowluma"),
+            "/home/u/snowluma-remote/workspace"
+        );
+        assert_eq!(
+            snowluma_workspace_from_dir("/opt/snowluma"),
+            "/opt/snowluma"
+        );
+    }
+
+    #[test]
+    fn needs_sudo_only_for_system_qq() {
+        assert!(needs_sudo_for_qq(Some("/"), Some("/opt/QQ/qq")));
+        assert!(!needs_sudo_for_qq(
+            Some("/home/u/Napcat"),
+            Some("/home/u/Napcat/opt/QQ/qq")
+        ));
+        assert!(!needs_sudo_for_qq(None, None));
+        let sel = RemoteSelectedPaths {
+            needs_sudo: true,
+            ..RemoteSelectedPaths::default()
+        };
+        assert_eq!(layout_from_selected(&sel), RemoteLayout::System);
+    }
+
+    #[test]
+    fn inventory_from_stdout_whitelist_dpkg_and_process() {
+        let stdout = sample_stdout(
+            "/home/u",
+            &(hit_qq("/home/u/Napcat", "officialInstaller")
+                + "\n"
+                + &hit_qq("/", "systemPackage")
+                + "\nHIT kind=nodejs source=pathLookup verified=1 root=/usr/bin/node nodeBin=/usr/bin/node\nHIT kind=snowluma source=process verified=1 root=/data/sl indexMjs=/data/sl/index.mjs\nHIT kind=docker_container source=pathLookup verified=1 root=ncbot-1001 dockerName=ncbot-1001\n"),
+        );
+        let inv = inventory_from_stdout(&stdout, None, "2026-08-25T00:00:00Z").unwrap();
+        assert_eq!(
+            inv.selected.qq_install_base.as_deref(),
+            Some("/home/u/Napcat")
+        );
+        assert_eq!(inv.selected.node_bin.as_deref(), Some("/usr/bin/node"));
+        assert_eq!(inv.selected.snowluma_dir.as_deref(), Some("/data/sl"));
+        assert_eq!(
+            inv.snowluma_linux_package,
+            Some(ncd_domain::SnowLumaLinuxPackage::Full)
+        );
+        assert!(
+            inv.items
+                .iter()
+                .any(|i| i.kind == RemoteInventoryKind::DockerContainer)
+        );
+        assert!(inv.selected.ncd_watch_root.is_none());
+    }
+
+    #[test]
+    fn select_paths_prefers_bundled_snowluma_node_over_path() {
+        let stdout = sample_stdout(
+            "/root",
+            "HIT kind=snowluma source=systemPackage verified=1 root=/opt/snowluma indexMjs=/opt/snowluma/index.mjs\nHIT kind=nodejs source=desktopOwned verified=1 root=/opt/snowluma/node nodeBin=/opt/snowluma/node\nHIT kind=nodejs source=pathLookup verified=1 root=/usr/bin/node nodeBin=/usr/bin/node\n",
+        );
+        let inv = inventory_from_stdout(&stdout, None, "2026-08-25T00:00:00Z").unwrap();
+        assert_eq!(inv.selected.node_bin.as_deref(), Some("/opt/snowluma/node"));
+        assert_eq!(
+            inv.snowluma_linux_package,
+            Some(ncd_domain::SnowLumaLinuxPackage::Full)
+        );
+    }
+
+    #[test]
+    fn inventory_parses_bot_hits_without_putting_them_in_items() {
+        let stdout = sample_stdout(
+            "/home/u",
+            "HIT kind=bot backend=napcat deployment=native qq=10001 source=configFile\nHIT kind=bot backend=snowluma deployment=native qq=10001 source=configFile\nHIT kind=bot backend=napcat deployment=docker qq=20002 source=dockerContainer dockerName=ncbot-20002\nHIT kind=bot backend=napcat deployment=native qq=10001 source=runtimeStatus\nHIT kind=qq source=officialInstaller verified=1 root=/home/u/Napcat qqBin=/home/u/Napcat/opt/QQ/qq\n",
+        );
+        let inv = inventory_from_stdout(&stdout, None, "2026-08-25T00:00:00Z").unwrap();
+        assert_eq!(inv.items.len(), 1);
+        assert_eq!(inv.bots.len(), 3);
+        assert_eq!(inv.bots[0].qq_id, 10001);
+        assert_eq!(inv.bots[0].backend, BackendType::NapCat);
+        assert_eq!(inv.bots[0].source, DiscoveredRemoteBotSource::ConfigFile);
+        assert_eq!(inv.bots[1].backend, BackendType::SnowLuma);
+        assert_eq!(inv.bots[2].qq_id, 20002);
+        assert_eq!(inv.bots[2].docker_name.as_deref(), Some("ncbot-20002"));
+    }
+
+    #[test]
+    fn probe_script_has_fingerprints_not_find() {
+        let script = build_probe_script(None);
+        assert!(!script.contains("find /"));
+        assert!(!script.contains("locate "));
+        assert!(script.contains("$HOME/Napcat"));
+        assert!(script.contains("/opt/QQ"));
+        assert!(script.contains("snowluma-remote/workspace/snowluma"));
+        assert!(script.contains("emit_sl /opt/snowluma systemPackage"));
+        assert!(script.contains("PREV_SL"));
+        assert!(script.contains("napcat.mjs"));
+        assert!(script.contains("webuiPort"));
+        assert!(script.contains("NAPCAT_WORKDIR"));
+        assert!(script.contains("$dir/node"));
+        assert!(script.contains("$dir/node/bin/node"));
+        assert!(script.contains("onebot11_"));
+        assert!(script.contains("onebot_"));
+        assert!(script.contains("kind=bot"));
+        assert!(script.contains("slbot-"));
+        assert!(!script.contains("SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD"));
+        assert!(!script.contains("WEBUI_TOKEN"));
+        let with_ov = build_probe_script(Some(&RemotePathOverrides {
+            qq_install_base: Some("/data/qq".into()),
+            ..RemotePathOverrides::default()
+        }));
+        assert!(with_ov.contains("OV_QQ_BASE='/data/qq'"));
+        let with_prev = build_probe_script_with_previous(None, Some("/opt/snowluma"));
+        assert!(with_prev.contains("PREV_SL='/opt/snowluma'"));
+    }
+
+    #[test]
+    fn opt_snowluma_hit_survives_without_running_process() {
+        let stdout = sample_stdout(
+            "/root",
+            "HIT kind=qq source=systemPackage verified=1 root=/ qqBin=/opt/QQ/qq\nHIT kind=snowluma source=systemPackage verified=1 root=/opt/snowluma indexMjs=/opt/snowluma/index.mjs runtimeJson=/opt/snowluma/config/runtime.json\n",
+        );
+        let inv = inventory_from_stdout(&stdout, None, "2026-08-25T00:00:00Z").unwrap();
+        assert_eq!(inv.selected.snowluma_dir.as_deref(), Some("/opt/snowluma"));
+        assert_eq!(
+            inv.selected.snowluma_workspace.as_deref(),
+            Some("/opt/snowluma")
+        );
+    }
+
+    #[test]
+    fn stale_when_unparseable_or_old() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(inventory_is_stale("nope", now));
+        assert!(!inventory_is_stale("2026-08-25T10:00:00Z", now));
+        assert!(inventory_is_stale("2026-08-24T12:00:00Z", now));
+    }
+
+    #[test]
+    fn system_base_paths_are_normalized_without_double_slash() {
+        // kunming 实测：系统包 base="/" 时探测脚本回吐 qqBin=//opt/QQ/qq，
+        // 不归一化会让 /proc/pid/exe 的字符串比对永远失配
+        let item =
+            parse_hit_line("kind=qq source=systemPackage verified=1 root=/ qqBin=//opt/QQ/qq")
+                .unwrap();
+        assert_eq!(item.root, "/");
+        assert_eq!(item.qq_bin.as_deref(), Some("/opt/QQ/qq"));
+    }
+
+    #[test]
+    fn select_paths_joins_system_base_without_double_slash() {
+        let items = vec![parse_hit_line("kind=qq source=systemPackage verified=1 root=/").unwrap()];
+        let sel = select_paths("/root", &items, None);
+        assert_eq!(sel.qq_install_base.as_deref(), Some("/"));
+        assert_eq!(sel.qq_bin.as_deref(), Some("/opt/QQ/qq"));
+        assert!(sel.needs_sudo);
+    }
+
+    #[derive(Default)]
+    struct ProbePause {
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    struct ProbeResponse {
+        stdout: Result<String, &'static str>,
+        pause: Option<Arc<ProbePause>>,
+    }
+
+    /// 默认固定输出；队列里的响应可在探测途中等待测试推进安装失效代次。
+    #[derive(Default)]
+    struct ScriptedHost {
+        stdout: String,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+        fail: bool,
+        windows_root: Option<String>,
+        responses: std::sync::Mutex<std::collections::VecDeque<ProbeResponse>>,
+    }
+
+    impl ScriptedHost {
+        fn new(stdout: impl Into<String>) -> Self {
+            Self {
+                stdout: stdout.into(),
+                ..Self::default()
+            }
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn respond(&self, stdout: Result<String, &'static str>, pause: Option<Arc<ProbePause>>) {
+            self.responses
+                .lock()
+                .unwrap()
+                .push_back(ProbeResponse { stdout, pause });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Host for ScriptedHost {
+        fn os(&self) -> ncd_host::Os {
+            if self.windows_root.is_some() {
+                ncd_host::Os::Windows
+            } else {
+                ncd_host::Os::Linux
+            }
+        }
+        fn arch(&self) -> ncd_host::Arch {
+            ncd_host::Arch::X86_64
+        }
+        fn locality(&self) -> ncd_host::Locality {
+            ncd_host::Locality::Remote
+        }
+        fn id(&self) -> &str {
+            "scripted"
+        }
+        fn target_managed_root(&self) -> Option<ncd_host::HostPath> {
+            self.windows_root
+                .as_deref()
+                .map(ncd_host::HostPath::from_windows)
+        }
+        fn target_home(&self) -> Option<ncd_host::HostPath> {
+            self.windows_root
+                .as_ref()
+                .map(|_| ncd_host::HostPath::from_windows(r"C:\Users\owner"))
+        }
+        fn shell(&self) -> &dyn ncd_host::HostShell {
+            &ncd_host::shell::BashShell
+        }
+        async fn read_file(
+            &self,
+            _: &ncd_host::HostPath,
+        ) -> Result<bytes::Bytes, ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn write_file(
+            &self,
+            _: &ncd_host::HostPath,
+            _: &[u8],
+        ) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn list_dir(
+            &self,
+            _: &ncd_host::HostPath,
+        ) -> Result<Vec<ncd_host::DirEntry>, ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn create_dir_all(&self, _: &ncd_host::HostPath) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn remove_file(&self, _: &ncd_host::HostPath) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn remove_dir_all(&self, _: &ncd_host::HostPath) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn exists(&self, _: &ncd_host::HostPath) -> Result<bool, ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn upload(
+            &self,
+            _: &std::path::Path,
+            _: &ncd_host::HostPath,
+        ) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn download(
+            &self,
+            _: &ncd_host::HostPath,
+            _: &std::path::Path,
+        ) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn extract_archive(
+            &self,
+            _: &ncd_host::HostPath,
+            _: &ncd_host::HostPath,
+            _: ncd_host::ArchiveKind,
+        ) -> Result<(), ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn spawn(
+            &self,
+            _: HostCommand,
+        ) -> Result<Box<dyn ncd_host::HostProcess>, ncd_host::HostError> {
+            Err(ncd_host::HostError::Unsupported { operation: "stub" })
+        }
+        async fn run_to_string(
+            &self,
+            cmd: HostCommand,
+        ) -> Result<ncd_host::CommandOutput, ncd_host::HostError> {
+            assert_eq!(cmd.program, "sh");
+            assert_eq!(cmd.timeout, Some(INVENTORY_PROBE_TIMEOUT));
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = self.responses.lock().unwrap().pop_front();
+            if let Some(response) = response {
+                if let Some(pause) = response.pause {
+                    pause.entered.notify_one();
+                    pause.resume.notified().await;
+                }
+                let stdout = response
+                    .stdout
+                    .map_err(|operation| ncd_host::HostError::Unsupported { operation })?;
+                return Ok(ncd_host::CommandOutput {
+                    exit_code: Some(0),
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.fail {
+                return Err(ncd_host::HostError::Unsupported { operation: "down" });
+            }
+            Ok(ncd_host::CommandOutput {
+                exit_code: Some(0),
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_remote_inventory_parses_scripted_host_stdout() {
+        let stdout = sample_stdout(
+            "/home/u",
+            "HIT kind=qq source=officialInstaller verified=1 root=/home/u/Napcat qqBin=/home/u/Napcat/opt/QQ/qq\nHIT kind=snowluma source=process verified=1 root=/data/sl indexMjs=/data/sl/index.mjs\n",
+        );
+        let host = ScriptedHost::new(stdout);
+        let inv = probe_remote_inventory(&host, None, None).await.unwrap();
+        assert_eq!(inv.home, "/home/u");
+        assert_eq!(
+            inv.selected.qq_install_base.as_deref(),
+            Some("/home/u/Napcat")
+        );
+        assert_eq!(inv.selected.snowluma_dir.as_deref(), Some("/data/sl"));
+    }
+
+    /// 带一份真实档案 s1 的 ServerManager:探到的库存能写回档案,也能从档案读回来
+    async fn manager_with_server(root: &std::path::Path) -> Arc<ServerManager> {
+        let manager = Arc::new(ServerManager::new(
+            root,
+            Arc::new(ncd_server::InMemoryCredentialStore::default()),
+        ));
+        manager
+            .add_server(
+                ncd_server::ServerProfile {
+                    id: "s1".into(),
+                    name: "s1".into(),
+                    host: "192.0.2.1".into(),
+                    platform: None,
+                    port: 22,
+                    username: "root".into(),
+                    auth_method: ncd_server::AuthMethod::Key,
+                    private_key_path: None,
+                    remember_credential: false,
+                    state: ncd_server::ServerState::default(),
+                    health: None,
+                    webui_url: None,
+                    path_overrides: None,
+                    inventory: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+    }
+
+    async fn ensure_scripted(
+        service: &RemoteInventoryService,
+        host: &Arc<ScriptedHost>,
+        force: bool,
+    ) -> Result<RemoteInventory, String> {
+        let owner: Arc<dyn Host> = host.clone();
+        service
+            .ensure_for_owner("s1", host.as_ref(), Some(&owner), force)
+            .await
+    }
+
+    fn spawn_ensure(
+        service: &Arc<RemoteInventoryService>,
+        host: &Arc<ScriptedHost>,
+    ) -> tokio::task::JoinHandle<Result<RemoteInventory, String>> {
+        let service = Arc::clone(service);
+        let host = Arc::clone(host);
+        tokio::spawn(async move { ensure_scripted(&service, &host, false).await })
+    }
+
+    async fn wait_for_probe(pause: &ProbePause) {
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+            .await
+            .expect("scripted inventory probe did not start");
+    }
+
+    #[tokio::test]
+    async fn inventory_service_reuses_only_the_same_host_arc_until_invalidated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager_with_server(tmp.path()).await;
+        let service = RemoteInventoryService::new(Arc::clone(&manager));
+        let first = Arc::new(ScriptedHost::new(sample_stdout("/home/a", "")));
+        let second = Arc::new(ScriptedHost::new(sample_stdout("/home/b", "")));
+
+        assert_eq!(
+            ensure_scripted(&service, &first, false).await.unwrap().home,
+            "/home/a"
+        );
+        assert_eq!(
+            ensure_scripted(&service, &first, false).await.unwrap().home,
+            "/home/a"
+        );
+        assert_eq!(first.probes(), 1);
+        assert_eq!(
+            ensure_scripted(&service, &second, false)
+                .await
+                .unwrap()
+                .home,
+            "/home/b"
+        );
+        assert_eq!(second.probes(), 1);
+
+        // 档案里那份还没过期,装卸后也得真去探
+        service.invalidate("s1").await;
+        assert_eq!(
+            ensure_scripted(&service, &second, false)
+                .await
+                .unwrap()
+                .home,
+            "/home/b"
+        );
+        assert_eq!(
+            ensure_scripted(&service, &first, false).await.unwrap().home,
+            "/home/a"
+        );
+        assert_eq!(second.probes(), 2);
+        assert_eq!(first.probes(), 2);
+
+        // 新的内存副本从档案里读回重探后的值
+        let fresh = RemoteInventoryService::new(Arc::clone(&manager));
+        assert_eq!(
+            ensure_scripted(&fresh, &first, false).await.unwrap().home,
+            "/home/a"
+        );
+        assert_eq!(
+            ensure_scripted(&service, &first, true).await.unwrap().home,
+            "/home/a"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reprobe_on_replacement_host_never_uses_old_saved_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = RemoteInventoryService::new(manager_with_server(tmp.path()).await);
+        let ok = Arc::new(ScriptedHost::new(sample_stdout("/home/a", "")));
+        let down = Arc::new(ScriptedHost {
+            fail: true,
+            ..ScriptedHost::default()
+        });
+        ensure_scripted(&service, &ok, false).await.unwrap();
+
+        service.invalidate("s1").await;
+        assert!(ensure_scripted(&service, &down, false).await.is_err());
+        assert_eq!(down.probes(), 1);
+        // 强制刷新要的就是这台机器现在的样子,探不到照旧报错
+        assert!(ensure_scripted(&service, &down, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_ensure_probes_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = RemoteInventoryService::new(manager_with_server(tmp.path()).await);
+        let host = Arc::new(ScriptedHost {
+            delay: Duration::from_millis(50),
+            ..ScriptedHost::new(sample_stdout("/home/a", ""))
+        });
+
+        let calls = (0..6).map(|_| ensure_scripted(&service, &host, false));
+        for inv in futures_util::future::join_all(calls).await {
+            assert_eq!(inv.unwrap().home, "/home/a");
+        }
+        assert_eq!(host.probes(), 1);
+
+        // 装卸后同样只重探一次
+        service.invalidate("s1").await;
+        let calls = (0..6).map(|_| ensure_scripted(&service, &host, false));
+        futures_util::future::join_all(calls).await;
+        assert_eq!(host.probes(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_reprobe_keeps_inventory_dirty_until_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = RemoteInventoryService::new(manager_with_server(tmp.path()).await);
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+
+        service.invalidate("s1").await;
+        host.respond(Err("probe failed"), None);
+        assert!(ensure_scripted(&service, &host, false).await.is_err());
+        assert!(service.is_dirty_for_test("s1"));
+
+        host.respond(Ok(sample_stdout("/home/new", "")), None);
+        assert_eq!(
+            ensure_scripted(&service, &host, false).await.unwrap().home,
+            "/home/new"
+        );
+        assert!(!service.is_dirty_for_test("s1"));
+        assert_eq!(
+            ensure_scripted(&service, &host, false).await.unwrap().home,
+            "/home/new"
+        );
+        assert_eq!(host.probes(), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_waits_for_invalidated_probe_instead_of_old_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = Arc::new(RemoteInventoryService::new(
+            manager_with_server(tmp.path()).await,
+        ));
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        service.invalidate("s1").await;
+        let pause = Arc::new(ProbePause::default());
+        host.respond(Ok(sample_stdout("/home/new", "")), Some(Arc::clone(&pause)));
+        let first = spawn_ensure(&service, &host);
+        wait_for_probe(&pause).await;
+
+        let follower = ensure_scripted(&service, &host, false);
+        tokio::pin!(follower);
+        assert!(matches!(
+            futures_util::poll!(&mut follower),
+            std::task::Poll::Pending
+        ));
+
+        pause.resume.notify_one();
+        assert_eq!(first.await.unwrap().unwrap().home, "/home/new");
+        assert_eq!(follower.await.unwrap().home, "/home/new");
+        assert_eq!(host.probes(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_during_probe_requires_a_new_generation_before_returning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager_with_server(tmp.path()).await;
+        let service = Arc::new(RemoteInventoryService::new(Arc::clone(&manager)));
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        service.invalidate("s1").await;
+
+        let pause = Arc::new(ProbePause::default());
+        host.respond(
+            Ok(sample_stdout("/home/before-second-install", "")),
+            Some(Arc::clone(&pause)),
+        );
+        host.respond(Ok(sample_stdout("/home/current", "")), None);
+        let probing = spawn_ensure(&service, &host);
+        wait_for_probe(&pause).await;
+        service.invalidate("s1").await;
+        pause.resume.notify_one();
+
+        assert_eq!(probing.await.unwrap().unwrap().home, "/home/current");
+        assert!(!service.is_dirty_for_test("s1"));
+        assert_eq!(
+            manager.list_servers().await[0]
+                .inventory
+                .as_ref()
+                .unwrap()
+                .home,
+            "/home/current"
+        );
+        assert_eq!(
+            ensure_scripted(&service, &host, false).await.unwrap().home,
+            "/home/current"
+        );
+        assert_eq!(host.probes(), 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_invalidation_is_bounded_and_leaves_inventory_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager_with_server(tmp.path()).await;
+        let service = Arc::new(RemoteInventoryService::new(Arc::clone(&manager)));
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        service.invalidate("s1").await;
+
+        let pauses: Vec<_> = (0..3).map(|_| Arc::new(ProbePause::default())).collect();
+        for pause in &pauses {
+            host.respond(
+                Ok(sample_stdout("/home/not-current", "")),
+                Some(Arc::clone(pause)),
+            );
+        }
+        let probing = spawn_ensure(&service, &host);
+        for pause in &pauses {
+            wait_for_probe(pause).await;
+            service.invalidate("s1").await;
+            pause.resume.notify_one();
+        }
+
+        let error = probing.await.unwrap().unwrap_err();
+        assert!(error.contains("组件状态持续变化"), "{error}");
+        assert!(service.is_dirty_for_test("s1"));
+        assert_eq!(host.probes(), 4);
+        assert_eq!(
+            manager.list_servers().await[0]
+                .inventory
+                .as_ref()
+                .unwrap()
+                .home,
+            "/home/old"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_forced_probe_does_not_restore_the_pre_refresh_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = RemoteInventoryService::new(manager_with_server(tmp.path()).await);
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        host.respond(Err("forced probe failed"), None);
+        assert!(ensure_scripted(&service, &host, true).await.is_err());
+        assert!(service.is_dirty_for_test("s1"));
+
+        host.respond(Ok(sample_stdout("/home/new", "")), None);
+        assert_eq!(
+            ensure_scripted(&service, &host, false).await.unwrap().home,
+            "/home/new"
+        );
+        assert_eq!(host.probes(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_reprobe_keeps_invalidation_for_the_next_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = Arc::new(RemoteInventoryService::new(
+            manager_with_server(tmp.path()).await,
+        ));
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/old", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        service.invalidate("s1").await;
+        let pause = Arc::new(ProbePause::default());
+        host.respond(
+            Ok(sample_stdout("/home/aborted", "")),
+            Some(Arc::clone(&pause)),
+        );
+        let probing = spawn_ensure(&service, &host);
+        wait_for_probe(&pause).await;
+        probing.abort();
+        assert!(probing.await.unwrap_err().is_cancelled());
+        assert!(service.is_dirty_for_test("s1"));
+
+        host.respond(Ok(sample_stdout("/home/new", "")), None);
+        assert_eq!(
+            ensure_scripted(&service, &host, false).await.unwrap().home,
+            "/home/new"
+        );
+        assert_eq!(host.probes(), 3);
+    }
+
+    #[tokio::test]
+    async fn cached_inventory_rechecks_host_username_and_path_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager_with_server(tmp.path()).await;
+        let service = RemoteInventoryService::new(Arc::clone(&manager));
+        let host = Arc::new(ScriptedHost::new(sample_stdout("/home/current", "")));
+        ensure_scripted(&service, &host, false).await.unwrap();
+        for (index, field) in ["host", "username", "paths"].into_iter().enumerate() {
+            let mut profile = manager.list_servers().await.into_iter().next().unwrap();
+            match field {
+                "host" => profile.host = "192.0.2.88".into(),
+                "username" => profile.username = "different-user".into(),
+                _ => {
+                    profile.path_overrides = Some(RemotePathOverrides {
+                        napcat_root: Some("/explicit/napcat".into()),
+                        ..Default::default()
+                    })
+                }
+            }
+            manager.update_server(profile, None).await.unwrap();
+            ensure_scripted(&service, &host, false).await.unwrap();
+            assert_eq!(host.probes(), index + 2);
+        }
+    }
+
+    #[test]
+    fn windows_selection_checks_each_path_and_preserves_explicit_external_roots() {
+        use ncd_host::{HostPath, Os};
+        let root =
+            HostPath::from_windows(r"C:\ProgramData\NapCatQQ Desktop\remote\users\new-owner");
+        let host = ScriptedHost {
+            windows_root: Some(root.render_for(Os::Windows)),
+            ..Default::default()
+        };
+        let home = r"C:\Users\owner";
+        let mut inventory = RemoteInventory::empty(home, chrono::Utc::now().to_rfc3339());
+        inventory.selected = RemoteSelectedPaths {
+            home: home.into(),
+            qq_install_base: Some(root.join("components/QQ").render_for(Os::Windows)),
+            napcat_root: Some(root.join("components/NapCatQQ").render_for(Os::Windows)),
+            snowluma_dir: Some(root.join("components/SnowLuma").render_for(Os::Windows)),
+            snowluma_workspace: Some(root.join("components/SnowLuma").render_for(Os::Windows)),
+            ncd_watch_root: Some(root.join("ncd-watch").render_for(Os::Windows)),
+            ..Default::default()
+        };
+        assert!(inventory_matches_target(&inventory, &host, None));
+        let overrides = RemotePathOverrides {
+            qq_install_base: Some(r"C:\Program Files\Tencent\QQ".into()),
+            napcat_root: Some(r"D:\Bots\NapCatQQ".into()),
+            ..Default::default()
+        };
+        inventory.selected.qq_install_base = overrides.qq_install_base.clone();
+        inventory.selected.qq_bin = Some(r"C:\Program Files\Tencent\QQ\versions\9.9\QQ.exe".into());
+        inventory.selected.napcat_root = overrides.napcat_root.clone();
+        assert!(inventory_matches_target(
+            &inventory,
+            &host,
+            Some(&overrides)
+        ));
+        assert!(!inventory_matches_target(&inventory, &host, None));
+        inventory.selected.snowluma_dir = Some(r"C:\old-owner\SnowLuma".into());
+        assert!(!inventory_matches_target(
+            &inventory,
+            &host,
+            Some(&overrides)
+        ));
+        inventory.selected.snowluma_dir = Some(
+            root.join("components/SnowLuma/../old")
+                .render_for(Os::Windows),
+        );
+        assert!(!inventory_matches_target(
+            &inventory,
+            &host,
+            Some(&overrides)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inventory_service_local_host_has_no_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = RemoteInventoryService::new(Arc::new(ServerManager::new(
+            tmp.path(),
+            Arc::new(ncd_server::InMemoryCredentialStore::default()),
+        )));
+        let host = ScriptedHost::default();
+        let (probe, selected) = service.host_probe("local", &host).await.unwrap();
+        assert!(probe.home.is_none());
+        assert!(selected.is_none());
+    }
+}

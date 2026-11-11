@@ -1,0 +1,642 @@
+//! 按 host / 布局 / release 快照实例化 Component
+//!
+//! 从 Layer4 command 下沉。DesktopSelf 的产品版本由调用方传入（来自 tauri 构建注入）。
+
+use std::path::Path;
+use std::sync::Arc;
+
+use ncd_appframework::{AppComponentSpec, AppFrameworkRegistry};
+use ncd_component::{
+    Component, ComponentId, DesktopSelfComponent, GitComponent, MANAGED_QQ_DIR_NAME,
+    MINGIT_DEFAULT_VERSION, NapCatComponent, NcdWatchComponent, NoVncComponent, NodeJsComponent,
+    QQComponent, RedisComponent, SnowLumaComponent, UV_DEFAULT_VERSION, UvComponent,
+    VcRedistComponent, WindowsAgentComponent, ncd_watch_asset_name, ncd_watch_release_download_url,
+    ncd_watch_release_download_url_for_tag,
+};
+use ncd_domain::RemoteSelectedPaths;
+use ncd_domain::SnowLumaLinuxPackage;
+use ncd_domain::desktop_default_install_paths;
+use ncd_domain::release_snapshot::ReleaseSnapshot;
+use ncd_domain::require_qq_install_base;
+use ncd_domain::snowluma_install_candidates;
+use ncd_host::{Arch, Host, HostPath, Locality, Os};
+
+use crate::components::action_policy::{
+    RemoteLayout, asset_sha256, data_root_to_host_path, infer_snowluma_linux_package,
+    is_bundled_snowluma_node, require_remote_home, snowluma_github_release_tag,
+    snowluma_linux_release_asset, snowluma_windows_release_asset,
+};
+use crate::components::graph::catalog_version_reqs_for;
+
+/// 实例化 Component 时的上下文（避免过长参数列表）。
+pub struct BuildComponentCtx<'a> {
+    pub data_root: &'a Path,
+    pub remote_windows_root: Option<&'a str>,
+    pub host: &'a dyn Host,
+    pub remote_home: Option<&'a str>,
+    pub layout: RemoteLayout,
+    pub snapshot: Option<&'a ReleaseSnapshot>,
+    pub local_snowluma_version: Option<&'a str>,
+    pub desktop_product_version: &'a str,
+    /// 库存选中路径；缺字段时回落桌面默认路径
+    pub selected: Option<&'a RemoteSelectedPaths>,
+    /// 安装/更新时显式选择的 Linux 包；None 则按库存推断
+    pub snowluma_linux_package: Option<SnowLumaLinuxPackage>,
+    /// 本机 SnowLuma Node 覆盖路径；远端路径走 selected.node_bin
+    pub snowluma_node_path: Option<&'a str>,
+    /// 应用端组件（Karin 等）按实例安装，必须带实例目录 / 端口；协议组件忽略
+    pub app_component: Option<&'a AppComponentHint>,
+    /// 应用端组件从这里找适配器；Node 的版本约束也要把应用端算进来
+    pub registry: &'a AppFrameworkRegistry,
+}
+
+/// 应用端组件的实例级输入（组件页 catalog 不列应用端，只有应用端页面会填）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppComponentHint {
+    pub instance_id: String,
+    pub install_dir: HostPath,
+    pub port: u16,
+    pub npm_registry: Option<String>,
+    pub pypi_index: Option<String>,
+    /// 指定安装的版本；None = 最新正式版。装完的真实版本由 detect 回读
+    pub install_version: Option<String>,
+    pub install_renderer: bool,
+    pub adopt_existing: bool,
+    /// 用户名密码类 WebUI 首启前种入的账号；编排层从 SecretStore 取，只在内存里过
+    pub webui_username: Option<String>,
+    pub webui_password: Option<String>,
+}
+
+/// 把 component_id 实例化成具体 Component
+pub fn build_component_for_host(
+    id: ComponentId,
+    ctx: &BuildComponentCtx<'_>,
+) -> Result<Arc<dyn Component>, String> {
+    let remote_windows = ctx.host.os() == Os::Windows && ctx.host.locality() == Locality::Remote;
+    let data_root_host = if remote_windows {
+        let root = ctx
+            .remote_windows_root
+            .filter(|root| !root.trim().is_empty())
+            .ok_or_else(|| "无法解析远端 Windows 受管目录，请先测试主机连接".to_string())?;
+        let path = HostPath::from_windows(root);
+        if !path.is_absolute() {
+            return Err("远端 Windows 受管目录必须为绝对路径".into());
+        }
+        path
+    } else {
+        data_root_to_host_path(ctx.data_root, ctx.host.os())
+    };
+    let data_paths = crate::DataPaths::new(ctx.data_root);
+    let target_staging = if remote_windows {
+        data_root_host.join("tmp")
+    } else {
+        data_root_to_host_path(
+            &data_paths.download_cache_dir().join("staging"),
+            ctx.host.os(),
+        )
+    };
+    let local_linux = ctx.host.os() == Os::Linux && ctx.host.locality() == Locality::Local;
+    let layout = ctx.layout;
+    let remote_home = ctx.remote_home;
+    let snapshot = ctx.snapshot;
+    let local_snowluma_version = ctx.local_snowluma_version;
+
+    let resolve_napcat_base = || -> Result<HostPath, String> {
+        if local_linux {
+            return Ok(data_root_host.join("components"));
+        }
+        if let Some(sel) = ctx.selected {
+            if let Ok(base) = require_qq_install_base(sel) {
+                return Ok(HostPath::from_posix(base));
+            }
+        }
+        let home = require_remote_home(remote_home)?;
+        let defaults = desktop_default_install_paths(home)?;
+        defaults
+            .qq_install_base
+            .map(HostPath::from_posix)
+            .ok_or_else(|| format!("无法派生默认 QQ 安装根（home={home}）"))
+    };
+
+    if id.is_app_framework() {
+        return build_app_framework_component(id, ctx, &data_root_host, remote_home);
+    }
+
+    let component: Arc<dyn Component> = match id {
+        ComponentId::NapCat => {
+            if ctx.host.os() == Os::Windows {
+                let install = ctx
+                    .selected
+                    .and_then(|s| s.napcat_root.as_deref())
+                    .map(HostPath::from_windows)
+                    .unwrap_or_else(|| data_root_host.join("components").join("NapCatQQ"));
+                let mut comp = NapCatComponent::for_windows(install);
+                if let Some(sha) = snapshot
+                    .and_then(|s| s.napcat_latest.as_ref())
+                    .and_then(|info| asset_sha256(info, "NapCat.Shell.zip"))
+                {
+                    comp = comp.with_sha256(sha);
+                }
+                Arc::new(comp)
+            } else {
+                let mut comp = NapCatComponent::new(resolve_napcat_base()?)
+                    .with_sudo(matches!(layout, RemoteLayout::System));
+                if let Some(sha) = snapshot
+                    .and_then(|s| s.napcat_latest.as_ref())
+                    .and_then(|info| asset_sha256(info, "NapCat.Shell.zip"))
+                {
+                    comp = comp.with_sha256(sha);
+                }
+                Arc::new(comp)
+            }
+        }
+        ComponentId::SnowLuma => {
+            if ctx.host.os() == Os::Windows {
+                let install = ctx
+                    .selected
+                    .and_then(|s| s.snowluma_dir.as_deref())
+                    .map(HostPath::from_windows)
+                    .unwrap_or_else(|| data_root_host.join("components").join("SnowLuma"));
+                // SnowLuma 仓库已关闭：不再依赖 GitHub 快照确定版本。tag 只取本机
+                // 已装版本（boot 探测）；都没有时用无 tag 组件——detect/verify 照常
+                // 工作（未装 → not_installed），install 会在组件内拒绝缺 tag。
+                let latest = snapshot.and_then(|s| s.snowluma_latest.as_ref());
+                let tag = snowluma_github_release_tag(latest, local_snowluma_version);
+                let package = ctx
+                    .snowluma_linux_package
+                    .unwrap_or_else(|| infer_snowluma_linux_package(ctx.selected));
+                let mut comp =
+                    SnowLumaComponent::for_windows_with_package(install, tag.clone(), package);
+                if let Some(asset_tag) = (!tag.is_empty()).then_some(tag.as_str()) {
+                    let asset = snowluma_windows_release_asset(asset_tag, package);
+                    if let Some(sha) = latest.and_then(|info| asset_sha256(info, &asset)) {
+                        comp = comp.with_sha256(sha);
+                    }
+                }
+                Arc::new(comp)
+            } else {
+                let workspace =
+                    if local_linux {
+                        data_root_host.join("components")
+                    } else if let Some(ws) = ctx
+                        .selected
+                        .and_then(|s| s.snowluma_workspace.as_deref())
+                        .filter(|p| !p.is_empty())
+                    {
+                        HostPath::from_posix(ws)
+                    } else {
+                        let home = require_remote_home(remote_home)?;
+                        let defaults = desktop_default_install_paths(home)?;
+                        HostPath::from_posix(defaults.snowluma_workspace.ok_or_else(|| {
+                            format!("无法派生默认 SnowLuma workspace（home={home}）")
+                        })?)
+                    };
+                // SnowLuma 仓库已关闭：tag 只取本机已装版本；都没有时用占位 URL——
+                // detect/verify 照常工作（未装 → not_installed），install 会因
+                // 下载 URL 无效而失败，且 UI 已不再提供安装入口。
+                let latest = snapshot.and_then(|s| s.snowluma_latest.as_ref());
+                let tag = snowluma_github_release_tag(latest, local_snowluma_version);
+                let package = ctx
+                    .snowluma_linux_package
+                    .unwrap_or_else(|| infer_snowluma_linux_package(ctx.selected));
+                if !matches!(ctx.host.arch(), Arch::X86_64 | Arch::Aarch64) {
+                    return Err(format!(
+                        "SnowLuma Linux 仅提供 x86_64 / aarch64 构建，当前为 {:?}",
+                        ctx.host.arch()
+                    ));
+                }
+                let asset = snowluma_linux_release_asset(
+                    if tag.is_empty() { "unknown" } else { &tag },
+                    ctx.host.arch(),
+                    package,
+                );
+                let url =
+                    format!("https://github.com/SnowLuma/SnowLuma/releases/download/{tag}/{asset}");
+                let mut comp = SnowLumaComponent::new(workspace, url).with_package(package);
+                if local_linux {
+                    // 本机 daemon 只从数据根启动，不能让系统包或远端库存替代本机安装门禁。
+                    comp = comp.with_snowluma_dir(data_root_host.join("components/SnowLuma"));
+                } else {
+                    if let Some(dir) = ctx
+                        .selected
+                        .and_then(|s| s.snowluma_dir.as_deref())
+                        .filter(|p| !p.is_empty())
+                    {
+                        comp = comp.with_snowluma_dir(HostPath::from_posix(dir));
+                    }
+                    for dir in snowluma_linux_extra_detect_dirs(ctx.selected, remote_home) {
+                        comp = comp.with_extra_detect_dir(dir);
+                    }
+                }
+                if let Some(sha) = latest.and_then(|info| asset_sha256(info, &asset)) {
+                    comp = comp.with_sha256(sha);
+                }
+                Arc::new(comp)
+            }
+        }
+        ComponentId::Qq => {
+            if ctx.host.os() == Os::Windows {
+                // 侧装根 components/QQ(启动链路 resolve_qq_install_path 同源);
+                // 安装包缓存独立于已安装组件，失败保留可复用
+                let qq_root = ctx
+                    .selected
+                    .and_then(|s| s.qq_install_base.as_deref())
+                    .map(HostPath::from_windows)
+                    .unwrap_or_else(|| data_root_host.join("components").join(MANAGED_QQ_DIR_NAME));
+                let cache = if remote_windows {
+                    target_staging.join("qq")
+                } else {
+                    data_root_to_host_path(
+                        &data_paths.installer_cache_dir().join("qq"),
+                        ctx.host.os(),
+                    )
+                };
+                Arc::new(QQComponent::default_v3_2_25(qq_root).with_tmp_dir(cache))
+            } else {
+                Arc::new(QQComponent::default_v3_2_25(resolve_napcat_base()?))
+            }
+        }
+        ComponentId::NodeJs => {
+            // Node 自己不知道谁要它;版本约束来自这台主机上所有可能依赖 Node 的组件
+            let accept = catalog_version_reqs_for(
+                ctx.registry,
+                ComponentId::NodeJs,
+                ctx.host.os(),
+                ctx.host.locality(),
+            );
+            if ctx.host.os() == Os::Windows {
+                let install_dir = data_root_host.join("components").join("NodeJs");
+                let mut comp = NodeJsComponent::new("22.13.0", install_dir)
+                    .with_version_reqs(accept)
+                    .with_tmp_dir(target_staging.clone());
+                if let Some(bin) = nodejs_extra_detect_bin(ctx.selected) {
+                    comp = comp.with_extra_detect_bin(bin);
+                }
+                // 执行器按 AppSettings::snowluma_node_override 取值,空白已经当没设
+                if let Some(path) = ctx.snowluma_node_path {
+                    comp = comp.with_extra_detect_bin(HostPath::from_windows(path));
+                }
+                Arc::new(comp)
+            } else {
+                let install_dir = if local_linux {
+                    data_root_host.join("components/NodeJs")
+                } else {
+                    node_install_dir(ctx.selected, remote_home)?
+                };
+                let mut comp =
+                    NodeJsComponent::new("22.13.0", install_dir).with_version_reqs(accept);
+                if let Some(path) = ctx.snowluma_node_path {
+                    comp = comp.with_extra_detect_bin(HostPath::from_posix(path));
+                }
+                if let Some(bin) = nodejs_extra_detect_bin(ctx.selected) {
+                    comp = comp.with_extra_detect_bin(bin);
+                }
+                Arc::new(comp)
+            }
+        }
+        ComponentId::NoVnc => Arc::new(NoVncComponent::new()),
+        ComponentId::WindowsAgent => Arc::new(WindowsAgentComponent::bundled()),
+        ComponentId::VcRedist => {
+            // 安装包缓存目录:稳定文件名 VC_redist.x64.exe(SHA256 匹配才复用),
+            // 失败保留可复用;只在 Windows 本机生效,组件自身 check_target 拦截
+            let cache = if remote_windows {
+                target_staging.join("vcredist")
+            } else {
+                data_root_to_host_path(
+                    &data_paths.installer_cache_dir().join("vcredist"),
+                    ctx.host.os(),
+                )
+            };
+            Arc::new(VcRedistComponent::new(cache))
+        }
+        ComponentId::NcdWatch => {
+            if ctx.host.os() == Os::Windows {
+                return Ok(Arc::new(ncd_component::WindowsNcdWatchComponent));
+            }
+            let mut comp = NcdWatchComponent::new(remote_home.map(|s| s.to_string()));
+            if let Some(root) = ctx
+                .selected
+                .and_then(|s| s.ncd_watch_root.as_deref())
+                .filter(|p| !p.is_empty())
+            {
+                comp = comp.with_install_root(HostPath::from_posix(root));
+            }
+            if let Some(info) = snapshot.and_then(|s| s.ncd_watch_latest.as_ref()) {
+                let tag = if info.tag.trim().is_empty() {
+                    format!(
+                        "watch-v{}",
+                        info.version.trim().trim_start_matches(['v', 'V'])
+                    )
+                } else {
+                    info.tag.clone()
+                };
+                comp = comp
+                    .with_release_tag(tag.clone())
+                    .with_version_label(info.version.clone());
+                if let Some(asset) = ncd_watch_asset_name(&tag, ctx.host.arch()) {
+                    if let Some(sha) = asset_sha256(info, &asset) {
+                        comp = comp.with_sha256(sha);
+                    }
+                }
+                if let Some(url) = ncd_watch_release_download_url_for_tag(&tag, ctx.host.arch()) {
+                    comp = comp.with_download_url(url);
+                }
+            } else if let Some(url) = ncd_watch_release_download_url(ctx.host.arch()) {
+                comp = comp.with_download_url(url);
+            }
+            Arc::new(comp)
+        }
+        ComponentId::DesktopSelf => {
+            let ver = ctx.desktop_product_version;
+            Arc::new(DesktopSelfComponent::from_env(ver).unwrap_or_else(|_| {
+                DesktopSelfComponent::new(ver, HostPath::from_posix("NapCatQQ-Desktop"))
+            }))
+        }
+        ComponentId::Uv => {
+            let install_dir = if ctx.host.os() == Os::Windows || local_linux {
+                data_root_host.join("components").join("Uv")
+            } else {
+                let home = require_remote_home(remote_home)?;
+                UvComponent::default_remote_install_dir(home)
+            };
+            let mut component = UvComponent::new(UV_DEFAULT_VERSION, install_dir);
+            if ctx.host.os() == Os::Windows {
+                component = component.with_tmp_dir(target_staging.clone());
+            }
+            Arc::new(component)
+        }
+        // Linux 上 git 是系统包，组件目录只是占位
+        ComponentId::Git => Arc::new(GitComponent::new(
+            MINGIT_DEFAULT_VERSION,
+            data_root_host.join("components").join("Git"),
+        )),
+        ComponentId::Redis => {
+            let install_dir = if ctx.host.os() == Os::Windows || local_linux {
+                data_root_host.join("components").join("Redis")
+            } else {
+                RedisComponent::default_remote_install_dir(require_remote_home(remote_home)?)
+            };
+            Arc::new(RedisComponent::new(install_dir))
+        }
+        _ => {
+            return Err(format!("组件工厂未覆盖: {}", id.as_str()));
+        }
+    };
+    Ok(component)
+}
+
+fn build_app_framework_component(
+    id: ComponentId,
+    ctx: &BuildComponentCtx<'_>,
+    data_root_host: &HostPath,
+    remote_home: Option<&str>,
+) -> Result<Arc<dyn Component>, String> {
+    let hint = ctx
+        .app_component
+        .ok_or_else(|| "应用端组件按实例安装，请从「应用端」页面操作".to_string())?;
+    let adapter = ctx
+        .registry
+        .by_component_id(id.as_str())
+        .ok_or_else(|| format!("应用端框架未注册: {}", id.as_str()))?;
+    // 工具链取值口径与其他远端组件一致：用户 path_overrides 优先，其次桌面端管理的
+    // 组件落点（NodeJs / Uv 组件同一目录），都没有再由框架组件回退到实例标记 / PATH。
+    // 两条都算出来交给适配器，Node 系只用 node_bin，Python 系只用 uv_bin。
+    let local = ctx.host.locality() == Locality::Local;
+    let node_bin = if ctx.host.os() == Os::Windows || local {
+        Some(NodeJsComponent::node_binary_path_for_os(
+            &data_root_host.join("components").join("NodeJs"),
+            ctx.host.os(),
+        ))
+    } else {
+        nodejs_extra_detect_bin(ctx.selected).or_else(|| {
+            node_install_dir(ctx.selected, remote_home)
+                .ok()
+                .map(|dir| NodeJsComponent::node_binary_path_for_os(&dir, ctx.host.os()))
+        })
+    };
+    let uv_bin = if ctx.host.os() == Os::Windows || local {
+        Some(UvComponent::uv_binary_path_for_os(
+            &data_root_host.join("components").join("Uv"),
+            ctx.host.os(),
+        ))
+    } else {
+        remote_home.map(|home| {
+            UvComponent::uv_binary_path_for_os(
+                &UvComponent::default_remote_install_dir(home),
+                ctx.host.os(),
+            )
+        })
+    };
+    // git 在 Linux 上是系统包，只有 Windows 有托管落点；redis 两边都有，框架组件用前自己核对在不在
+    let git_bin = GitComponent::managed_binary_path_for_os(
+        &data_root_host.join("components").join("Git"),
+        ctx.host.os(),
+    );
+    let redis_bin = if ctx.host.os() == Os::Windows || local {
+        Some(RedisComponent::managed_binary_path_for_os(
+            &data_root_host.join("components").join("Redis"),
+            ctx.host.os(),
+        ))
+    } else {
+        remote_home.map(|home| {
+            RedisComponent::managed_binary_path_for_os(
+                &RedisComponent::default_remote_install_dir(home),
+                ctx.host.os(),
+            )
+        })
+    };
+    Ok(adapter.component(&AppComponentSpec {
+        install_dir: hint.install_dir.clone(),
+        port: hint.port,
+        node_bin,
+        uv_bin,
+        git_bin,
+        redis_bin,
+        npm_registry: hint.npm_registry.clone(),
+        pypi_index: hint.pypi_index.clone(),
+        install_version: hint.install_version.clone(),
+        install_renderer: hint.install_renderer,
+        adopt_existing: hint.adopt_existing,
+        instance_id: hint.instance_id.clone(),
+        webui_username: hint.webui_username.clone(),
+        webui_password: hint.webui_password.clone(),
+    }))
+}
+
+/// Linux 远端 detect 在默认 workspace 之外再看这些目录（不扫盘）。
+fn snowluma_linux_extra_detect_dirs(
+    selected: Option<&RemoteSelectedPaths>,
+    remote_home: Option<&str>,
+) -> Vec<HostPath> {
+    let mut dirs = Vec::new();
+    if let Some(home) = remote_home.filter(|s| !s.is_empty()) {
+        for dir in snowluma_install_candidates(home) {
+            dirs.push(HostPath::from_posix(dir));
+        }
+    } else {
+        dirs.push(HostPath::from_posix(ncd_domain::SYSTEM_SNOWLUMA_DIR));
+    }
+    if let Some(dir) = selected
+        .and_then(|s| s.snowluma_dir.as_deref())
+        .filter(|p| !p.is_empty())
+    {
+        dirs.push(HostPath::from_posix(dir));
+    }
+    dirs
+}
+
+/// 可复用 Node 的额外探测点：用户覆盖 / 便携安装。不含 SnowLuma 完整包自带的 `{dir}/node`。
+fn nodejs_extra_detect_bin(selected: Option<&RemoteSelectedPaths>) -> Option<HostPath> {
+    let sel = selected?;
+    let bin = sel.node_bin.as_deref().filter(|s| !s.is_empty())?;
+    if is_bundled_snowluma_node(bin, sel.snowluma_dir.as_deref()) {
+        return None;
+    }
+    Some(HostPath::from_posix(bin))
+}
+
+fn node_install_dir(
+    selected: Option<&RemoteSelectedPaths>,
+    remote_home: Option<&str>,
+) -> Result<HostPath, String> {
+    if let Some(bin) = selected.and_then(|s| s.node_bin.as_deref()) {
+        let n = bin.replace('\\', "/");
+        if n.contains("/snowluma-remote/") || n.contains("/Napcat/usr/node/") {
+            if let Some(dir) = n.strip_suffix("/bin/node") {
+                return Ok(HostPath::from_posix(dir));
+            }
+        }
+    }
+    let home = require_remote_home(remote_home)?;
+    let defaults = desktop_default_install_paths(home)?;
+    let ws = defaults
+        .snowluma_workspace
+        .ok_or_else(|| format!("无法派生默认 Node 安装目录（home={home}）"))?;
+    Ok(HostPath::from_posix(ncd_domain::join_under(&ws, "node")))
+}
+
+#[cfg(test)]
+mod selected_path_tests {
+    use super::{node_install_dir, nodejs_extra_detect_bin, snowluma_linux_extra_detect_dirs};
+    use ncd_domain::RemoteSelectedPaths;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_snowluma_gate_requires_the_managed_runtime() {
+        use super::{BuildComponentCtx, build_component_for_host};
+        use crate::components::action_policy::RemoteLayout;
+        use ncd_appframework::AppFrameworkRegistry;
+        use ncd_component::{ComponentId, DetectOutcome};
+        use ncd_host::local::LocalLinuxHost;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let data_root = workspace.path().join("desktop");
+        let external = workspace.path().join("external-snowluma");
+        for root in [&external, &data_root.join("components/SnowLuma")] {
+            std::fs::create_dir_all(root.join("client")).unwrap();
+            std::fs::create_dir_all(root.join("native")).unwrap();
+            std::fs::write(root.join("index.mjs"), "").unwrap();
+            std::fs::write(root.join("node"), "").unwrap();
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"name":"@snowluma/runtime","version":"1.0.0"}"#,
+            )
+            .unwrap();
+        }
+        let host = LocalLinuxHost::new();
+        let registry = AppFrameworkRegistry::with_builtin();
+        let selected = RemoteSelectedPaths {
+            snowluma_dir: Some(external.to_string_lossy().into_owned()),
+            ..RemoteSelectedPaths::default()
+        };
+        let component = build_component_for_host(
+            ComponentId::SnowLuma,
+            &BuildComponentCtx {
+                data_root: &data_root,
+                remote_windows_root: None,
+                host: &host,
+                remote_home: None,
+                layout: RemoteLayout::Rootless,
+                snapshot: None,
+                local_snowluma_version: Some("1.0.0"),
+                desktop_product_version: "1.0.0",
+                selected: Some(&selected),
+                snowluma_linux_package: None,
+                snowluma_node_path: None,
+                app_component: None,
+                registry: &registry,
+            },
+        )
+        .unwrap();
+        let detected = component.detect_outcome(&host).await.unwrap();
+        assert!(
+            matches!(detected, DetectOutcome::Installed(version) if version.source.contains("/desktop/components/SnowLuma/"))
+        );
+        std::fs::remove_dir_all(data_root.join("components/SnowLuma")).unwrap();
+        assert_eq!(
+            component.detect_outcome(&host).await.unwrap(),
+            DetectOutcome::NotInstalled
+        );
+    }
+
+    #[test]
+    fn node_install_dir_uses_portable_prefix() {
+        let selected = RemoteSelectedPaths {
+            home: "/home/u".into(),
+            node_bin: Some("/home/u/snowluma-remote/workspace/node/bin/node".into()),
+            needs_sudo: false,
+            ..RemoteSelectedPaths::default()
+        };
+        let dir = node_install_dir(Some(&selected), Some("/home/u")).unwrap();
+        assert_eq!(dir.as_posix(), "/home/u/snowluma-remote/workspace/node");
+    }
+
+    #[test]
+    fn node_install_dir_ignores_system_path_node() {
+        let selected = RemoteSelectedPaths {
+            home: "/home/u".into(),
+            node_bin: Some("/usr/bin/node".into()),
+            needs_sudo: false,
+            ..RemoteSelectedPaths::default()
+        };
+        let dir = node_install_dir(Some(&selected), Some("/home/u")).unwrap();
+        assert_eq!(dir.as_posix(), "/home/u/snowluma-remote/workspace/node");
+    }
+
+    #[test]
+    fn snowluma_extra_detect_includes_opt_and_home_layouts() {
+        let dirs = snowluma_linux_extra_detect_dirs(None, Some("/root"));
+        let posix: Vec<_> = dirs.iter().map(|p| p.as_posix().to_string()).collect();
+        assert!(posix.contains(&"/opt/snowluma".to_string()));
+        assert!(posix.contains(&"/root/snowluma-remote/workspace/snowluma".to_string()));
+        assert!(posix.contains(&"/root/Napcat/snowluma-workspace/snowluma".to_string()));
+    }
+
+    #[test]
+    fn extra_detect_skips_snowluma_bundled_node() {
+        let full = RemoteSelectedPaths {
+            home: "/root".into(),
+            snowluma_dir: Some("/opt/snowluma".into()),
+            node_bin: Some("/opt/snowluma/node".into()),
+            needs_sudo: false,
+            ..RemoteSelectedPaths::default()
+        };
+        assert!(nodejs_extra_detect_bin(Some(&full)).is_none());
+    }
+
+    #[test]
+    fn extra_detect_keeps_portable_node() {
+        let lite = RemoteSelectedPaths {
+            home: "/home/u".into(),
+            snowluma_dir: Some("/home/u/snowluma-remote/workspace/snowluma".into()),
+            node_bin: Some("/home/u/snowluma-remote/workspace/node/bin/node".into()),
+            needs_sudo: false,
+            ..RemoteSelectedPaths::default()
+        };
+        let bin = nodejs_extra_detect_bin(Some(&lite)).unwrap();
+        assert_eq!(
+            bin.as_posix(),
+            "/home/u/snowluma-remote/workspace/node/bin/node"
+        );
+    }
+}

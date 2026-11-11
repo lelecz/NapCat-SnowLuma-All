@@ -1,0 +1,295 @@
+# 只负责 Windows MSI 打包与布局断言。质量门禁在 ci.yml；发版编排在 release.yml。
+
+name: Build MSI Package
+
+on:
+  workflow_call:
+    inputs:
+      warm_cache:
+        description: "只在 main 预热依赖缓存，不打包或上传制品"
+        required: false
+        default: false
+        type: boolean
+      version:
+        description: "版本号，支持 1.7.28 或 v1.7.28；为空时从 tauri.conf.json / package.json 读取"
+        required: false
+        default: ""
+        type: string
+      git_ref:
+        description: "构建所基于的 Git ref"
+        required: false
+        default: ""
+        type: string
+      upload_artifact_name:
+        description: "MSI 制品名；为空时自动按版本生成"
+        required: false
+        default: ""
+        type: string
+    outputs:
+      version:
+        description: "带 v 前缀的版本号"
+        value: ${{ jobs.build.outputs.version }}
+      version_plain:
+        description: "不带 v 前缀的版本号"
+        value: ${{ jobs.build.outputs.version_plain }}
+      artifact_name:
+        description: "上传的 MSI 制品名"
+        value: ${{ jobs.build.outputs.artifact_name }}
+      msi_file_name:
+        description: "MSI 文件名"
+        value: ${{ jobs.build.outputs.msi_file_name }}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，支持 1.7.28 或 v1.7.28；为空时从 tauri.conf.json / package.json 读取"
+        required: false
+        default: ""
+        type: string
+      git_ref:
+        description: "构建所基于的 Git ref；为空时使用当前触发 ref"
+        required: false
+        default: ""
+        type: string
+      upload_artifact_name:
+        description: "MSI 制品名；为空时自动按版本生成"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-msi-${{ inputs.warm_cache && 'cache' || 'package' }}-${{ inputs.git_ref || github.ref }}-${{ inputs.version || 'auto' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.resolve_version.outputs.VERSION }}
+      version_plain: ${{ steps.resolve_version.outputs.VERSION_PLAIN }}
+      artifact_name: ${{ steps.resolve_artifact.outputs.ARTIFACT_NAME }}
+      msi_file_name: ${{ steps.collect_msi.outputs.MSI_FILE_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Exclude build dirs from Defender scan
+        shell: pwsh
+        run: |
+          $paths = @($env:CARGO_HOME, $env:RUSTUP_HOME, "$env:USERPROFILE\.rustup", "$env:GITHUB_WORKSPACE\target") | Where-Object { $_ }
+          foreach ($p in $paths) { Add-MpPreference -ExclusionPath $p }
+
+      # workspace 产物包含编译期代理密钥，不能进入 fork PR 可读的 Actions 缓存。
+      # 仅缓存第三方依赖；新命名空间也不恢复旧的完整 target 缓存。
+      - name: Cache Cargo dependencies
+        id: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rust-msi-deps-v3
+          # rust-cache 未计入虚拟 workspace 根清单，需显式跟踪 release profile。
+          shared-key: build-msi-windows-${{ hashFiles('Cargo.toml') }}
+          workspaces: ". -> target"
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          cache-on-failure: "false"
+          save-if: ${{ inputs.warm_cache && github.ref == 'refs/heads/main' }}
+
+      - name: Verify dependency-only cache
+        run: node scripts/ci-release-cache.mjs check
+
+      - name: Install frontend deps
+        if: ${{ !inputs.warm_cache || steps.cache.outputs.cache-hit != 'true' }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve version
+        id: resolve_version
+        shell: pwsh
+        run: |
+          $inputVersion = "${{ inputs.version }}"
+
+          if ($inputVersion) {
+            $version = $inputVersion
+          } elseif (Test-Path "src-tauri/tauri.conf.json") {
+            $config = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+            $version = $config.version
+          } elseif (Test-Path "package.json") {
+            $package = Get-Content "package.json" -Raw | ConvertFrom-Json
+            $version = $package.version
+          } else {
+            Write-Error "无法从输入、src-tauri/tauri.conf.json 或 package.json 解析版本号"
+            exit 1
+          }
+
+          if (-not $version) {
+            Write-Error "解析出的版本号为空"
+            exit 1
+          }
+
+          if (-not ($version -like "v*")) {
+            $version = "v$version"
+          }
+
+          $plain = $version -replace "^v", ""
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "VERSION_PLAIN=$plain" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved version: $version"
+
+      - name: Check version metadata
+        run: pnpm run check:versions
+
+      # 中转代理编译期注入(ncd-network/build.rs)。
+      # 仓库 secrets 历史名是 NCD_PROXY_SHARED_SECRET;build.rs 同时认 NCD_PROXY_SECRET。
+      # BASE_URL 非机密,与 .env.example 一致;若以后要换域名可改成 vars.NCD_PROXY_BASE_URL。
+      - name: Check proxy build env
+        if: ${{ !inputs.warm_cache }}
+        shell: pwsh
+        env:
+          NCD_PROXY_BASE_URL: ${{ vars.NCD_PROXY_BASE_URL || 'https://napcat-desktop.aqiaoyo.top' }}
+          NCD_PROXY_SECRET: ${{ secrets.NCD_PROXY_SECRET }}
+          NCD_PROXY_SHARED_SECRET: ${{ secrets.NCD_PROXY_SHARED_SECRET }}
+        run: |
+          $base = $env:NCD_PROXY_BASE_URL
+          $hasSecret = -not [string]::IsNullOrWhiteSpace($env:NCD_PROXY_SECRET)
+          $hasLegacy = -not [string]::IsNullOrWhiteSpace($env:NCD_PROXY_SHARED_SECRET)
+          Write-Host "NCD_PROXY_BASE_URL set=$([bool]$base) value_len=$($base.Length)"
+          Write-Host "NCD_PROXY_SECRET present=$hasSecret"
+          Write-Host "NCD_PROXY_SHARED_SECRET present=$hasLegacy"
+          if (-not $base -or (-not $hasSecret -and -not $hasLegacy)) {
+            Write-Warning "Proxy env incomplete: MSI will fall back to GitHub direct (proxy_configured=false)"
+          }
+
+      - name: Build Tauri MSI
+        if: ${{ !inputs.warm_cache || steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          NCD_PROXY_BASE_URL: ${{ vars.NCD_PROXY_BASE_URL || 'https://napcat-desktop.aqiaoyo.top' }}
+          # 首选新名;空则 build.rs 回退 SHARED_SECRET
+          NCD_PROXY_SECRET: ${{ secrets.NCD_PROXY_SECRET }}
+          NCD_PROXY_SHARED_SECRET: ${{ secrets.NCD_PROXY_SHARED_SECRET }}
+        run: pnpm run tauri:build ${{ inputs.warm_cache && '--no-bundle' || '--bundles msi' }} -- --locked
+
+      # Tauri WiX 中间产物名：`{product}_{ver}_{arch}_{lang}.msi`
+      # 例如 `NapCatQQ Desktop_3.1.1_x64_zh-CN.msi`（language=zh-CN 时）。
+      # 对外/自更新仍固定：`NapCatQQ-Desktop-{ver}-x64.msi` + 别名 `NapCatQQ-Desktop-x64.msi`
+      # （desktop_update / release-notes 认这两个名字，不要把 zh-CN 写进 Release 资产名）。
+      - name: Collect MSI output
+        if: ${{ !inputs.warm_cache }}
+        id: collect_msi
+        shell: pwsh
+        run: |
+          $bundleRoot = "target/release/bundle"
+          $versionPlain = "${{ steps.resolve_version.outputs.VERSION_PLAIN }}"
+          $preferredLang = "zh-CN"
+
+          $msiFiles = @(Get-ChildItem -Path $bundleRoot -Filter "*.msi" -File -Recurse -ErrorAction SilentlyContinue)
+          if (-not $msiFiles -or $msiFiles.Count -eq 0) {
+            Write-Error "未在 $bundleRoot 下找到 MSI 输出"
+            exit 1
+          }
+
+          Write-Host "Found MSI candidates:"
+          $msiFiles | Sort-Object LastWriteTime -Descending | ForEach-Object {
+            Write-Host ("  {0}  ({1} bytes, {2})" -f $_.FullName, $_.Length, $_.LastWriteTime)
+          }
+
+          # 1) 优先当前配置语言后缀（*_zh-CN.msi）
+          # 2) 再优先文件名含版本号
+          # 3) 最后按 mtime 取最新
+          $langSuffix = "_" + $preferredLang + ".msi"
+          $byLang = @($msiFiles | Where-Object { $_.Name.EndsWith($langSuffix, [System.StringComparison]::OrdinalIgnoreCase) })
+          $pool = if ($byLang.Count -gt 0) { $byLang } else { $msiFiles }
+
+          $byVersion = @($pool | Where-Object {
+            $_.Name -like ("*" + $versionPlain + "*")
+          })
+          $pool = if ($byVersion.Count -gt 0) { $byVersion } else { $pool }
+
+          $primary = $pool | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $primary) {
+            Write-Error "无法从候选 MSI 中选出主产物"
+            exit 1
+          }
+
+          if ($byLang.Count -eq 0) {
+            Write-Warning "未找到 *$langSuffix；回退到其它 MSI（当前 wix.language 应为 $preferredLang）: $($primary.Name)"
+          } else {
+            Write-Host "Selected preferred language MSI: $($primary.Name)"
+          }
+
+          $outDir = "release-assets"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          $expectedName = "NapCatQQ-Desktop-${versionPlain}-x64.msi"
+          $expectedPath = Join-Path $outDir $expectedName
+          Copy-Item -LiteralPath $primary.FullName -Destination $expectedPath -Force
+
+          $latestAlias = Join-Path $outDir "NapCatQQ-Desktop-x64.msi"
+          Copy-Item -LiteralPath $primary.FullName -Destination $latestAlias -Force
+
+          # 自更新走 GitHub Release MSI，不收集 latest.json / .sig
+
+          "MSI_FILE_NAME=$expectedName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "MSI_SOURCE_NAME=$($primary.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Collected MSI source: $($primary.FullName)"
+          Write-Host "Collected MSI public: $expectedPath"
+          Write-Host "Collected MSI alias:  $latestAlias"
+          Get-ChildItem $outDir | ForEach-Object { Write-Host ("  asset: {0} ({1} bytes)" -f $_.Name, $_.Length) }
+
+      - name: Assert MSI UpgradeCode and layout
+        if: ${{ !inputs.warm_cache }}
+        shell: pwsh
+        run: |
+          $msi = Join-Path "release-assets" "${{ steps.collect_msi.outputs.MSI_FILE_NAME }}"
+          if (-not (Test-Path $msi)) {
+            Write-Error "MSI not found for assert: $msi"
+            exit 1
+          }
+          & powershell -NoProfile -ExecutionPolicy Bypass -File "scripts/assert-msi-layout.ps1" -MsiPath $msi
+
+      - name: Resolve artifact name
+        if: ${{ !inputs.warm_cache }}
+        id: resolve_artifact
+        shell: pwsh
+        run: |
+          $artifactName = "${{ inputs.upload_artifact_name }}"
+          if (-not $artifactName) {
+            $artifactName = "windows-msi-${{ steps.resolve_version.outputs.VERSION_PLAIN }}"
+          }
+          "ARTIFACT_NAME=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload MSI artifact
+        if: ${{ !inputs.warm_cache }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve_artifact.outputs.ARTIFACT_NAME }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: release-assets/*
+
+      # 不仅依赖缓存 action 的 post 清理；删除失败就令 job 失败，禁止保存缓存。
+      # MSI 已复制到 release-assets 并上传，此时可移除 target 中的本仓库产物。
+      - name: Remove workspace artifacts before caching
+        run: node scripts/ci-release-cache.mjs clean

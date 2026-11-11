@@ -1,0 +1,173 @@
+// Docker 容器 / 状态的展示派生纯函数。零 React / 零 tauri 依赖。
+
+import type {
+    ContainerInfo,
+    ContainerAction,
+    ContainerState,
+    DockerFlavor,
+    DockerStatus,
+    ImageInfo,
+} from '../../ipc/types';
+
+/// 容器状态徽章:给 UI 一个语义色 + 中文标签。color 用中性语义名,
+/// 具体映射到 Fluent / Tailwind 色由组件层决定(这层不碰样式库)。
+export interface ContainerBadge {
+    label: string;
+    tone: 'success' | 'danger' | 'warning' | 'neutral';
+}
+
+export function containerStateBadge(state: ContainerState): ContainerBadge {
+    switch (state) {
+        case 'running':
+            return { label: '运行中', tone: 'success' };
+        case 'exited':
+            return { label: '已停止', tone: 'neutral' };
+        case 'created':
+            return { label: '已创建', tone: 'neutral' };
+        case 'restarting':
+            return { label: '重启中', tone: 'warning' };
+        case 'paused':
+            return { label: '已暂停', tone: 'warning' };
+        default:
+            return { label: '未知', tone: 'danger' };
+    }
+}
+
+/// 一句话概括 docker 是否能直接部署,给页面顶部状态条用。
+export function dockerStatusSummary(
+    status: DockerStatus,
+    engineName = 'Docker',
+): {
+    ready: boolean;
+    label: string;
+} {
+    if (!status.installed) {
+        return { ready: false, label: `未安装 ${engineName}` };
+    }
+    if (!status.daemonRunning) {
+        return {
+            ready: false,
+            label:
+                engineName === 'Podman'
+                    ? `Podman ${status.version} 运行环境未就绪`
+                    : `${engineName} ${status.version} 已装，但守护进程未运行`,
+        };
+    }
+    if (!status.composeAvailable) {
+        return { ready: false, label: `${engineName} ${status.version} 缺少 compose 插件` };
+    }
+    return { ready: true, label: `${engineName} ${status.version} 就绪` };
+}
+
+export function dockerManagementSummary(
+    status: DockerStatus,
+    engineName = 'Docker',
+): { ready: boolean; label: string } {
+    if (status.installed && status.daemonRunning && !status.composeAvailable) {
+        return { ready: true, label: `${engineName} ${status.version} 可管理 · 缺少 compose 插件` };
+    }
+    return dockerStatusSummary(status, engineName);
+}
+
+/// 判断一个容器名是不是本工程部署的 NapCat / SnowLuma(用于在容器列表里
+/// 标记"这是我们部署的")。简单按镜像名前缀判断。
+export function isManagedImage(image: string): boolean {
+    return image.includes('napcat-docker') || image.includes('snowluma');
+}
+
+/// 展示用镜像引用:repo:tag;`<none>:<none>` 时退回短 id。
+export function imageDisplayRef(image: ImageInfo): string {
+    const repo = image.repository.trim();
+    const tag = image.tag.trim();
+    const none = (s: string) => s === '' || s === '<none>';
+    if (!none(repo) && !none(tag)) {
+        return `${repo}:${tag}`;
+    }
+    if (!none(repo) && none(tag)) {
+        return repo;
+    }
+    return image.id;
+}
+
+/// 是否悬空镜像(dangling)。
+export function isDanglingImage(image: ImageInfo): boolean {
+    const repo = image.repository.trim();
+    const tag = image.tag.trim();
+    return (repo === '<none>' || repo === '') && (tag === '<none>' || tag === '');
+}
+
+/// 传给 `docker rmi` 的引用(优先 repo:tag,否则 id)。
+export function imageRemoveRef(image: ImageInfo): string {
+    if (!image.tag.trim() || image.tag === '<none>') return image.id;
+    const ref = imageDisplayRef(image);
+    if (ref === image.id) {
+        return image.id;
+    }
+    return ref;
+}
+
+export function containerActions(state: ContainerState): ContainerAction[] {
+    switch (state) {
+        case 'running':
+            return ['stop', 'restart', 'pause'];
+        case 'paused':
+            return ['unpause'];
+        case 'created':
+        case 'exited':
+            return ['start'];
+        case 'restarting':
+            return ['stop'];
+        default:
+            return [];
+    }
+}
+
+/// 删除镜像失败时是否属于「仍有容器引用，需 -f」类错误。
+export function imageRemoveConflictNeedsForce(message: string): boolean {
+    const m = message.toLowerCase();
+    return m.includes('must be forced') || m.includes('conflict: unable to delete');
+}
+
+/// 冲突时给用户看的操作指引；其它失败走 InfoBar 短句 + 日志。
+export function imageRemoveFailureHint(raw: string): string {
+    if (!imageRemoveConflictNeedsForce(raw)) return '';
+    return '该镜像仍被容器引用。可勾选「强制删除」再试，或到「容器」页先删/停相关容器。';
+}
+
+/// 判断镜像仓库是否为本工程 NapCat / SnowLuma 官方镜像。
+export function isManagedImageRef(repository: string): boolean {
+    return repository.includes('napcat-docker') || repository.includes('snowluma');
+}
+
+/// 判断一个容器是否属于指定 flavor(NapCat / SnowLuma)。按官方镜像 repo 名匹配:
+/// NapCat -> napcat-docker, SnowLuma -> snowluma。框架行「Docker 部署」按钮据此
+/// 判定该 flavor 是否已部署,已部署就禁用按钮避免重复部署撞容器名/端口。
+export function containerMatchesFlavor(container: ContainerInfo, flavor: DockerFlavor): boolean {
+    const image = container.image;
+    if (flavor === 'napcat') return image.includes('napcat-docker');
+    if (flavor === 'snowluma') return image.includes('snowluma');
+    return false;
+}
+
+/// 端口文案去重压缩。
+///
+/// docker 对每个映射会同时列 IPv4 和 IPv6 两条(`0.0.0.0:18211->18211/tcp`
+/// 和 `[::]:18211->18211/tcp`)，对用户是同一个端口。这里按"宿主端口->容器
+/// 端口/协议"归一去重(丢掉绑定地址前缀)，让 napcat 那种 4 条塌成 2 条，
+/// 既去噪又稳定卡片高度。
+///
+/// 返回精简后的展示文案数组，形如 `18211->18211/tcp`。
+export function compactPorts(ports: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of ports) {
+        // 去掉绑定地址前缀：`0.0.0.0:18211->...` / `[::]:18211->...` → `18211->...`
+        // 匹配开头到"紧挨数字的那个冒号"，把 IPv4 / IPv6 绑定地址一并吃掉。
+        const stripped = raw.replace(/^.*:(?=\d)/, '');
+        const key = stripped || raw;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(key);
+    }
+    return out;
+}

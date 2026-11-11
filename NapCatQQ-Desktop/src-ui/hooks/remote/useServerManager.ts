@@ -1,0 +1,224 @@
+// ServerManager CRUD + 连接测试的 React 适配层。
+// 远端组件部署走组件页 (run_component_action with host_id = "remote:<id>")。
+
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useServers } from './useServers';
+import { serverService } from '../../core/services/server.service';
+import { pushInfoBar } from '../ui/globalInfoBarStore';
+import { pushErrorBar } from '../ui/pushErrorBar';
+import { errorText } from '../../core/domain/errors';
+import { SEE_LOGS_HINT } from '../../core/domain/ui/errorBarCopy';
+import type { ServerProfile } from '../../core/ipc/generated/domain/ServerProfile';
+import type { ProbeReport } from '../../core/ipc/generated/domain/ProbeReport';
+import { WINDOWS_REMOTE_INFO_KEY } from './useWindowsRemoteInfo';
+
+/// 档案显示名：优先 name，回退 host，最后裸 id。InfoBar 标题里用，让用户一眼
+/// 认出是哪台机器，而不是看裸 UUID。
+function serverLabel(p: { name?: string | null; host?: string | null; id?: string }): string {
+    return p.name?.trim() || p.host?.trim() || p.id || '远端服务器';
+}
+
+function invalidateServerLists(queryClient: ReturnType<typeof useQueryClient>) {
+    queryClient.invalidateQueries({ queryKey: ['servers'] });
+    queryClient.invalidateQueries({ queryKey: ['ssh-config-hosts'] });
+}
+
+export function useServerManager() {
+    const queryClient = useQueryClient();
+
+    const serversQuery = useServers();
+
+    const addMutation = useMutation({
+        mutationFn: (args: { profile: ServerProfile; password?: string }) =>
+            serverService.add(args.profile, args.password),
+        onSuccess: (created) => {
+            invalidateServerLists(queryClient);
+            pushInfoBar({
+                key: `server-add:${created.id}`,
+                tone: 'success',
+                title: '服务器已添加',
+                content: `${serverLabel(created)} 已加入远端主机列表`,
+                autoDismissMs: 4000,
+            });
+        },
+        // 失败提示由调用方在 catch 里处理（RemoteHostPanel 的 addServerAsync
+        // 链路要先关弹窗再决定是否接着配免密，错误上下文在那边更完整）。
+    });
+
+    const updateMutation = useMutation({
+        mutationFn: (args: { profile: ServerProfile; password?: string }) =>
+            serverService.update(args.profile, args.password),
+        onSuccess: (updated) => {
+            invalidateServerLists(queryClient);
+            pushInfoBar({
+                key: `server-update:${updated.id}`,
+                tone: 'success',
+                title: '服务器已更新',
+                content: `${serverLabel(updated)} 的连接信息已保存`,
+                autoDismissMs: 4000,
+            });
+        },
+        onError: (err: unknown, args) => {
+            pushErrorBar({
+                key: `server-update:${args.profile.id}`,
+                title: '更新服务器失败',
+                raw: errorText(err),
+            });
+        },
+    });
+
+    const deleteMutation = useMutation({
+        mutationFn: (id: string) => serverService.delete(id),
+        // delete 返回 void，但要在删除前抓一下显示名（onError 时还能用），所以从
+        // 当前列表反查。删成功后列表会失效重拉，这里只为提示文案。
+        onSuccess: (_void, id) => {
+            const label = serverLabel(serversQuery.data?.find((s) => s.id === id) ?? { id });
+            invalidateServerLists(queryClient);
+            pushInfoBar({
+                key: `server-delete:${id}`,
+                tone: 'success',
+                title: '服务器已删除',
+                content: `${label} 的档案与已保存凭据已清除`,
+                autoDismissMs: 4000,
+            });
+        },
+        onError: (err: unknown, id) => {
+            pushErrorBar({
+                key: `server-delete:${id}`,
+                title: '删除服务器失败',
+                raw: errorText(err),
+            });
+        },
+    });
+
+    const testMutation = useMutation({
+        mutationFn: (args: { id: string; password?: string }) =>
+            serverService.testConnection(args.id, args.password),
+        // 探测报告 success=false 不是 IPC 失败（命令本身成功返回了报告），所以
+        // 走 onSuccess 分流：报告 success 才绿条，否则红条带后端给的 error 原因。
+        onSuccess: (report, args) => {
+            if (report.success) {
+                const server = serversQuery.data?.find((item) => item.id === args.id);
+                if (server)
+                    queryClient.setQueryData(
+                        [
+                            WINDOWS_REMOTE_INFO_KEY,
+                            server.id,
+                            server.host,
+                            server.port,
+                            server.username,
+                            server.platform ?? 'auto',
+                        ],
+                        report.windowsInfo ?? null,
+                    );
+            }
+            queryClient.invalidateQueries({ queryKey: ['servers'] });
+            // 恢复链路增强：除了 invalidate，显式 refetchQueries 强制立即拉新数据。
+            // 解决“在远程页测试连接成功后，Bot 列表徽标和配置页门禁不自动更新”的问题。
+            // 即使 Bot 侧的 observer 当时因为路由等原因不是超级活跃，refetch 也能尽快更新 cache。
+            void queryClient.refetchQueries({ queryKey: ['servers'] });
+
+            const label = serverLabel(
+                serversQuery.data?.find((s) => s.id === args.id) ?? { id: args.id },
+            );
+            if (report.success) {
+                const latency = `${report.latencyMs}ms`;
+                pushInfoBar({
+                    key: `server-test:${args.id}`,
+                    tone: 'success',
+                    title: '连接成功',
+                    content: report.osInfo
+                        ? `${label} · ${report.osInfo} · ${latency}`
+                        : `${label} · ${latency}`,
+                    autoDismissMs: 5000,
+                });
+            } else if (report.hostKeyMismatch) {
+                // 已记录的 host key 与本次不一致:疑似中间人。危险红条阻断,不自动信任。
+                console.error(`[servers] host key mismatch · ${label}:`, report.error);
+                pushInfoBar({
+                    key: `server-test:${args.id}`,
+                    tone: 'danger',
+                    title: '主机指纹不一致 · 疑似中间人',
+                    content: `${label}：远端 host key 与记录不符，已阻断连接。${SEE_LOGS_HINT}`,
+                });
+            } else if (report.hostKeyPrompt) {
+                // 首次连接需确认指纹:不是失败,交给面板弹确认框,这里不出红条。
+            } else {
+                pushErrorBar({
+                    key: `server-test:${args.id}`,
+                    title: '连接失败',
+                    raw: report.error ? `${label}：${report.error}` : `${label}：无法建立 SSH 连接`,
+                });
+            }
+        },
+        onError: (err: unknown, args) => {
+            pushErrorBar({
+                key: `server-test:${args.id}`,
+                title: '连接失败',
+                raw: errorText(err),
+            });
+        },
+    });
+
+    const setupKeyAuthMutation = useMutation({
+        mutationFn: (args: { id: string; password: string }) =>
+            serverService.setupKeyAuth(args.id, args.password),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['servers'] });
+        },
+    });
+
+    const refreshInventoryMutation = useMutation({
+        mutationFn: (serverId: string) => serverService.refreshInventory(serverId),
+        onSuccess: () => {
+            invalidateServerLists(queryClient);
+        },
+        onError: (err: unknown, serverId) => {
+            pushErrorBar({
+                key: `server-inventory:${serverId}`,
+                title: '重新发现失败',
+                raw: errorText(err),
+            });
+        },
+    });
+
+    const confirmHostKeyMutation = useMutation({
+        mutationFn: (args: { id: string; keyKind: string; keyB64: string }) =>
+            serverService.confirmHostKey(args.id, args.keyKind, args.keyB64),
+    });
+
+    return {
+        servers: serversQuery.data ?? [],
+        isLoading: serversQuery.isLoading,
+        isSuccess: serversQuery.isSuccess,
+        refetch: serversQuery.refetch,
+
+        addServer: addMutation.mutate,
+        addServerAsync: addMutation.mutateAsync,
+        isAdding: addMutation.isPending,
+
+        updateServer: updateMutation.mutate,
+        updateServerAsync: updateMutation.mutateAsync,
+        isUpdating: updateMutation.isPending,
+
+        deleteServer: deleteMutation.mutate,
+        isDeleting: deleteMutation.isPending,
+
+        testConnection: testMutation.mutate,
+        testConnectionAsync: testMutation.mutateAsync,
+        isTesting: testMutation.isPending,
+        testResult: testMutation.data as ProbeReport | undefined,
+
+        setupKeyAuth: setupKeyAuthMutation.mutateAsync,
+        isSettingUpKey: setupKeyAuthMutation.isPending,
+
+        confirmHostKey: confirmHostKeyMutation.mutateAsync,
+        isConfirmingHostKey: confirmHostKeyMutation.isPending,
+
+        refreshInventory: refreshInventoryMutation.mutateAsync,
+        isRefreshingInventory: refreshInventoryMutation.isPending,
+        inventoryError: refreshInventoryMutation.error
+            ? errorText(refreshInventoryMutation.error)
+            : null,
+    };
+}

@@ -1,0 +1,475 @@
+# PR / main 按路径运行完整检查；前端分片、Rust 按编译边界并行，Gate 汇总全部结果。
+
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      force_full:
+        description: "发布门禁复用全部测试，忽略路径过滤和手动 suite"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "跑哪些门禁（PR 固定 full）"
+        required: false
+        default: full
+        type: choice
+        options:
+          - full
+          - frontend
+          - rust
+          - rust-smoke
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.inputs.suite || 'full' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 完整测试产物可跨 run 复用，关闭增量以控制缓存体积。
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+  RUST_TEST_THREADS: "4"
+
+jobs:
+  changes:
+    name: Path filters
+    runs-on: ubuntu-latest
+    outputs:
+      rust_core: ${{ steps.filter.outputs.rust_core }}
+      rust_shell: ${{ steps.filter.outputs.rust_shell }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - name: Test gate policy
+        run: node --test scripts/ci-gate.test.mjs scripts/ci-rust-cache.test.mjs scripts/ci-release-cache.test.mjs
+
+      # 版本检查在 frontend，版本文件必须进 frontend 过滤；
+      # tauri.conf.json 同时在两端过滤内。
+      - name: Detect changed areas
+        if: ${{ !inputs.force_full && github.event_name != 'workflow_dispatch' }}
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          base: ${{ github.event_name == 'push' && github.event.before || github.event.repository.default_branch }}
+          filters: |
+            rust_core:
+              - 'crates/**'
+              - 'src-tauri/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'clippy.toml'
+              - 'rust-toolchain.toml'
+              - 'scripts/ci-rust-cache*'
+              - 'scripts/test-windows-agent*'
+              - '.github/workflows/ci.yml'
+            rust_shell:
+              - 'crates/**'
+              - 'src-tauri/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'clippy.toml'
+              - 'rust-toolchain.toml'
+              - 'scripts/ci-rust-cache*'
+              - 'scripts/build-remote-agent.mjs'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'src-ui/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'src-tauri/tauri.conf.json'
+              - 'src-tauri/capabilities/**'
+              - 'src-tauri/resources/**'
+              - 'crates/ncd-backend-snowluma/resources/**'
+              - 'crates/ncd-component/resources/**'
+              - 'crates/ncd-deploy/resources/snowluma-data-migrate*'
+              - 'crates/ncd-runtime/src/metrics/remote_assets_batch*.py'
+              - 'crates/ncd-runtime/src/app_framework/manager/migration_transfer.py'
+              - 'crates/ncd-runtime/tests/migration_transfer_test.py'
+              - 'scripts/build-snowluma-login-helper.mjs'
+              - '.github/workflows/ci.yml'
+
+  frontend:
+    name: Frontend (${{ matrix.shard }}/2)
+    needs: changes
+    if: >-
+      inputs.force_full ||
+      ((github.event_name == 'pull_request' || github.event_name == 'push') && needs.changes.outputs.frontend == 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'frontend'))
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Python for external login helper
+        if: matrix.shard == 1
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check version metadata
+        if: matrix.shard == 1
+        run: pnpm run check:versions
+
+      - name: Typecheck
+        if: matrix.shard == 1
+        run: pnpm run typecheck
+
+      - name: Unit tests
+        run: pnpm run test:unit --shard=${{ matrix.shard }}/2
+
+      # OneBot 探针是注入用户 Bot 进程的脚本，只能靠线级回归守住
+      - name: Probe tests
+        if: matrix.shard == 1
+        run: pnpm run test:probe
+
+      - name: Validate external SnowLuma login helper assets
+        if: matrix.shard == 1
+        run: pnpm run build:sl-login-helper
+
+      - name: Remote QQ and SnowLuma helper tests
+        if: matrix.shard == 1
+        run: pnpm run test:sl-login-helper
+
+      - name: Bot migration archive tests
+        if: matrix.shard == 1
+        run: python -B -m unittest discover -s crates/ncd-runtime/tests -p migration_transfer_test.py
+
+      - name: SnowLuma container data migration tests
+        if: matrix.shard == 1
+        run: node --test crates/ncd-deploy/resources/snowluma-data-migrate.test.cjs
+
+  rust-core:
+    name: Rust ${{ matrix.group }} (Windows)
+    needs: changes
+    if: >-
+      inputs.force_full ||
+      ((github.event_name == 'pull_request' || github.event_name == 'push') && needs.changes.outputs.rust_core == 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'rust' || github.event.inputs.suite == 'rust-smoke'))
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(!inputs.force_full && github.event.inputs.suite == 'rust-smoke' && '["core"]' || '["core", "runtime"]') }}
+    env:
+      # 测试失败仍报告断言源码位置；关闭符号以减少链接和缓存传输成本。
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ncd-runtime 的 launch plan 测试要求 PATH 上有 node.exe；
+      # windows-2025 镜像 PATH 里的 Node 已不可靠管理，显式装
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 本 job 不跑 clippy/fmt，不装组件可少下几百 MB
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 托管 Windows runner 是管理员；Defender 实时扫 target/registry 是编译大头之一
+      - name: Exclude build dirs from Defender scan
+        shell: pwsh
+        run: |
+          # 托管 runner 不一定有 RUSTUP_HOME，空值会让 Add-MpPreference 直接报错
+          $paths = @($env:CARGO_HOME, $env:RUSTUP_HOME, "$env:USERPROFILE\.rustup", "$env:GITHUB_WORKSPACE\target") | Where-Object { $_ }
+          foreach ($p in $paths) { Add-MpPreference -ExclusionPath $p }
+
+      - name: Compute Cargo cache keys
+        id: inputs
+        run: node scripts/ci-rust-cache.mjs keys
+
+      - name: Cache Cargo
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ${{ steps.inputs.outputs.cargo-home }}/registry
+            ${{ steps.inputs.outputs.cargo-home }}/git
+          key: rust-tests-v5-${{ matrix.group }}-${{ !inputs.force_full && github.event.inputs.suite == 'rust-smoke' && 'smoke' || 'full' }}-${{ steps.inputs.outputs.environment-key }}-${{ steps.inputs.outputs.source-key }}
+          restore-keys: |
+            rust-tests-v5-${{ matrix.group }}-${{ !inputs.force_full && github.event.inputs.suite == 'rust-smoke' && 'smoke' || 'full' }}-${{ steps.inputs.outputs.environment-key }}-
+            rust-tests-v5-${{ matrix.group }}-${{ !inputs.force_full && github.event.inputs.suite == 'rust-smoke' && 'smoke' || 'full' }}-${{ steps.inputs.outputs.legacy-environment-key }}-
+            rust-tests-v4-core-${{ !inputs.force_full && github.event.inputs.suite == 'rust-smoke' && 'smoke' || 'full' }}-${{ steps.inputs.outputs.legacy-environment-key }}-
+
+      - name: Restore Cargo input timestamps
+        run: node scripts/ci-rust-cache.mjs restore
+
+      # 全量测试已包含导出用例；只有 smoke 需要单独导出。
+      - name: Export ts-rs bindings
+        if: ${{ !inputs.force_full && github.event_name == 'workflow_dispatch' && github.event.inputs.suite == 'rust-smoke' }}
+        shell: pwsh
+        run: cargo test --workspace --exclude ncd-tauri --lib export_bindings_ -- --quiet
+
+      # launch plan ColdStart 测试要读真实 QQ 注册表；runner 没装 QQ。
+      # 测试只读 Install 值、不校验路径内容，stub 一个假安装目录即可。
+      - name: Stub QQ install registry for launch plan tests
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\WOW6432Node\Tencent\QQNT'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name Install -Value 'C:\Program Files\Tencent\QQNT' -PropertyType String -Force | Out-Null
+
+      # 快速回归：只跑近期易碎的 integration / compose，不跑全 workspace
+      - name: Smoke tests
+        if: ${{ !inputs.force_full && github.event_name == 'workflow_dispatch' && github.event.inputs.suite == 'rust-smoke' }}
+        shell: pwsh
+        run: |
+          cargo test -p ncd-runtime --test bot_manager -- --quiet
+          cargo test -p ncd-deploy --lib docker::compose::tests -- --quiet
+          cargo test -p ncd-backend-napcat --lib napcat::login_poller -- --quiet
+
+      - name: Windows Agent tests under a standard account
+        if: >-
+          matrix.group == 'core' && (inputs.force_full ||
+          github.event_name != 'workflow_dispatch' ||
+          github.event.inputs.suite == 'full' ||
+          github.event.inputs.suite == 'rust')
+        shell: pwsh
+        run: ./scripts/test-windows-agent.ps1 -ExcludeRuntime
+
+      - name: Workspace tests
+        if: >-
+          inputs.force_full ||
+          github.event_name != 'workflow_dispatch' ||
+          github.event.inputs.suite == 'full' ||
+          github.event.inputs.suite == 'rust'
+        shell: pwsh
+        run: |
+          if ('${{ matrix.group }}' -eq 'runtime') {
+            cargo test -p ncd-runtime -p ncd-mcp --locked
+          } else {
+            cargo test --workspace --exclude ncd-tauri --exclude ncd-runtime --exclude ncd-mcp --locked
+          }
+
+      - name: Assert generated IPC types committed
+        shell: pwsh
+        run: |
+          git diff --exit-code -- src-ui/core/ipc/generated
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $untracked = @(git ls-files --others --exclude-standard -- src-ui/core/ipc/generated)
+          if ($untracked.Count -gt 0) { throw "Uncommitted IPC types: $($untracked -join ', ')" }
+
+      - name: Capture Cargo input timestamps
+        if: always()
+        run: node scripts/ci-rust-cache.mjs capture
+
+      - name: Preserve compiled cache after a test failure
+        if: failure() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target
+            ${{ steps.inputs.outputs.cargo-home }}/registry
+            ${{ steps.inputs.outputs.cargo-home }}/git
+          key: rust-tests-v5-${{ matrix.group }}-${{ !inputs.force_full && github.event.inputs.suite == 'rust-smoke' && 'smoke' || 'full' }}-${{ steps.inputs.outputs.environment-key }}-${{ steps.inputs.outputs.source-key }}
+
+  # Tauri 独立编译；其导出用例也必须检查 generated 差异。
+  rust-shell:
+    name: Rust shell / Tauri (Windows)
+    needs: changes
+    if: >-
+      inputs.force_full ||
+      ((github.event_name == 'pull_request' || github.event_name == 'push') && needs.changes.outputs.rust_shell == 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'rust'))
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Exclude build dirs from Defender scan
+        shell: pwsh
+        run: |
+          # 托管 runner 不一定有 RUSTUP_HOME，空值会让 Add-MpPreference 直接报错
+          $paths = @($env:CARGO_HOME, $env:RUSTUP_HOME, "$env:USERPROFILE\.rustup", "$env:GITHUB_WORKSPACE\target") | Where-Object { $_ }
+          foreach ($p in $paths) { Add-MpPreference -ExclusionPath $p }
+
+      - name: Compute Cargo cache keys
+        id: inputs
+        run: node scripts/ci-rust-cache.mjs keys
+
+      - name: Cache Cargo
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ${{ steps.inputs.outputs.cargo-home }}/registry
+            ${{ steps.inputs.outputs.cargo-home }}/git
+          key: rust-tests-v4-shell-${{ steps.inputs.outputs.environment-key }}-${{ steps.inputs.outputs.source-key }}
+          restore-keys: |
+            rust-tests-v4-shell-${{ steps.inputs.outputs.environment-key }}-
+            rust-tests-v4-shell-${{ steps.inputs.outputs.legacy-environment-key }}-
+
+      - name: Restore Cargo input timestamps
+        run: node scripts/ci-rust-cache.mjs restore
+
+      - name: Build bundled Windows agent
+        # Tauri validates packaged resources even for shell unit tests.
+        run: node scripts/build-remote-agent.mjs
+
+      # Agent 是 gitignored 资源，首次 restore 时尚不存在；生成后再按内容校验恢复时间戳。
+      - name: Restore generated Agent input timestamp
+        run: node scripts/ci-rust-cache.mjs restore
+
+      - name: Run shell tests (ncd-tauri)
+        run: cargo test -p ncd-tauri
+
+      - name: Assert shell IPC types committed
+        shell: pwsh
+        run: |
+          git diff --exit-code -- src-ui/core/ipc/generated
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $untracked = @(git ls-files --others --exclude-standard -- src-ui/core/ipc/generated)
+          if ($untracked.Count -gt 0) { throw "Uncommitted IPC types: $($untracked -join ', ')" }
+
+      - name: Capture Cargo input timestamps
+        run: node scripts/ci-rust-cache.mjs capture
+
+  rust-linux:
+    name: Rust workspace (Linux)
+    needs: changes
+    if: >-
+      inputs.force_full ||
+      ((github.event_name == 'pull_request' || github.event_name == 'push') && needs.changes.outputs.rust_shell == 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'rust'))
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9
+
+      - name: Compute Cargo cache keys
+        id: inputs
+        run: node scripts/ci-rust-cache.mjs keys
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ${{ steps.inputs.outputs.cargo-home }}/registry
+            ${{ steps.inputs.outputs.cargo-home }}/git
+          key: rust-tests-v5-linux-${{ steps.inputs.outputs.environment-key }}-${{ steps.inputs.outputs.source-key }}
+          restore-keys: |
+            rust-tests-v5-linux-${{ steps.inputs.outputs.environment-key }}-
+            rust-tests-v5-linux-${{ steps.inputs.outputs.legacy-environment-key }}-
+
+      - name: Restore Cargo input timestamps
+        run: node scripts/ci-rust-cache.mjs restore
+
+      # 一次编译全部目标；执行原有 Linux 契约，避免逐包命令反复改变 feature 并重新编译。
+      - name: Build Linux workspace and test platform contracts
+        run: >-
+          cargo nextest run --workspace --all-targets --locked --test-threads=4
+          -E 'kind(lib) & (package(=ncd-host)
+          | (package(=ncd-component) & test(bad_release_archive_preserves_the_installed_runtime))
+          | ((package(=ncd-deploy) | package(=ncd-runtime)) & test(docker))
+          | (package(=ncd-tauri) & test(desktop_opener::tests)))'
+
+      - name: Verify Cargo cache invalidation
+        env:
+          CI_RUST_CACHE_TEST_CARGO: "1"
+        run: node --test scripts/ci-rust-cache.test.mjs
+
+      - name: Capture Cargo input timestamps
+        if: always()
+        run: node scripts/ci-rust-cache.mjs capture
+
+  gate:
+    name: Gate
+    needs:
+      - changes
+      - frontend
+      - rust-core
+      - rust-shell
+      - rust-linux
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci-gate.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Require green jobs
+        env:
+          CI_EVENT: ${{ inputs.force_full && 'workflow_dispatch' || github.event_name }}
+          CI_SUITE: ${{ inputs.force_full && 'full' || github.event.inputs.suite || 'full' }}
+          CI_JOB_RESULTS: ${{ toJSON(needs) }}
+        run: node scripts/ci-gate.mjs

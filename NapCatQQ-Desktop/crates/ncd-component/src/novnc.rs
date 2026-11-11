@@ -1,0 +1,440 @@
+//! NoVncComponent:noVNC + 图形栈组件(SnowLuma 远端 VNC 接入用)
+//!
+//! 对齐 legacy install_snowluma.sh.j2 的"图形栈"安装步骤,装一整套:
+//! Xvfb / fluxbox / x11vnc / novnc / websockify + dbus-x11
+//!
+//! 安装策略:不下载二进制,走 apt / dnf 装系统包(legacy 验证过的策略,
+//! SnowLuma 远端 VNC 接入必备)
+//!
+//! 包列表
+//!
+//! Debian / Ubuntu(apt):
+//! - dbus-x11(D-Bus session)
+//! - fluxbox(轻量窗口管理器)
+//! - xvfb(虚拟 framebuffer)
+//! - x11vnc(把 X server 暴露成 VNC)
+//! - novnc(浏览器端 HTML5 VNC client)
+//! - websockify(VNC ↔ WebSocket 桥接)
+//!
+//! RHEL / CentOS / Fedora(dnf):
+//! - dbus-x11 fluxbox openbox xorg-x11-server-Xvfb x11vnc
+//! - novnc python3-websockify(在 EPEL)
+//!
+//! 探测:检查 command -v websockify && command -v x11vnc 是否同时存在
+//! noVNC 是 web 资源不是 binary,但 websockify 是 noVNC 的运行时依赖,所以用它代理探测
+
+use async_trait::async_trait;
+
+use std::time::Duration;
+
+use ncd_host::{Host, HostCommand, LinuxPackageManager, Locality, Os};
+
+use crate::context::{ActionCtx, ProgressKind, ProgressLogLevel};
+use crate::error::ActionError;
+use crate::pkg_install_stream::run_pkg_command_with_progress;
+use crate::traits::Component;
+use crate::types::{ComponentId, DetectedVersion, LaunchArgs, VerifyReport};
+
+/// noVNC + 图形栈 component
+#[derive(Debug, Clone)]
+pub struct NoVncComponent {
+    /// 是否走 sudo 提权(默认 true,因为 apt/dnf install 必须 root;
+    /// 远端 ubuntu 用户已配置 NOPASSWD sudo 时才能 silent 安装)
+    pub use_sudo: bool,
+}
+
+impl NoVncComponent {
+    pub fn new() -> Self {
+        Self { use_sudo: true }
+    }
+
+    pub fn with_sudo(mut self, use_sudo: bool) -> Self {
+        self.use_sudo = use_sudo;
+        self
+    }
+
+    /// 图形栈的包名只按 deb / rpm 两族维护,其它包管理器直接报不支持
+    async fn detect_pkg_manager(
+        &self,
+        host: &dyn Host,
+    ) -> Result<LinuxPackageManager, ActionError> {
+        match LinuxPackageManager::detect(host).await {
+            Some(pm @ (LinuxPackageManager::Apt | LinuxPackageManager::Dnf)) => Ok(pm),
+            Some(other) => Err(ActionError::install_step(
+                "detect_pkg_manager",
+                format!("noVNC 图形栈只支持 apt / dnf,当前主机是 {other}"),
+            )),
+            None => Err(ActionError::install_step(
+                "detect_pkg_manager",
+                "neither apt-get nor dnf found on host",
+            )),
+        }
+    }
+
+    /// 图形栈安装命令。不用 LinuxPackageManager::install_command 的通用形式:
+    /// apt 要 --no-install-recommends 防拖一堆桌面包;dnf 要 --allowerasing
+    /// --setopt=strict=0(legacy install_snowluma.sh.j2 L112),否则单包匹配失败
+    /// 会 abort 整个 transaction。提权交给 Host:use_sudo 时打 .elevated() 标
+    fn build_install_command(&self, mgr: LinuxPackageManager) -> HostCommand {
+        let pkgs_apt = "dbus-x11 fluxbox xvfb x11vnc novnc websockify";
+        let pkgs_dnf =
+            "dbus-x11 fluxbox openbox xorg-x11-server-Xvfb x11vnc novnc python3-websockify";
+
+        let cmd_str = match mgr {
+            LinuxPackageManager::Apt => format!(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {pkgs_apt}"
+            ),
+            _ => format!("dnf install --allowerasing --setopt=strict=0 -y {pkgs_dnf}"),
+        };
+
+        self.maybe_elevated(HostCommand::new("sh").arg("-c").arg(cmd_str))
+            .timeout(Duration::from_secs(600))
+    }
+
+    /// 刷新索引;dnf 装包自带刷新,返回 no-op
+    fn build_refresh_command(&self, mgr: LinuxPackageManager) -> HostCommand {
+        match mgr.refresh_command() {
+            Some(cmd) => self.maybe_elevated(cmd),
+            None => HostCommand::new("sh")
+                .arg("-c")
+                .arg("true")
+                .timeout(Duration::from_secs(300)),
+        }
+    }
+
+    /// use_sudo 时给命令打 .elevated() 标(提权细节由 Host 注入的密码决定),否则
+    /// 原样返回,Component 不自己拼 sudo,提权逻辑收敛到 Host 层
+    fn maybe_elevated(&self, cmd: HostCommand) -> HostCommand {
+        if self.use_sudo { cmd.elevated() } else { cmd }
+    }
+
+    /// 组件元数据,给 list_components Tauri command 使用
+    pub fn info() -> crate::types::ComponentInfo {
+        crate::types::ComponentInfo {
+            id: ComponentId::NoVnc,
+            display_name: "noVNC".to_string(),
+            description: "远端扫码用的远程桌面".to_string(),
+            repo_url: Some("https://novnc.com/".to_string()),
+            supported_targets: vec![
+                crate::types::SupportedTarget::new(Os::Linux, Locality::Local),
+                crate::types::SupportedTarget::new(Os::Linux, Locality::Remote),
+            ],
+            category: crate::types::ComponentCategory::RuntimeDep,
+            uninstall: crate::types::UninstallSupport::Supported,
+        }
+    }
+}
+
+impl Default for NoVncComponent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Component for NoVncComponent {
+    fn id(&self) -> ComponentId {
+        ComponentId::NoVnc
+    }
+
+    fn supported_targets(&self) -> &'static [(Os, Locality)] {
+        // 只在 Linux(Local 也支持但极少用,主要是远端 VNC)
+        &[(Os::Linux, Locality::Local), (Os::Linux, Locality::Remote)]
+    }
+
+    async fn detect(&self, host: &dyn Host) -> Result<Option<DetectedVersion>, ActionError> {
+        // 与远端 SL 启动前检查对齐：缺 Xvfb / dbus-launch 时不能报已安装，
+        // 否则「补全依赖」会跳过图形栈，启动却失败。
+        let cmd = HostCommand::new("sh").arg("-c").arg(
+            "command -v Xvfb >/dev/null && command -v x11vnc >/dev/null && \
+             command -v websockify >/dev/null && command -v dbus-launch >/dev/null && \
+             (command -v fluxbox >/dev/null || command -v openbox >/dev/null) && \
+             (test -f /usr/share/novnc/vnc.html || test -f /usr/share/noVNC/vnc.html) && \
+             echo OK && websockify --help 2>&1 | head -1",
+        );
+        let out = host.run_to_string(cmd).await?;
+        if !out.success() {
+            return Ok(None);
+        }
+        if !out.stdout.contains("OK") {
+            return Ok(None);
+        }
+
+        // 用 dpkg / rpm 获取 novnc 包版本(尽量给出版本号,失败也不影响 detect)
+        let version = detect_package_version(host)
+            .await
+            .unwrap_or_else(|| "installed".to_string());
+        Ok(Some(DetectedVersion {
+            version,
+            source: "Xvfb + x11vnc + websockify + dbus-launch detected via PATH".into(),
+        }))
+    }
+
+    async fn install(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        self.check_target(host)?;
+        if self.use_sudo
+            && ncd_host::remote::probe_sudo(host).await
+                == ncd_host::remote::SudoAccess::PasswordRequired
+            && !host.has_elevation_password().await
+        {
+            return Err(ActionError::install_step(
+                "sudo",
+                "elevation_required: 安装 noVNC 图形栈需要 sudo 密码，请输入密码后重试",
+            ));
+        }
+        ctx.emit(ProgressKind::Started { total_steps: 3 }).await;
+
+        // Step 1:探测包管理器
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: "detect package manager".into(),
+        })
+        .await;
+        let mgr = self.detect_pkg_manager(host).await?;
+        ctx.info(format!("package manager: {mgr:?}")).await;
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+
+        // Step 2:刷新包索引
+        ctx.emit(ProgressKind::StepBegin {
+            step: 2,
+            message: "refresh package index".into(),
+        })
+        .await;
+        let refresh_cmd = self.build_refresh_command(mgr);
+        if mgr == LinuxPackageManager::Apt {
+            run_pkg_command_with_progress(host, ctx, refresh_cmd, 2, 5, 25, "apt-get update…")
+                .await?;
+        } else {
+            let out = host.run_to_string(refresh_cmd).await?;
+            if !out.success() {
+                return Err(ActionError::install_step(
+                    "apt_update",
+                    format!("exit={:?} stderr={}", out.exit_code, out.stderr.trim()),
+                ));
+            }
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 2, ok: true }).await;
+
+        // Step 3:装图形栈
+        ctx.emit(ProgressKind::StepBegin {
+            step: 3,
+            message: format!("install graphics stack ({mgr:?})"),
+        })
+        .await;
+        let install_cmd = self.build_install_command(mgr);
+        run_pkg_command_with_progress(host, ctx, install_cmd, 3, 28, 95, "apt/dnf install 图形栈…")
+            .await?;
+        if self.detect(host).await?.is_none() {
+            return Err(ActionError::install_step(
+                "verify_graphics_stack",
+                "图形栈安装后仍缺少 Xvfb / x11vnc / websockify / dbus / 窗口管理器或 noVNC 页面",
+            ));
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 3, ok: true }).await;
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    async fn uninstall(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        self.check_target(host)?;
+        ctx.emit(ProgressKind::Started { total_steps: 1 }).await;
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: "remove novnc / websockify / x11vnc / fluxbox / xvfb".into(),
+        })
+        .await;
+        let mgr = self.detect_pkg_manager(host).await?;
+        let pkgs: &[&str] = match mgr {
+            LinuxPackageManager::Apt => &["novnc", "websockify", "x11vnc", "fluxbox", "xvfb"],
+            _ => &[
+                "novnc",
+                "python3-websockify",
+                "x11vnc",
+                "fluxbox",
+                "openbox",
+                "xorg-x11-server-Xvfb",
+            ],
+        };
+        let cmd = self.maybe_elevated(mgr.remove_command(pkgs));
+        let out = host.run_to_string(cmd).await?;
+        if !out.success() {
+            // 卸载失败一般是某个包未安装;不视为致命错误,只记录
+            ctx.log(
+                ProgressLogLevel::Warn,
+                format!(
+                    "novnc uninstall: exit={:?} stderr={}",
+                    out.exit_code,
+                    out.stderr.trim()
+                ),
+            )
+            .await;
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    async fn verify(&self, host: &dyn Host) -> Result<VerifyReport, ActionError> {
+        let detected = self.detect(host).await?;
+        let mut report = VerifyReport::ok().with_check(
+            "Xvfb + x11vnc + websockify + dbus-launch on PATH",
+            detected.is_some(),
+            detected.as_ref().map(|v| v.source.clone()),
+        );
+
+        for binary in &["Xvfb"] {
+            let cmd = HostCommand::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {binary}"));
+            let exists = match host.run_to_string(cmd).await {
+                Ok(o) => o.success() && !o.stdout.trim().is_empty(),
+                Err(_) => false,
+            };
+            report = report.with_check(format!("{binary} on PATH"), exists, None);
+        }
+
+        Ok(report)
+    }
+
+    fn launch_command(
+        &self,
+        _host: &dyn Host,
+        args: &LaunchArgs,
+    ) -> Result<HostCommand, ActionError> {
+        // noVNC 没有"统一启动命令",一般由 SnowLuma daemon 自己拼装
+        // 这里返回 websockify 的占位命令(供调用方拼装时复用)
+        Ok(args.apply_to(HostCommand::new("websockify")))
+    }
+}
+
+/// 尝试通过 dpkg / rpm 拿到 novnc 包版本号,失败返回 None
+async fn detect_package_version(host: &dyn Host) -> Option<String> {
+    // dpkg
+    let cmd = HostCommand::new("sh")
+        .arg("-c")
+        .arg("dpkg-query -W -f='${Version}' novnc 2>/dev/null || rpm -q --qf '%{VERSION}' novnc 2>/dev/null");
+    let out = host.run_to_string(cmd).await.ok()?;
+    if out.success() {
+        let s = out.stdout.trim();
+        if !s.is_empty() && !s.contains("not installed") && !s.contains("no package") {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_command_apt_includes_required_packages() {
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_install_command(LinuxPackageManager::Apt);
+        assert_eq!(cmd.program, "sh");
+        let arg = cmd.args.last().unwrap();
+        assert!(arg.contains("apt-get install"));
+        for pkg in &[
+            "dbus-x11",
+            "fluxbox",
+            "xvfb",
+            "x11vnc",
+            "novnc",
+            "websockify",
+        ] {
+            assert!(arg.contains(pkg), "apt cmd should contain {pkg}: {arg}");
+        }
+    }
+
+    #[test]
+    fn install_command_dnf_includes_required_packages() {
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_install_command(LinuxPackageManager::Dnf);
+        let arg = cmd.args.last().unwrap();
+        assert!(arg.contains("dnf install"));
+        for pkg in &[
+            "x11vnc",
+            "novnc",
+            "python3-websockify",
+            "fluxbox",
+            "xorg-x11-server-Xvfb",
+        ] {
+            assert!(arg.contains(pkg), "dnf cmd should contain {pkg}: {arg}");
+        }
+    }
+
+    #[test]
+    fn install_command_uses_sudo_by_default() {
+        // 提权改走 .elevated() 标志,命令体本身不含 sudo(由 Host 层注入 sudo -S/-n)
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_install_command(LinuxPackageManager::Apt);
+        assert!(cmd.elevated, "默认 use_sudo 时必须打 elevated 标");
+        assert!(
+            !cmd.args.last().unwrap().contains("sudo"),
+            "命令体不该再硬编码 sudo"
+        );
+    }
+
+    #[test]
+    fn install_command_skips_sudo_when_disabled() {
+        let comp = NoVncComponent::new().with_sudo(false);
+        let cmd = comp.build_install_command(LinuxPackageManager::Apt);
+        assert!(!cmd.elevated, "use_sudo=false 不打 elevated 标");
+        assert!(!cmd.args.last().unwrap().contains("sudo"));
+    }
+
+    #[test]
+    fn refresh_command_for_dnf_is_noop() {
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_refresh_command(LinuxPackageManager::Dnf);
+        assert_eq!(cmd.args.last().unwrap(), "true");
+    }
+
+    #[test]
+    fn refresh_command_for_apt_uses_apt_get_update() {
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_refresh_command(LinuxPackageManager::Apt);
+        assert!(cmd.args.last().unwrap().contains("apt-get update"));
+    }
+
+    #[test]
+    fn id_returns_novnc() {
+        assert_eq!(NoVncComponent::new().id(), ComponentId::NoVnc);
+    }
+
+    #[test]
+    fn supported_targets_only_linux() {
+        let comp = NoVncComponent::new();
+        assert!(
+            comp.supported_targets()
+                .contains(&(Os::Linux, Locality::Remote))
+        );
+        assert!(
+            !comp
+                .supported_targets()
+                .contains(&(Os::Windows, Locality::Local))
+        );
+    }
+
+    #[test]
+    fn apt_install_uses_noninteractive_frontend() {
+        // 防止 dpkg 的 menuconfig 阻塞 SSH 命令(legacy 教训)
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_install_command(LinuxPackageManager::Apt);
+        assert!(
+            cmd.args
+                .last()
+                .unwrap()
+                .contains("DEBIAN_FRONTEND=noninteractive")
+        );
+    }
+
+    #[test]
+    fn dnf_install_uses_allow_erasing() {
+        // legacy install_snowluma.sh.j2 L112 强制要求(否则单包匹配失败 abort 全部)
+        let comp = NoVncComponent::new();
+        let cmd = comp.build_install_command(LinuxPackageManager::Dnf);
+        assert!(cmd.args.last().unwrap().contains("--allowerasing"));
+        assert!(cmd.args.last().unwrap().contains("--setopt=strict=0"));
+    }
+}

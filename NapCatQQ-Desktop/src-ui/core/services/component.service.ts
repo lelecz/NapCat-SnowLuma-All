@@ -1,0 +1,180 @@
+// Component 安装 / 探测 / 操作 IPC 服务。
+// 本域的命令名只在此文件出现，后端改命令名只改这一处。
+//
+// 浏览器预览模式直接走 mock，给前端 UI 实时进度动画。
+
+import { invoke, isTauri } from '../ipc/transport';
+import type {
+    ComponentDetectResult,
+    ComponentId,
+    ComponentInfo,
+    DependencyPlan,
+    LocalQqSource,
+    NodeEnvironmentCandidate,
+    NodeProbeResult,
+    RequirementPhase,
+    RuntimeReadiness,
+    SnowLumaLinuxPackage,
+    StepKind,
+} from '../ipc/types';
+import type { QqDependencyReport } from '../ipc/generated/qq/QqDependencyReport';
+import type { InstallDependenciesResult } from '../ipc/generated/qq/InstallDependenciesResult';
+import {
+    mockCancelAction,
+    mockComponentCatalog,
+    mockDependencyPlan,
+    mockDetect,
+    mockLocalQqSource,
+    mockRunAction,
+    mockRuntimeReadiness,
+} from '../ipc/mock/component.mock';
+import { withMockDelay } from '../ipc/mock/bootstrap.mock';
+
+export const componentService = {
+    openDirectory: async (componentId: ComponentId, hostId: string): Promise<void> => {
+        if (!isTauri) throw new Error('只能在桌面客户端中打开本地目录');
+        await invoke<void>('open_component_directory', { componentId, hostId });
+    },
+
+    listComponents: async (): Promise<ComponentInfo[]> => {
+        if (isTauri) return invoke<ComponentInfo[]>('list_components');
+        return withMockDelay(mockComponentCatalog, 200);
+    },
+
+    detectComponent: async (
+        componentId: ComponentId,
+        hostId: string,
+    ): Promise<ComponentDetectResult> => {
+        if (isTauri) {
+            return invoke<ComponentDetectResult>('detect_component', {
+                componentId,
+                hostId,
+            });
+        }
+        return withMockDelay(mockDetect(componentId, hostId), 150);
+    },
+
+    runComponentAction: async (
+        componentId: ComponentId,
+        hostId: string,
+        kind: StepKind,
+        taskId?: string,
+        snowlumaLinuxPackage?: SnowLumaLinuxPackage | null,
+        sudoPassword?: string,
+        rememberSudo?: boolean,
+    ): Promise<string> => {
+        if (isTauri) {
+            return invoke<string>('run_component_action', {
+                componentId,
+                hostId,
+                kind,
+                taskId: taskId ?? null,
+                snowlumaLinuxPackage: snowlumaLinuxPackage ?? null,
+                ...(sudoPassword === undefined
+                    ? {}
+                    : { sudoPassword, rememberSudo: rememberSudo ?? false }),
+            });
+        }
+        return withMockDelay(mockRunAction(componentId, hostId, kind, taskId), 50);
+    },
+
+    cancelComponentAction: async (taskId: string): Promise<void> => {
+        if (isTauri) {
+            return invoke<void>('cancel_component_action', { taskId });
+        }
+        mockCancelAction(taskId);
+    },
+
+    // 组件在某主机上按阶段的依赖状态（装前预览 / 「为什么不可用」）
+    resolveDependencies: async (
+        componentId: ComponentId,
+        hostId: string,
+        phase: RequirementPhase,
+        snowlumaLinuxPackage?: SnowLumaLinuxPackage | null,
+    ): Promise<DependencyPlan> => {
+        if (isTauri) {
+            return invoke<DependencyPlan>('resolve_component_dependencies', {
+                componentId,
+                hostId,
+                phase,
+                snowlumaLinuxPackage: snowlumaLinuxPackage ?? null,
+            });
+        }
+        return withMockDelay(mockDependencyPlan(componentId, hostId, phase), 150);
+    },
+
+    // 组件自己 + Run 依赖是否都在；SnowLuma 包类型由后端按设置 / 库存决定
+    resolveRuntimeReadiness: async (
+        componentId: ComponentId,
+        hostId: string,
+    ): Promise<RuntimeReadiness> => {
+        if (isTauri) {
+            return invoke<RuntimeReadiness>('resolve_runtime_readiness', {
+                componentId,
+                hostId,
+            });
+        }
+        return withMockDelay(mockRuntimeReadiness(componentId, hostId), 150);
+    },
+
+    // 本机 Bot 冷启动会用组件页装的 QQ 还是用户自己的 QQ
+    localQqSource: async (): Promise<LocalQqSource> => {
+        if (isTauri) return invoke<LocalQqSource>('local_qq_source');
+        return withMockDelay(mockLocalQqSource(), 150);
+    },
+
+    // QQ 系统依赖检测（仅 Linux 远端）。
+    detectQqDependencies: async (hostId: string): Promise<QqDependencyReport> => {
+        if (isTauri) return invoke<QqDependencyReport>('detect_qq_dependencies', { hostId });
+        return withMockDelay(
+            {
+                satisfied: [],
+                missing: [],
+                distroInfo: { family: 'debian', name: 'Ubuntu', version: '24.04' },
+                installCommand: null,
+            } satisfies QqDependencyReport,
+            150,
+        );
+    },
+
+    // QQ 系统依赖安装（仅 Linux 远端）。
+    // sudoPassword: 前端弹框收集到的 sudo 密码，传给后端注入 Host 执行安装。
+    // None 时后端自动从 keyring 找缓存密码。
+    installQqDependencies: async (
+        hostId: string,
+        packages: string[],
+        sudoPassword?: string,
+    ): Promise<InstallDependenciesResult> => {
+        return invoke<InstallDependenciesResult>('install_qq_dependencies', {
+            hostId,
+            packages,
+            sudoPassword: sudoPassword ?? null,
+        });
+    },
+
+    // 记住远端服务器的 sudo 密码（用于提权操作）。
+    rememberSudoPassword: async (serverId: string, password: string): Promise<void> => {
+        return invoke<void>('remember_sudo_password', {
+            serverId,
+            password,
+        });
+    },
+
+    // 扫描本地 Node.js 运行环境候选
+    probeLocalNodeCandidates: async (): Promise<NodeEnvironmentCandidate[]> => {
+        if (isTauri) return invoke<NodeEnvironmentCandidate[]>('probe_local_node_candidates');
+        return [];
+    },
+
+    // 探测单个 Node 可执行文件
+    probeNodeBinaryVersion: async (path: string): Promise<NodeProbeResult> => {
+        if (isTauri) return invoke<NodeProbeResult>('probe_node_binary_version', { path });
+        return {
+            path,
+            exists: false,
+            version: null,
+            isValid: false,
+            error: 'Mock: not running in Tauri',
+        };
+    },
+};

@@ -1,0 +1,330 @@
+//! 系统包任务的 runner:补主机命令(tar / unzip)与 QQ 系统依赖
+//!
+//! 从 L4 commands/components/{sys_pkg,qq_deps}.rs 下沉。任务提交在 executor.rs,
+//! 这里只负责在拿到 host 之后把事干完并往 task 推进度。
+
+use ncd_component::qq_deps::{
+    QqDependencyDetector, QqDependencyInstaller, qq_qqnt_dependencies_for_locality,
+};
+use ncd_component::{
+    ActionCtx, DependencyTarget, HostPackageGroup, ProgressEvent, ProgressKind, ProgressLogLevel,
+};
+use ncd_domain::InstallDependenciesResult;
+use ncd_host::linux_pkg::{EnsureCommandError, install_missing_command, plan_missing_command};
+use ncd_host::{Host, Os};
+
+use crate::deploy::tasks::{DeploymentTaskContext, DeploymentTaskRunResult};
+
+pub async fn push_task_progress(task_ctx: &DeploymentTaskContext, kind: ProgressKind) {
+    task_ctx.push_progress(ProgressEvent::new(kind)).await;
+}
+
+async fn log(
+    task_ctx: &DeploymentTaskContext,
+    level: ProgressLogLevel,
+    message: impl Into<String>,
+) {
+    push_task_progress(
+        task_ctx,
+        ProgressKind::Log {
+            level,
+            message: message.into(),
+        },
+    )
+    .await;
+}
+
+async fn finish(task_ctx: &DeploymentTaskContext, ok: bool) {
+    push_task_progress(task_ctx, ProgressKind::StepEnd { step: 1, ok }).await;
+    push_task_progress(task_ctx, ProgressKind::Finished { ok }).await;
+}
+
+async fn fail(task_ctx: &DeploymentTaskContext, msg: String) -> DeploymentTaskRunResult {
+    log(task_ctx, ProgressLogLevel::Error, msg.clone()).await;
+    finish(task_ctx, false).await;
+    DeploymentTaskRunResult::failed(msg)
+}
+
+/// 任务队列里「系统包」一类的标识与文案
+pub fn system_package_group(target: &DependencyTarget) -> Option<String> {
+    match target {
+        DependencyTarget::HostCommand { command, .. } => Some(format!("archive_tool:{command}")),
+        DependencyTarget::HostPackages { group } => Some(group.as_str().to_string()),
+        DependencyTarget::Component { .. } => None,
+    }
+}
+
+pub fn system_package_title(target: &DependencyTarget) -> String {
+    match target {
+        DependencyTarget::HostCommand { command, .. } => format!("准备系统工具 {command}"),
+        DependencyTarget::HostPackages {
+            group: HostPackageGroup::QqDependencies,
+        } => "安装 QQ 系统依赖".to_string(),
+        DependencyTarget::Component { id } => id.as_str().to_string(),
+    }
+}
+
+/// 按目标分派 runner
+pub async fn run_system_package_task(
+    target: DependencyTarget,
+    host: &dyn Host,
+    task_ctx: DeploymentTaskContext,
+) -> DeploymentTaskRunResult {
+    match target {
+        DependencyTarget::HostCommand { command, package } => {
+            ensure_host_command_task(&command, &package, host, task_ctx).await
+        }
+        DependencyTarget::HostPackages {
+            group: HostPackageGroup::QqDependencies,
+        } => install_qq_dependencies_task(host, Vec::new(), None, task_ctx).await,
+        DependencyTarget::Component { id } => {
+            DeploymentTaskRunResult::failed(format!("{} 不是系统包目标", id.as_str()))
+        }
+    }
+}
+
+/// 缺命令就用包管理器装 `package`;已在 PATH 上直接成功
+pub async fn ensure_host_command_task(
+    command: &str,
+    package: &str,
+    host: &dyn Host,
+    task_ctx: DeploymentTaskContext,
+) -> DeploymentTaskRunResult {
+    push_task_progress(&task_ctx, ProgressKind::Started { total_steps: 1 }).await;
+    push_task_progress(
+        &task_ctx,
+        ProgressKind::StepBegin {
+            step: 1,
+            message: format!("检查系统工具 {command}"),
+        },
+    )
+    .await;
+
+    if host.command_exists(command).await {
+        log(
+            &task_ctx,
+            ProgressLogLevel::Info,
+            format!("{command} 已可用"),
+        )
+        .await;
+        finish(&task_ctx, true).await;
+        return DeploymentTaskRunResult::ok(format!("{command} 已就绪"));
+    }
+
+    // 自动补装只认 Linux 包管理器;别的系统直接说清楚,别报成「没识别到包管理器」
+    if host.os() != Os::Linux {
+        return fail(
+            &task_ctx,
+            format!("缺少 {command}，自动安装只支持 Linux 主机，请手动安装 {package} 后重试"),
+        )
+        .await;
+    }
+
+    let pm = match plan_missing_command(host, command).await {
+        // 上面刚探过不在,这里又在了:别的任务刚装上,按已就绪算
+        Ok(None) => {
+            finish(&task_ctx, true).await;
+            return DeploymentTaskRunResult::ok(format!("{command} 已就绪"));
+        }
+        Ok(Some(pm)) => pm,
+        Err(err) => return fail(&task_ctx, ensure_failure_message(command, package, err)).await,
+    };
+
+    log(
+        &task_ctx,
+        ProgressLogLevel::Info,
+        format!("通过 {} 安装 {package}", pm.binary()),
+    )
+    .await;
+    match install_missing_command(host, pm, command, package).await {
+        Ok(()) => {
+            finish(&task_ctx, true).await;
+            DeploymentTaskRunResult::ok(format!("{command} 已安装"))
+        }
+        Err(err) => fail(&task_ctx, ensure_failure_message(command, package, err)).await,
+    }
+}
+
+fn ensure_failure_message(command: &str, package: &str, err: EnsureCommandError) -> String {
+    match err {
+        EnsureCommandError::NoPackageManager => {
+            format!("主机缺少 {command} 且未识别到包管理器，请手动安装 {package} 后重试")
+        }
+        EnsureCommandError::NeedsElevation(pm) => format!(
+            "安装 {package} 需要 sudo 权限，请手动执行 sudo {} 后重试",
+            pm.install_hint(&[package])
+        ),
+        EnsureCommandError::StillMissing { detail, .. } => {
+            format!("安装 {package} 后仍无法找到 {command}: {detail}")
+        }
+    }
+}
+
+/// 装 QQ 系统依赖;`packages` 为空时先探测缺什么
+pub async fn install_qq_dependencies_task(
+    host: &dyn Host,
+    packages: Vec<String>,
+    sudo_password: Option<String>,
+    task_ctx: DeploymentTaskContext,
+) -> DeploymentTaskRunResult {
+    if host.os() != Os::Linux {
+        return DeploymentTaskRunResult::failed(
+            "QQ dependencies installation is only supported on Linux",
+        );
+    }
+
+    push_task_progress(&task_ctx, ProgressKind::Started { total_steps: 1 }).await;
+    push_task_progress(
+        &task_ctx,
+        ProgressKind::StepBegin {
+            step: 1,
+            message: "安装 QQ 系统依赖".into(),
+        },
+    )
+    .await;
+
+    let packages = if packages.is_empty() {
+        log(&task_ctx, ProgressLogLevel::Info, "检测 QQ 系统依赖").await;
+        let detector =
+            QqDependencyDetector::new(qq_qqnt_dependencies_for_locality(host.locality()));
+        match detector.detect(host, None).await {
+            Ok(report) => report.missing.into_iter().map(|p| p.name).collect(),
+            Err(err) => return fail(&task_ctx, format!("检测 QQ 系统依赖失败: {err}")).await,
+        }
+    } else {
+        packages
+    };
+
+    if packages.is_empty() {
+        log(&task_ctx, ProgressLogLevel::Info, "QQ 系统依赖已满足").await;
+        finish(&task_ctx, true).await;
+        return DeploymentTaskRunResult::ok("QQ 系统依赖已满足");
+    }
+
+    log(
+        &task_ctx,
+        ProgressLogLevel::Info,
+        format!(
+            "缺失 {} 个 QQ 系统依赖: {}",
+            packages.len(),
+            packages.join(", ")
+        ),
+    )
+    .await;
+
+    match run_qq_installer(host, packages, sudo_password, &task_ctx).await {
+        Ok(result) if result.elevation_required => {
+            fail(
+                &task_ctx,
+                "elevation_required: 安装 QQ 系统依赖需要 sudo 密码，请输入密码后重试".to_string(),
+            )
+            .await
+        }
+        Ok(result) if result.success => {
+            log(
+                &task_ctx,
+                ProgressLogLevel::Info,
+                format!("QQ 系统依赖安装成功: {}", result.installed.join(", ")),
+            )
+            .await;
+            finish(&task_ctx, true).await;
+            DeploymentTaskRunResult::ok(format!("已安装 {} 个 QQ 系统依赖", result.installed.len()))
+        }
+        Ok(result) => fail(&task_ctx, qq_install_failure_message(&result)).await,
+        Err(err) => fail(&task_ctx, format!("安装 QQ 系统依赖失败: {err}")).await,
+    }
+}
+
+/// 用户显式点「安装 QQ 依赖」走这条:包列表 / 密码由调用方给,结果原样返回给 UI
+pub async fn run_qq_dependency_install_for_command(
+    host: &dyn Host,
+    packages: Vec<String>,
+    sudo_password: Option<String>,
+    task_ctx: DeploymentTaskContext,
+) -> Result<InstallDependenciesResult, String> {
+    push_task_progress(&task_ctx, ProgressKind::Started { total_steps: 1 }).await;
+    push_task_progress(
+        &task_ctx,
+        ProgressKind::StepBegin {
+            step: 1,
+            message: "安装 QQ 系统依赖".into(),
+        },
+    )
+    .await;
+    log(
+        &task_ctx,
+        ProgressLogLevel::Info,
+        if packages.is_empty() {
+            "安装 QQ 系统依赖: 未指定包列表".to_string()
+        } else {
+            format!("安装 QQ 系统依赖: {}", packages.join(", "))
+        },
+    )
+    .await;
+
+    // 出错也要把原因写进步骤日志并收尾,不然任务详情一直转着圈、看不到为什么失败
+    let result = match run_qq_installer(host, packages, sudo_password, &task_ctx).await {
+        Ok(result) => result,
+        Err(err) => {
+            let msg = err.to_string();
+            log(
+                &task_ctx,
+                ProgressLogLevel::Error,
+                format!("安装 QQ 系统依赖失败: {msg}"),
+            )
+            .await;
+            finish(&task_ctx, false).await;
+            return Err(msg);
+        }
+    };
+
+    let ok = result.success && !result.elevation_required;
+    if ok {
+        log(
+            &task_ctx,
+            ProgressLogLevel::Info,
+            format!("QQ 系统依赖安装成功: {}", result.installed.join(", ")),
+        )
+        .await;
+    }
+    finish(&task_ctx, ok).await;
+    Ok(result)
+}
+
+pub fn qq_install_failure_message(result: &InstallDependenciesResult) -> String {
+    let failed = result
+        .failed
+        .iter()
+        .map(|f| format!("{}: {}", f.name, f.reason))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failed.is_empty() {
+        "QQ 系统依赖安装失败".to_string()
+    } else {
+        format!("部分 QQ 系统依赖安装失败: {failed}")
+    }
+}
+
+/// 把 installer 的 ActionCtx 进度转发到 task。转完才返回:调用方紧接着推的
+/// 结果日志和 Finished 必须排在 installer 自己的日志后面
+async fn run_qq_installer(
+    host: &dyn Host,
+    packages: Vec<String>,
+    sudo_password: Option<String>,
+    task_ctx: &DeploymentTaskContext,
+) -> Result<InstallDependenciesResult, ncd_component::ActionError> {
+    let (mut ctx, mut rx) = ActionCtx::new();
+    let forward_to = task_ctx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            forward_to.push_progress(event).await;
+        }
+    });
+    let result = QqDependencyInstaller
+        .install(host, packages, sudo_password.as_deref(), &mut ctx)
+        .await;
+    // 发送端全丢掉,转发任务把剩下的推完就会退出
+    drop(ctx);
+    let _ = forwarder.await;
+    result
+}

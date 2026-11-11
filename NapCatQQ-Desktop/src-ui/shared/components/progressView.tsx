@@ -1,0 +1,252 @@
+// 安装 / 更新进度的行内渲染子件。组件页的机器行和 Docker 行、应用端实例的安装进度、
+// 任务详情都用它，放在 shared 里，免得几个模块互相伸手或各画一份进度 UI。
+
+import React from 'react';
+import { CheckCircle2, Loader2, Radio, Repeat } from 'lucide-react';
+import { Progress } from '../ui';
+import { MotionIcon } from '../ui/motion';
+import { cn } from '../utils/cn';
+import {
+    type ActionProgressView,
+    deriveEtaSeconds,
+    downloadStageLabel,
+    formatBytes,
+    formatEta,
+    formatSpeed,
+    isIndeterminate,
+} from '../../core/domain/components/progress';
+
+function progressSuccessEnterKey(progress: ActionProgressView): string {
+    return `success-${progress.overallPercent}-${progress.message ?? ''}`;
+}
+
+function taskLevelPercent(progress: ActionProgressView): number {
+    return progress.dockerLayers.length > 0 ? progress.percent : progress.overallPercent;
+}
+
+export const ProgressLine: React.FC<{
+    progress: ActionProgressView;
+    className?: string;
+    /** 卡片底栏只展示一行摘要；完整下载信息仍可通过提示和辅助技术读取。 */
+    compact?: boolean;
+}> = ({ progress, className, compact = false }) => {
+    const row = (inner: React.ReactNode) => (
+        <div className={cn('mt-1 flex min-w-0 max-w-full items-center gap-2', className)}>
+            {inner}
+        </div>
+    );
+
+    if (progress.status === 'failed' || progress.status === 'cancelled') {
+        const isCancelled = progress.status === 'cancelled';
+        return row(
+            <>
+                <span
+                    aria-hidden
+                    className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${isCancelled ? 'bg-warning' : 'bg-danger'}`}
+                />
+                <span className={`min-w-0 truncate text-[12px] text-text-tertiary`}>
+                    {isCancelled ? '已取消' : '任务失败'}
+                </span>
+            </>,
+        );
+    }
+    if (progress.status === 'success') {
+        return row(
+            <>
+                <MotionIcon
+                    icon={CheckCircle2}
+                    motion="pulse"
+                    playEnter
+                    enterKey={progressSuccessEnterKey(progress)}
+                    size={12}
+                    className="shrink-0 text-success"
+                />
+                <span className="min-w-0 truncate text-[12px] text-success">已完成</span>
+            </>,
+        );
+    }
+
+    const isDownload = progress.downloadStage != null;
+    const indeterminate = isIndeterminate(progress);
+
+    if (!isDownload) {
+        return row(
+            <>
+                <MotionIcon
+                    icon={Loader2}
+                    motion="spin"
+                    playEnter={false}
+                    size={12}
+                    className="shrink-0 text-brand"
+                />
+                <span
+                    className="min-w-0 truncate text-[12px] text-text-secondary"
+                    title={progress.message || '处理中…'}
+                >
+                    {progress.message || '处理中…'}
+                </span>
+                <span className="ml-auto shrink-0 font-mono text-[11.5px] tabular-nums text-text-secondary">
+                    {progress.overallPercent}%
+                </span>
+            </>,
+        );
+    }
+
+    const stageLabel = downloadStageLabel(progress.downloadStage) ?? '下载中';
+    const eta = deriveEtaSeconds(progress);
+    const bytesText =
+        progress.downloadedBytes != null && progress.totalBytes != null
+            ? `${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`
+            : progress.downloadedBytes != null
+              ? formatBytes(progress.downloadedBytes)
+              : null;
+    const trailingMetric =
+        progress.speedBps != null
+            ? formatSpeed(progress.speedBps)
+            : eta != null
+              ? `ETA ${formatEta(eta)}`
+              : null;
+    const downloadDetails = [
+        stageLabel,
+        bytesText,
+        trailingMetric,
+        indeterminate ? null : `${progress.percent}%`,
+        progress.message.trim(),
+    ]
+        .filter(Boolean)
+        .join(' · ');
+
+    // message 可能只含阶段；单位匹配仅用于去重，实际数值仍来自结构化字段。
+    const message = progress.message.trim();
+    const messageHasBytes = /(?:^|[\s·])\d+(?:\.\d+)?\s*(?:[KMGT]i?)?B(?=$|[\s·]|\/\s*\d)/i.test(
+        message,
+    );
+    const messageHasTrailingMetric =
+        progress.speedBps != null
+            ? /\d+(?:\.\d+)?\s*(?:[KMGT]i?)?B\/s\b/i.test(message)
+            : Boolean(trailingMetric && message.includes(trailingMetric));
+    const primaryMessage = [message || stageLabel, messageHasBytes ? null : bytesText]
+        .filter(Boolean)
+        .join(' · ');
+
+    if (compact) {
+        return (
+            <div
+                className={cn('mt-1 min-w-0 max-w-full text-[11.5px]', className)}
+                role="group"
+                title={downloadDetails}
+                aria-label={downloadDetails}
+            >
+                <div className="flex min-w-0 items-center gap-2">
+                    <StageIcon stage={progress.downloadStage} />
+                    <span className="min-w-0 truncate text-text-secondary">{stageLabel}</span>
+                    {trailingMetric && (
+                        <span className="shrink-0 font-mono tabular-nums text-brand">
+                            {trailingMetric}
+                        </span>
+                    )}
+                    <span className="ml-auto shrink-0 font-mono tabular-nums text-text-secondary">
+                        {indeterminate ? '—' : `${progress.percent}%`}
+                    </span>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div
+            className={cn(
+                'mt-1 flex min-w-0 max-w-full items-center gap-2 text-[11.5px]',
+                className,
+            )}
+            title={downloadDetails}
+        >
+            <StageIcon stage={progress.downloadStage} />
+            <span className="min-w-0 flex-1 truncate text-text-secondary">{primaryMessage}</span>
+            {!messageHasTrailingMetric && trailingMetric && (
+                <span className="shrink-0 font-mono tabular-nums text-brand">{trailingMetric}</span>
+            )}
+            <span className="ml-auto shrink-0 font-mono tabular-nums text-text-secondary">
+                {indeterminate ? '—' : `${progress.percent}%`}
+            </span>
+        </div>
+    );
+};
+
+export function shouldShowProgressBar(progress: ActionProgressView): boolean {
+    if (progress.status === 'failed' || progress.status === 'cancelled') return false;
+    if (progress.status === 'success') return false;
+    return true;
+}
+
+export const ProgressBarOverlay: React.FC<{
+    progress: ActionProgressView;
+    /** Docker/包管理器安装等有明确 percent 时用确定进度条 */
+    determinate?: boolean;
+}> = ({ progress, determinate = false }) => {
+    const indeterminate = isIndeterminate(progress);
+    const tone = progress.downloadStage === 'switching_mirror' ? 'warning' : 'brand';
+    const isDownload = progress.downloadStage != null;
+    const barIndeterminate = determinate
+        ? indeterminate
+        : indeterminate || (!isDownload && progress.overallPercent <= 0);
+    return (
+        <Progress
+            size="sm"
+            tone={tone}
+            value={taskLevelPercent(progress)}
+            indeterminate={barIndeterminate}
+            className="absolute inset-x-0 bottom-0 h-[2px] rounded-none bg-transparent"
+        />
+    );
+};
+
+const StageIcon: React.FC<{ stage: ActionProgressView['downloadStage'] }> = ({ stage }) => {
+    switch (stage) {
+        case 'racing':
+            return (
+                <MotionIcon
+                    icon={Radio}
+                    motion="pulse"
+                    playEnter={false}
+                    size={12}
+                    strokeWidth={2.2}
+                    className="shrink-0 text-brand"
+                />
+            );
+        case 'switching_mirror':
+            return (
+                <MotionIcon
+                    icon={Repeat}
+                    motion="pulse"
+                    playEnter={false}
+                    size={12}
+                    strokeWidth={2.2}
+                    className="shrink-0 text-warning"
+                />
+            );
+        case 'resuming':
+            return (
+                <MotionIcon
+                    icon={Loader2}
+                    motion="spin"
+                    playEnter={false}
+                    size={12}
+                    strokeWidth={2.2}
+                    className="shrink-0 text-info"
+                />
+            );
+        case 'streaming':
+        default:
+            return (
+                <MotionIcon
+                    icon={Loader2}
+                    motion="spin"
+                    playEnter={false}
+                    size={12}
+                    strokeWidth={2.2}
+                    className="shrink-0 text-brand"
+                />
+            );
+    }
+};

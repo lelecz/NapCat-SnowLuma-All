@@ -1,0 +1,243 @@
+// BotCard 子件：头像 / 信息 chip / 底栏工具钮 / 配置摘要 helpers
+
+import { forwardRef, useEffect, useRef, type ComponentType } from 'react';
+import type { LucideProps } from 'lucide-react';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../../../../shared/ui';
+import { ActionMotionIcon, MotionIcon, type MotionIconPreset } from '../../../../shared/ui/motion';
+import { useMotion } from '../../../../hooks/preferences/useMotion';
+import type { BotConfig } from '../../../../core/ipc/generated/domain/BotConfig';
+import { describeAutoRestartSchedule } from '../../../../core/domain/bot/auto-restart';
+import { cn } from '../../../../shared/utils/cn';
+
+export { BotAvatar } from '../../BotAvatar';
+
+export function ToolbarMotionIcon({
+    icon,
+    size,
+    strokeWidth,
+    hoverAccent = true,
+}: {
+    icon: ComponentType<LucideProps>;
+    size: number;
+    strokeWidth: number;
+    hoverAccent?: boolean;
+}) {
+    return (
+        <MotionIcon
+            icon={icon}
+            motion="none"
+            hoverAccent={hoverAccent}
+            size={size}
+            strokeWidth={strokeWidth}
+            playEnter={false}
+        />
+    );
+}
+
+export function InfoChip({
+    icon,
+    iconMotion = 'none',
+    label,
+    value,
+    muted,
+    tooltip,
+    tone = 'neutral',
+}: {
+    icon: ComponentType<LucideProps>;
+    iconMotion?: MotionIconPreset;
+    label?: string;
+    value?: React.ReactNode;
+    muted?: boolean;
+    tooltip?: string;
+    tone?: 'neutral' | 'brand' | 'warning' | 'danger' | 'info';
+}) {
+    const isIconOnly = !value && !label;
+
+    return (
+        <span
+            title={tooltip}
+            data-tooltip={tooltip}
+            className={cn(
+                'inline-flex min-w-0 items-center justify-center transition-colors',
+                isIconOnly
+                    ? 'h-5 w-5 shrink-0 rounded-full border cursor-default'
+                    : 'max-w-full gap-1 rounded-pill border px-1.5 py-0.5 text-2xs',
+                tone === 'neutral' && [
+                    'border-border-subtle/80 bg-inset/80',
+                    muted ? 'text-text-tertiary' : 'text-text-secondary',
+                ],
+                tone === 'brand' && 'border-brand/30 bg-brand-soft/50 text-brand font-medium',
+                tone === 'danger' && 'border-danger/30 bg-danger-soft/50 text-danger font-medium',
+                tone === 'warning' &&
+                    'border-warning/30 bg-warning-soft/50 text-warning font-medium',
+                tone === 'info' && 'border-info/30 bg-info-soft/50 text-info font-medium',
+            )}
+        >
+            <span
+                className={cn(
+                    'inline-flex shrink-0 items-center justify-center',
+                    tone === 'neutral' ? 'text-text-tertiary' : 'currentColor',
+                )}
+            >
+                <ActionMotionIcon
+                    icon={icon}
+                    motion={iconMotion}
+                    size={isIconOnly ? 11 : 10}
+                    strokeWidth={2.2}
+                    playEnter={false}
+                />
+            </span>
+            {label ? (
+                <span
+                    className={cn(
+                        'shrink-0',
+                        tone === 'neutral' ? 'text-text-tertiary' : 'opacity-80',
+                    )}
+                >
+                    {label}
+                </span>
+            ) : null}
+            {value ? (
+                <span
+                    className={cn(
+                        'max-w-[7.5rem] truncate font-medium',
+                        tone === 'neutral'
+                            ? muted
+                                ? 'text-text-tertiary'
+                                : 'text-text'
+                            : 'currentColor',
+                    )}
+                >
+                    {value}
+                </span>
+            ) : null}
+        </span>
+    );
+}
+
+interface IconButtonProps {
+    tooltip: string;
+    onClick: (e: React.MouseEvent) => void;
+    disabled?: boolean;
+    tone?: 'neutral' | 'brand' | 'success' | 'danger';
+    children: React.ReactNode;
+    /// 显隐状态：false 时不渲染（return null），完全移除 DOM。
+    visible?: boolean;
+}
+
+// 底栏工具钮：visible=false 时完全不渲染，避免占位。
+// elegant/standard 档用 CSS transition，rich 档保留 GSAP bindHover。
+export const IconButton = forwardRefIcon();
+
+function forwardRefIcon() {
+    return forwardRef<HTMLButtonElement, IconButtonProps>(function IconButtonImpl(
+        { tooltip, onClick, disabled, tone = 'neutral', children, visible = true },
+        ref,
+    ) {
+        const m = useMotion();
+        const localRef = useRef<HTMLButtonElement | null>(null);
+        const setRef = (node: HTMLButtonElement | null) => {
+            localRef.current = node;
+            if (typeof ref === 'function') ref(node);
+            else if (ref) (ref as React.MutableRefObject<HTMLButtonElement | null>).current = node;
+        };
+
+        // hover 弹性：rich 档用 GSAP bindHover，elegant/standard 档用 CSS transition。
+        useEffect(() => {
+            const el = localRef.current;
+            if (!el || disabled || !visible || !m.enabled || m.level !== 'rich') return;
+            return m.bindHover(el, { lift: null, shadow: false, brightness: false });
+        }, [m.enabled, m.level, m.speed, m.bindHover, disabled, visible]);
+
+        if (!visible) return null;
+
+        return (
+            <Tooltip>
+                <TooltipTrigger asChild>
+                    <button
+                        ref={setRef}
+                        type="button"
+                        aria-label={tooltip}
+                        onClick={onClick}
+                        disabled={disabled}
+                        className={cn(
+                            'inline-flex h-8 w-8 items-center justify-center rounded-xs',
+                            'transition-[color,background-color,transform] duration-150',
+                            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand',
+                            'disabled:cursor-not-allowed disabled:opacity-40',
+                            m.level !== 'rich' && 'hover:scale-[1.04]',
+                            tone === 'neutral' &&
+                                'text-text-secondary hover:bg-inset hover:text-text',
+                            tone === 'brand' && 'text-brand hover:bg-brand-soft',
+                            tone === 'success' && 'text-success hover:bg-success-soft',
+                            tone === 'danger' && 'text-danger hover:bg-danger-soft',
+                        )}
+                    >
+                        {children}
+                    </button>
+                </TooltipTrigger>
+                <TooltipContent>{tooltip}</TooltipContent>
+            </Tooltip>
+        );
+    });
+}
+
+export interface ChannelCount {
+    httpServer: number;
+    httpSse: number;
+    httpClient: number;
+    wsServer: number;
+    wsClient: number;
+    plugins: number;
+    total: number;
+}
+
+export function countEnabledChannels(config: BotConfig): ChannelCount {
+    const c = config.connect;
+    if (!c) {
+        return {
+            httpServer: 0,
+            httpSse: 0,
+            httpClient: 0,
+            wsServer: 0,
+            wsClient: 0,
+            plugins: 0,
+            total: 0,
+        };
+    }
+    const httpServer = (c.httpServers ?? []).filter((x) => x.enable).length;
+    const httpSse = (c.httpSseServers ?? []).filter((x) => x.enable).length;
+    const httpClient = (c.httpClients ?? []).filter((x) => x.enable).length;
+    const wsServer = (c.websocketServers ?? []).filter((x) => x.enable).length;
+    const wsClient = (c.websocketClients ?? []).filter((x) => x.enable).length;
+    const plugins = (c.plugins ?? []).length;
+    return {
+        httpServer,
+        httpSse,
+        httpClient,
+        wsServer,
+        wsClient,
+        plugins,
+        total: httpServer + httpSse + httpClient + wsServer + wsClient + plugins,
+    };
+}
+
+export function channelDetailLabel(c: ChannelCount): string {
+    const parts: string[] = [];
+    if (c.httpServer || c.httpSse) parts.push(`HTTP ${c.httpServer + c.httpSse}`);
+    if (c.httpClient) parts.push(`回调 ${c.httpClient}`);
+    // 与 NapCat 文档一致：服务端=正向 WS，客户端=反向 WS
+    if (c.wsServer) parts.push(`正向 WS ${c.wsServer}`);
+    if (c.wsClient) parts.push(`反向 WS ${c.wsClient}`);
+    if (c.plugins) parts.push(`插件 ${c.plugins}`);
+    return parts.join(' · ');
+}
+
+export function formatRestartHint(config: BotConfig): string | null {
+    const parts: string[] = [];
+    const scheduled = describeAutoRestartSchedule(config.bot.autoRestartSchedule);
+    if (scheduled) parts.push(scheduled);
+    if (config.bot.offlineAutoRestart) parts.push('离线时');
+    if (parts.length === 0) return null;
+    return parts.join(' · ');
+}

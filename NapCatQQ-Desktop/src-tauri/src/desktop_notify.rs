@@ -1,0 +1,151 @@
+// 桌面 Toast:OfflineNotifier + DomainEvent 监听(无 WebView 时仍提醒)
+
+use std::sync::{Arc, OnceLock};
+
+use async_trait::async_trait;
+use ncd_domain::DesktopNotifySettings;
+use ncd_domain::ids::BotId;
+use ncd_domain::napcat_events::NapCatLoginInvalidationReason;
+use ncd_runtime::{
+    BroadcastEventBus, DomainEvent, EventBus, EventFilter, OfflineNoticeKind, OfflineNotifier,
+};
+use tauri::AppHandle;
+#[cfg(not(windows))]
+use tauri_plugin_notification::NotificationExt;
+use tokio::sync::RwLock;
+
+pub struct TauriOfflineNotifier {
+    app: OnceLock<AppHandle>,
+    flags: Arc<RwLock<DesktopNotifySettings>>,
+}
+
+impl TauriOfflineNotifier {
+    pub fn new(flags: Arc<RwLock<DesktopNotifySettings>>) -> Arc<Self> {
+        Arc::new(Self {
+            app: OnceLock::new(),
+            flags,
+        })
+    }
+
+    pub fn bind_app(self: &Arc<Self>, app: AppHandle) {
+        let _ = self.app.set(app);
+    }
+
+    #[cfg(windows)]
+    fn aumid(app: &AppHandle) -> String {
+        app.config().identifier.clone()
+    }
+
+    fn dispatch_toast(app: &AppHandle, headline: &str, body: &str) {
+        let headline = headline.to_string();
+        let body = body.to_string();
+        #[cfg(windows)]
+        {
+            let aumid = Self::aumid(app);
+            let _ = app.run_on_main_thread(move || {
+                crate::windows_toast::show_desktop_toast(&aumid, &headline, &body);
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let notification_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Err(err) = notification_app
+                    .notification()
+                    .builder()
+                    .title(&headline)
+                    .body(&body)
+                    .show()
+                {
+                    tracing::warn!(%err, "desktop notification show failed");
+                }
+            });
+        }
+    }
+
+    fn show(&self, headline: &str, body: &str) {
+        let Some(app) = self.app.get().cloned() else {
+            tracing::debug!("desktop notify skipped: app handle not bound yet");
+            return;
+        };
+        let headline = headline.to_string();
+        let body = body.to_string();
+        Self::dispatch_toast(&app, &headline, &body);
+    }
+}
+
+#[async_trait]
+impl OfflineNotifier for TauriOfflineNotifier {
+    async fn notify(&self, bot_id: &BotId, kind: OfflineNoticeKind) {
+        if !self.flags.read().await.notify_on_offline {
+            return;
+        }
+        let (headline, body) = match kind {
+            OfflineNoticeKind::AutoRestart => {
+                ("Bot 离线", format!("{bot_id} 已离线，已尝试自动重启"))
+            }
+            OfflineNoticeKind::Manual => ("Bot 离线", format!("{bot_id} 已离线，请打开主界面处理")),
+            OfflineNoticeKind::Recovered => ("Bot 已恢复", format!("{bot_id} 已重新上线")),
+        };
+        self.show(headline, &body);
+    }
+}
+
+fn post_notification(app: &AppHandle, headline: &str, body: &str) {
+    TauriOfflineNotifier::dispatch_toast(app, headline, body);
+}
+
+pub fn spawn_desktop_notify_listener(
+    app: AppHandle,
+    event_bus: BroadcastEventBus,
+    flags: Arc<RwLock<DesktopNotifySettings>>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut sub = event_bus.subscribe(EventFilter::all());
+        while let Some(event) = sub.next().await {
+            let cfg = flags.read().await;
+            match &event {
+                DomainEvent::BotProcessExited {
+                    bot_id,
+                    exit_code,
+                    reason,
+                } => {
+                    if !cfg.notify_on_bot_crashed {
+                        continue;
+                    }
+                    let abnormal = exit_code.map(|c| c != 0).unwrap_or(true);
+                    if !abnormal {
+                        continue;
+                    }
+                    let detail = reason
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            exit_code
+                                .map(|c| format!("退出码 {c}"))
+                                .unwrap_or_else(|| "进程已结束".to_string())
+                        });
+                    post_notification(&app, "Bot 进程退出", &format!("{bot_id}：{detail}"));
+                }
+                DomainEvent::NapCatLoginInvalidated { bot_id, reason } => {
+                    if !cfg.notify_on_login_kicked {
+                        continue;
+                    }
+                    let (headline, body) = match reason {
+                        NapCatLoginInvalidationReason::Kicked => (
+                            "QQ 被踢下线",
+                            format!("Bot {bot_id} 账号被踢，请打开主界面重新登录"),
+                        ),
+                        NapCatLoginInvalidationReason::LoggedOut => (
+                            "登录已失效",
+                            format!("Bot {bot_id} 登录失效，请打开主界面处理"),
+                        ),
+                    };
+                    post_notification(&app, headline, &body);
+                }
+                _ => {}
+            }
+        }
+    });
+}

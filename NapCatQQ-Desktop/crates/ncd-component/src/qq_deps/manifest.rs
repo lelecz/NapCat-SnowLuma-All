@@ -1,0 +1,221 @@
+//! QQ Linux 运行时依赖清单定义
+
+use ncd_domain::{DependencyCategory, SystemDependency};
+
+/// QQ Linux 运行时完整依赖清单
+pub struct QQDependencyManifest {
+    pub schema_version: u32,
+    pub for_qq_version: String,
+    pub dependencies: Vec<SystemDependency>,
+}
+
+/// 本机桌面只需要 QQ 运行库；远端安装脚本还依赖虚拟显示和部署工具。
+/// 解包器和协议端工具由各组件的 HostCommand 依赖独立检查。
+pub fn qq_qqnt_dependencies_for_locality(locality: ncd_host::Locality) -> QQDependencyManifest {
+    let mut manifest = qq_qqnt_dependencies_v3_2_25();
+    if locality == ncd_host::Locality::Local {
+        manifest
+            .dependencies
+            .retain(|dependency| dependency.category == DependencyCategory::Runtime);
+    }
+    manifest
+}
+
+/// 获取 QQ 3.2.25 的官方依赖清单
+pub fn qq_qqnt_dependencies_v3_2_25() -> QQDependencyManifest {
+    QQDependencyManifest {
+        schema_version: 1,
+        for_qq_version: "3.2.25-45758".to_string(),
+        dependencies: vec![
+            // Runtime 分类 - 第一部分
+            SystemDependency {
+                canonical_name: "nss".to_string(),
+                debian_package: "libnss3".to_string(),
+                rhel_package: "nss".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Runtime,
+                description: "Network Security Services".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "gbm".to_string(),
+                debian_package: "libgbm1".to_string(),
+                rhel_package: "mesa-libgbm".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Runtime,
+                description: "Generic Buffer Management".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "glib".to_string(),
+                debian_package: "libglib2.0-0".to_string(),
+                rhel_package: "glib2".to_string(),
+                has_t64_variant: true,
+                category: DependencyCategory::Runtime,
+                description: "GLib runtime library".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "atk".to_string(),
+                debian_package: "libatk1.0-0".to_string(),
+                rhel_package: "atk".to_string(),
+                has_t64_variant: true,
+                category: DependencyCategory::Runtime,
+                description: "Accessibility Toolkit".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "atspi".to_string(),
+                debian_package: "libatspi2.0-0".to_string(),
+                rhel_package: "at-spi2-atk".to_string(),
+                has_t64_variant: true,
+                category: DependencyCategory::Runtime,
+                description: "Assistive Technology SPI".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "gtk3".to_string(),
+                debian_package: "libgtk-3-0".to_string(),
+                rhel_package: "gtk3".to_string(),
+                has_t64_variant: true,
+                category: DependencyCategory::Runtime,
+                description: "GTK+ 3 toolkit".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "alsa".to_string(),
+                debian_package: "libasound2".to_string(),
+                rhel_package: "alsa-lib".to_string(),
+                has_t64_variant: true,
+                category: DependencyCategory::Runtime,
+                description: "ALSA sound library".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "xvfb".to_string(),
+                debian_package: "xvfb".to_string(),
+                rhel_package: "xorg-x11-server-Xvfb".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Graphics,
+                description: "X virtual framebuffer".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "xauth".to_string(),
+                debian_package: "xauth".to_string(),
+                rhel_package: "xorg-x11-xauth".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Graphics,
+                description: "X authority utilities".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "curl".to_string(),
+                debian_package: "curl".to_string(),
+                rhel_package: "curl".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "HTTP client".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "jq".to_string(),
+                debian_package: "jq".to_string(),
+                rhel_package: "jq".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "JSON processor".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "cpio".to_string(),
+                debian_package: "cpio".to_string(),
+                rhel_package: "cpio".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "CPIO archiver".to_string(),
+            },
+            // install.sh 静态包补齐(jq/curl/xvfb/xauth/cpio/libnss3/libgbm1 已在上方)
+            SystemDependency {
+                canonical_name: "zip".to_string(),
+                debian_package: "zip".to_string(),
+                rhel_package: "zip".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "ZIP archiver".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "unzip".to_string(),
+                debian_package: "unzip".to_string(),
+                rhel_package: "unzip".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "ZIP extractor".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "screen".to_string(),
+                debian_package: "screen".to_string(),
+                rhel_package: "screen".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "Terminal multiplexer (后台会话)".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "procps".to_string(),
+                debian_package: "procps".to_string(),
+                rhel_package: "procps-ng".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "Process utilities (ps/top)".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "rpm2cpio".to_string(),
+                debian_package: "rpm2cpio".to_string(),
+                rhel_package: "rpm".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Toolchain,
+                description: "RPM to CPIO converter".to_string(),
+            },
+            // Dockerfile + legacy Python 都列的 QQ 运行时库
+            SystemDependency {
+                canonical_name: "notify".to_string(),
+                debian_package: "libnotify4".to_string(),
+                rhel_package: "libnotify".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Runtime,
+                description: "Desktop notification".to_string(),
+            },
+            SystemDependency {
+                canonical_name: "secret".to_string(),
+                debian_package: "libsecret-1-0".to_string(),
+                rhel_package: "libsecret".to_string(),
+                has_t64_variant: false,
+                category: DependencyCategory::Runtime,
+                description: "Secret service library".to_string(),
+            },
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ncd_host::Locality;
+
+    #[test]
+    fn desktop_qq_does_not_require_remote_display_and_script_tools() {
+        let local = qq_qqnt_dependencies_for_locality(Locality::Local);
+        let remote = qq_qqnt_dependencies_for_locality(Locality::Remote);
+        for manifest in [&local, &remote] {
+            assert!(
+                manifest
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.canonical_name == "nss")
+            );
+        }
+        for tool in ["xvfb", "xauth", "screen", "rpm2cpio", "jq"] {
+            assert!(
+                !local
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.canonical_name == tool)
+            );
+            assert!(
+                remote
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.canonical_name == tool)
+            );
+        }
+    }
+}

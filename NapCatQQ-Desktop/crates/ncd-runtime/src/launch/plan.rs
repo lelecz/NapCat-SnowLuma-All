@@ -1,0 +1,823 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+
+use crate::snowluma::SnowLumaStartMode;
+use ncd_domain::bot_config::{BackendType, BotConfig};
+use ncd_domain::ids::BotId;
+use ncd_domain::kinds::RuntimeTarget;
+use ncd_traits::runtime_backend::BotRuntimeConfig;
+
+#[async_trait]
+pub trait RuntimeLaunchPlanner: Send + Sync {
+    async fn build_plan(
+        &self,
+        bot_id: &BotId,
+        config: &BotConfig,
+    ) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FileSystemRuntimeLaunchPlanner {
+    runtime_root: PathBuf,
+    snowluma_data_root: Option<PathBuf>,
+    /// SnowLuma daemon 安装根(含 node.exe 与 entry 脚本)
+    /// None 时回落到 <runtime_root>/snowluma注意:这与 NapCat 的
+    /// runtime_root 不同——NapCat 直接装在 runtime 根,SnowLuma 装在子目录
+    snowluma_runtime_root: Option<PathBuf>,
+    /// 可选 QQ 安装目录(含 QQ.exe)。生产默认 None,侧装 components/QQ 优先、注册表兜底;
+    /// 测试注入假路径,避免 CI runner 依赖本机 QQ。
+    qq_install_path: Option<PathBuf>,
+}
+
+impl FileSystemRuntimeLaunchPlanner {
+    /// 仅 NapCat 路径所需的最小构造(保留向后兼容)SnowLuma 路径未注入
+    /// snowluma_data_root / snowluma_runtime_root,调用 SnowLuma 分支会
+    /// 回落到 <runtime_root>/snowluma
+    pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime_root: runtime_root.into(),
+            snowluma_data_root: None,
+            snowluma_runtime_root: None,
+            qq_install_path: None,
+        }
+    }
+
+    /// 注入 SnowLuma 持久化数据根目录(对齐红线 4.1:由 bootstrap::resolve_data_root
+    /// 单一权威派生,本结构体只是消费者)
+    pub fn with_snowluma_data_root(mut self, data_root: impl Into<PathBuf>) -> Self {
+        self.snowluma_data_root = Some(data_root.into());
+        self
+    }
+
+    /// 注入 SnowLuma daemon 安装根(含 node.exe)
+    /// 与 NapCat runtime_root 严格分离
+    pub fn with_snowluma_runtime_root(mut self, runtime_root: impl Into<PathBuf>) -> Self {
+        self.snowluma_runtime_root = Some(runtime_root.into());
+        self
+    }
+
+    /// 测试注入 QQ 安装目录；生产使用托管目录优先、注册表兜底的解析。
+    pub fn with_qq_install_path(mut self, qq_install: impl Into<PathBuf>) -> Self {
+        self.qq_install_path = Some(qq_install.into());
+        self
+    }
+}
+
+#[async_trait]
+impl RuntimeLaunchPlanner for FileSystemRuntimeLaunchPlanner {
+    async fn build_plan(
+        &self,
+        bot_id: &BotId,
+        config: &BotConfig,
+    ) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+        let snowluma_data_root = self
+            .snowluma_data_root
+            .clone()
+            .unwrap_or_else(|| self.runtime_root.join("snowluma"));
+        let snowluma_runtime_root = self
+            .snowluma_runtime_root
+            .clone()
+            .unwrap_or_else(|| self.runtime_root.join("snowluma"));
+        match config.bot.backend_type {
+            BackendType::NapCat => {
+                if let Some(qq_install) = &self.qq_install_path {
+                    build_napcat_launch_plan_with_qq_install_path(
+                        bot_id,
+                        config,
+                        &self.runtime_root,
+                        qq_install,
+                    )
+                    .await
+                } else {
+                    build_napcat_launch_plan(bot_id, config, &self.runtime_root).await
+                }
+            }
+            BackendType::SnowLuma => {
+                build_snowluma_launch_plan(config, &snowluma_runtime_root, &snowluma_data_root)
+                    .await
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeLaunchPlan {
+    NapCat(NapCatLaunchPlan),
+    SnowLuma(SnowLumaLaunchPlan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NapCatLaunchPlan {
+    pub runtime_root: PathBuf,
+    pub napcat_dir: PathBuf,
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub working_dir: PathBuf,
+    pub load_script_path: PathBuf,
+}
+
+/// SnowLuma 启动计划
+/// 路径来源:所有路径都必须由调用方(最终来自
+/// bootstrap::resolve_data_root 与 PathProbe)传入;本 struct 不在
+/// 业务模块内硬编码 %ProgramData% / %LocalAppData%
+/// 字段语义:
+/// - runtime_root:SnowLuma 安装根,含 node.exe 与 daemon entry 脚本
+/// - snowluma_data_root:SnowLuma 持久化数据根(<data_root>/snowluma)
+///   存放 app-config.json / session.json / per-Bot onebot_<uin>.json 等
+/// - start_mode:本次启动是 ColdStart(backend spawn QQ.exe)还是 HotStart
+///   (attach 到用户已开的 QQ.exe)
+/// - qq_install_path:仅 ColdStart 路径需要;HotStart 留 None
+/// - bot_qq_id:渲染 per-Bot OneBot 配置文件名时使用
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnowLumaLaunchPlan {
+    pub runtime_root: PathBuf,
+    pub snowluma_data_root: PathBuf,
+    pub start_mode: SnowLumaStartMode,
+    pub qq_install_path: Option<PathBuf>,
+    pub bot_qq_id: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeLaunchPlanError {
+    #[error("unsupported runtime target: {0:?}")]
+    UnsupportedTarget(RuntimeTarget),
+    #[error("snowluma node.exe missing at {}", .0.display())]
+    SnowLumaNodeMissing(PathBuf),
+    #[error("snowluma start mode invalid: {0}")]
+    SnowLumaInvalidStartMode(String),
+    #[error("unsupported platform for QQ registry lookup: {0}")]
+    UnsupportedPlatform(String),
+    #[error("required runtime file missing: {message}; checked path: {}", checked_path.display())]
+    MissingFile {
+        message: String,
+        checked_path: PathBuf,
+    },
+    #[error("failed to write loadNapCat.js: {0}")]
+    LoadScript(String),
+}
+
+impl RuntimeLaunchPlan {
+    pub fn into_runtime_config(self, mut cfg: BotRuntimeConfig) -> BotRuntimeConfig {
+        match self {
+            RuntimeLaunchPlan::NapCat(plan) => {
+                cfg.launch_command = std::iter::once(plan.program.to_string_lossy().to_string())
+                    .chain(plan.args)
+                    .collect();
+                cfg.working_dir = Some(plan.working_dir);
+                cfg.environment = plan.environment;
+            }
+            RuntimeLaunchPlan::SnowLuma(plan) => {
+                let local_qr_enabled = cfg!(windows)
+                    && crate::snowluma::session::load_snowluma_app_config(&plan.snowluma_data_root)
+                        .local_qr_login_enabled;
+                cfg.environment.insert(
+                    "SNOWLUMA_LOCAL_QR_LOGIN_ENABLED".to_string(),
+                    if local_qr_enabled { "1" } else { "0" }.to_string(),
+                );
+                // SnowLuma 启动语义由 SnowLumaRuntimeBackend 自己处理(spawn QQ.exe +
+                // daemon load_process),不通过 BotRuntimeConfig.launch_command 触发外部
+                // 进程working_dir 设为 snowluma_data_root,便于运行时调试与日志关联
+                cfg.launch_command = Vec::new();
+                cfg.working_dir = Some(plan.snowluma_data_root);
+                // SnowLumaRuntimeBackend.start 通过 environment 渠道拿 QQ.exe 路径
+                // / start_mode(避免给 BotRuntimeConfig 加新字段)
+                // HotStart 不再透传 attach_pid,由 backend 在 Phase A 自动按 qq_id
+                // 扫一遍系统进程 + tencent:// 探测匹配出真实 PID
+                if let Some(qq_install) = plan.qq_install_path {
+                    cfg.environment.insert(
+                        "SNOWLUMA_QQ_EXE".to_string(),
+                        qq_install
+                            .join(if cfg!(windows) { "QQ.exe" } else { "qq" })
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                // 把 qq_id 也注入环境变量,让 backend 在 HotStart 时自动匹配;
+                // ColdStart 也用得到(落盘配置文件名等)
+                cfg.environment
+                    .insert("SNOWLUMA_QQ_ID".to_string(), plan.bot_qq_id.to_string());
+                let mode_str = match plan.start_mode {
+                    SnowLumaStartMode::ColdStart => "cold_start",
+                    SnowLumaStartMode::HotStart => "hot_start",
+                };
+                cfg.environment
+                    .insert("SNOWLUMA_START_MODE".to_string(), mode_str.to_string());
+            }
+        }
+        cfg
+    }
+}
+
+pub async fn build_runtime_launch_plan(
+    bot_id: &BotId,
+    config: &BotConfig,
+    runtime_root: impl AsRef<Path>,
+    snowluma_runtime_root: impl AsRef<Path>,
+    snowluma_data_root: impl AsRef<Path>,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    match config.bot.backend_type {
+        BackendType::NapCat => {
+            build_napcat_launch_plan(bot_id, config, runtime_root.as_ref()).await
+        }
+        BackendType::SnowLuma => {
+            build_snowluma_launch_plan(
+                config,
+                snowluma_runtime_root.as_ref(),
+                snowluma_data_root.as_ref(),
+            )
+            .await
+        }
+    }
+}
+
+/// 构造 SnowLuma 启动计划(COLD / HOT 两路)
+/// 决策流程:
+/// 1. 从 BotConfig.bot.snowluma_start_mode 读出 start_mode;缺省(None)
+///    回退到 SnowLumaStartMode::ColdStart(设计文档约定的默认行为)
+/// 2. 任何模式都校验 <runtime_root>/node.exe 是常规文件存在
+/// 3. ColdStart 解析 QQ install path(侧装优先,注册表兜底);HotStart 跳过
+async fn build_snowluma_launch_plan(
+    config: &BotConfig,
+    snowluma_runtime_root: &Path,
+    snowluma_data_root: &Path,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    let start_mode = config
+        .bot
+        .snowluma_start_mode
+        .unwrap_or(SnowLumaStartMode::ColdStart);
+
+    // node.exe 是 daemon 的二进制入口，检查可用 node (内置 / 独立组件 / 系统 PATH)
+    let _node_path = resolve_snowluma_node_exe(snowluma_runtime_root).await?;
+
+    let qq_install_path = match start_mode {
+        // SnowLuma 装在 components/SnowLuma,父目录就是 components
+        SnowLumaStartMode::ColdStart => Some(resolve_qq_install_path(
+            snowluma_runtime_root
+                .parent()
+                .unwrap_or(snowluma_runtime_root),
+        )?),
+        SnowLumaStartMode::HotStart => {
+            // HotStart 自带 PID 自动匹配语义(backend Phase A 按 qq_id 扫进程),
+            // 这里不需要 QQ install path:用户手动启动了 QQ,QQ 路径已经定了
+            None
+        }
+    };
+
+    Ok(RuntimeLaunchPlan::SnowLuma(SnowLumaLaunchPlan {
+        runtime_root: snowluma_runtime_root.to_path_buf(),
+        snowluma_data_root: snowluma_data_root.to_path_buf(),
+        start_mode,
+        qq_install_path,
+        bot_qq_id: config.bot.qq_id,
+    }))
+}
+
+async fn resolve_snowluma_node_exe(
+    snowluma_runtime_root: &Path,
+) -> Result<PathBuf, RuntimeLaunchPlanError> {
+    let bundled = snowluma_runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" });
+    if is_regular_file(&bundled).await {
+        return Ok(bundled);
+    }
+    let nested = bundled.join("bin/node");
+    if is_regular_file(&nested).await {
+        return Ok(nested);
+    }
+    if let Some(parent) = snowluma_runtime_root.parent() {
+        let comp_node = parent.join("NodeJs").join(if cfg!(windows) {
+            "node.exe"
+        } else {
+            "bin/node"
+        });
+        if is_regular_file(&comp_node).await {
+            return Ok(comp_node);
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+            if is_regular_file(&candidate).await {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(RuntimeLaunchPlanError::SnowLumaNodeMissing(bundled))
+}
+
+async fn is_regular_file(path: &Path) -> bool {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.is_file(),
+        Err(_) => false,
+    }
+}
+
+pub async fn build_napcat_launch_plan_with_qq_install_path(
+    bot_id: &BotId,
+    config: &BotConfig,
+    runtime_root: impl AsRef<Path>,
+    qq_install: impl AsRef<Path>,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    build_napcat_launch_plan_inner(bot_id, config, runtime_root.as_ref(), qq_install.as_ref()).await
+}
+
+/// 不带 qq_install_path 覆盖的 NapCat 启动计划。
+/// `components_dir` 是这台主机的组件根(DataPaths::components_dir):
+/// NapCat 装在它的 NapCatQQ 子目录,侧装 QQ 在 QQ 子目录,两者同源
+pub async fn build_napcat_launch_plan(
+    bot_id: &BotId,
+    config: &BotConfig,
+    components_dir: impl AsRef<Path>,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    let components_dir = components_dir.as_ref();
+    let qq_install = resolve_qq_install_path(components_dir)?;
+    build_napcat_launch_plan_inner(bot_id, config, components_dir, &qq_install).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn build_napcat_launch_plan_inner(
+    bot_id: &BotId,
+    config: &BotConfig,
+    runtime_root: &Path,
+    qq_install: &Path,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    let napcat_dir = runtime_root.join("NapCatQQ");
+    ensure_runtime_file(
+        &napcat_dir.join("NapCatWinBootMain.exe"),
+        "未检测到 NapCatWinBootMain.exe，请先安装 NapCat 运行时组件",
+    )?;
+    ensure_runtime_file(
+        &napcat_dir.join("NapCatWinBootHook.dll"),
+        "未检测到 NapCatWinBootHook.dll，请先安装 NapCat 运行时组件",
+    )?;
+    ensure_runtime_file(
+        &napcat_dir.join("napcat.mjs"),
+        "未检测到 napcat.mjs，请先安装 NapCat 运行时组件",
+    )?;
+    ensure_runtime_file(
+        &napcat_dir.join("qqnt.json"),
+        "未检测到 qqnt.json，请先安装 NapCat 运行时组件",
+    )?;
+
+    let qq_exe = qq_install.join(if cfg!(windows) { "QQ.exe" } else { "qq" });
+    ensure_runtime_file(&qq_exe, "未检测到 QQ.exe，请确认已安装 QQ NT")?;
+
+    let load_script_path = napcat_dir.join("loadNapCat.js");
+    let napcat_mjs_uri = crate::metrics::napcat_file_uri(&napcat_dir.join("napcat.mjs"))
+        .map_err(RuntimeLaunchPlanError::LoadScript)?;
+
+    // 指标注入必须在本函数内完成：BotManager 与 NativeDeployment::launch 都会
+    // 调 build_plan。若只在 Manager 侧改 loadNapCat.js，launch 里第二次
+    // translate→build_plan 会写回无探针基线，且 spawn 环境也丢 NCD_METRICS_*。
+    // runtime_root 是 components 目录，data_root 为其父。
+    let data_root = runtime_root.parent().unwrap_or(runtime_root);
+    let metrics_prefs = crate::metrics::BotRuntimeMetricsPrefs::from_data_root(data_root);
+    let metrics_plan =
+        match crate::metrics::prepare_inject(data_root, bot_id.as_str(), config, &metrics_prefs) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    target: "ncd_runtime::launch",
+                    bot_id = %bot_id,
+                    %err,
+                    "metrics prepare_inject failed; writing plain loadNapCat.js"
+                );
+                None
+            }
+        };
+
+    // load 脚本内 bake env + require；不要依赖 NODE_OPTIONS 预加载（会抢在 env 写入前执行）
+    let metrics_env = metrics_plan.as_ref().map(|p| {
+        let mut env = BTreeMap::new();
+        crate::metrics::apply_metrics_to_environment(&mut env, p);
+        env
+    });
+    let probe_path = metrics_plan.as_ref().map(|p| p.probe_script.as_path());
+    let load_script = crate::metrics::build_napcat_load_script_with_env(
+        &napcat_mjs_uri,
+        probe_path,
+        metrics_env.as_ref(),
+    );
+    tokio::fs::write(&load_script_path, load_script)
+        .await
+        .map_err(|error| RuntimeLaunchPlanError::LoadScript(error.to_string()))?;
+    if metrics_plan.is_some() {
+        tracing::info!(
+            target: "ncd_runtime::launch",
+            bot_id = %bot_id,
+            path = %load_script_path.display(),
+            "metrics: loadNapCat.js includes env bake + probe require"
+        );
+    }
+
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "NAPCAT_PATCH_PACKAGE".to_string(),
+        napcat_dir.join("qqnt.json").to_string_lossy().to_string(),
+    );
+    environment.insert(
+        "NAPCAT_LOAD_PATH".to_string(),
+        load_script_path.to_string_lossy().to_string(),
+    );
+    environment.insert(
+        "NAPCAT_INJECT_PATH".to_string(),
+        napcat_dir
+            .join("NapCatWinBootHook.dll")
+            .to_string_lossy()
+            .to_string(),
+    );
+    environment.insert(
+        "NAPCAT_LAUNCHER_PATH".to_string(),
+        napcat_dir
+            .join("NapCatWinBootMain.exe")
+            .to_string_lossy()
+            .to_string(),
+    );
+    environment.insert(
+        "NAPCAT_MAIN_PATH".to_string(),
+        napcat_dir.join("napcat.mjs").to_string_lossy().to_string(),
+    );
+    // 本机 NC：NCD_* 仍放进 spawn env 作兜底；不设 NODE_OPTIONS=--require
+    if let Some(plan) = metrics_plan.as_ref() {
+        crate::metrics::apply_metrics_to_environment(&mut environment, plan);
+        environment.insert(
+            "NCD_METRICS_PROBE_PATH".into(),
+            plan.probe_script.to_string_lossy().into_owned(),
+        );
+    }
+
+    Ok(RuntimeLaunchPlan::NapCat(NapCatLaunchPlan {
+        runtime_root: runtime_root.to_path_buf(),
+        napcat_dir: napcat_dir.clone(),
+        program: napcat_dir.join("NapCatWinBootMain.exe"),
+        args: vec![
+            qq_exe.to_string_lossy().to_string(),
+            napcat_dir
+                .join("NapCatWinBootHook.dll")
+                .to_string_lossy()
+                .to_string(),
+            bot_id.as_str().to_string(),
+        ],
+        environment,
+        working_dir: napcat_dir,
+        load_script_path,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+async fn build_napcat_launch_plan_inner(
+    bot_id: &BotId,
+    config: &BotConfig,
+    components_dir: &Path,
+    qq_install: &Path,
+) -> Result<RuntimeLaunchPlan, RuntimeLaunchPlanError> {
+    let qq_app = qq_install.join("resources/app");
+    let napcat_dir = qq_app.join("app_launcher/napcat");
+    let qq = qq_install.join("qq");
+    ensure_runtime_file(&qq, "未检测到 QQ，请先安装 QQ 组件")?;
+    ensure_runtime_file(
+        &napcat_dir.join("napcat.mjs"),
+        "未检测到 NapCat，请先安装 NapCat 组件",
+    )?;
+    let data_root = components_dir.parent().unwrap_or(components_dir);
+    let prefs = crate::metrics::BotRuntimeMetricsPrefs::from_data_root(data_root);
+    let metrics = crate::metrics::prepare_inject(data_root, bot_id.as_str(), config, &prefs)
+        .map_err(|e| RuntimeLaunchPlanError::LoadScript(e.to_string()))?;
+    let mut environment = BTreeMap::new();
+    if let Some(plan) = &metrics {
+        crate::metrics::apply_metrics_to_environment(&mut environment, plan);
+    }
+    let script = crate::metrics::build_napcat_load_script_with_env(
+        &crate::metrics::napcat_file_uri(&napcat_dir.join("napcat.mjs"))
+            .map_err(RuntimeLaunchPlanError::LoadScript)?,
+        metrics.as_ref().map(|p| p.probe_script.as_path()),
+        Some(&environment),
+    );
+    let load_script_path = qq_app.join("loadNapCat.js");
+    tokio::fs::write(&load_script_path, script)
+        .await
+        .map_err(|e| RuntimeLaunchPlanError::LoadScript(e.to_string()))?;
+    let install_base = ncd_domain::qq_install_base_from_qq_bin(&qq.to_string_lossy())
+        .ok_or_else(|| RuntimeLaunchPlanError::LoadScript("无法解析 QQ 安装根".into()))?;
+    ncd_component::remote_qq_entry::set_remote_qq_package_main(
+        &ncd_host::local::LocalLinuxHost::new(),
+        &ncd_host::HostPath::from_posix(install_base),
+        ncd_component::remote_qq_entry::QQ_MAIN_NAPCAT_INJECT,
+    )
+    .await
+    .map_err(RuntimeLaunchPlanError::LoadScript)?;
+    Ok(RuntimeLaunchPlan::NapCat(NapCatLaunchPlan {
+        runtime_root: components_dir.to_path_buf(),
+        napcat_dir: napcat_dir.clone(),
+        program: qq,
+        args: vec![
+            "--no-sandbox".into(),
+            "-q".into(),
+            config.bot.qq_id.to_string(),
+        ],
+        environment,
+        working_dir: qq_install.to_path_buf(),
+        load_script_path,
+    }))
+}
+
+fn ensure_runtime_file(path: &Path, message: &str) -> Result<(), RuntimeLaunchPlanError> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(RuntimeLaunchPlanError::MissingFile {
+            message: message.to_string(),
+            checked_path: path.to_path_buf(),
+        })
+    }
+}
+
+/// 本机冷启动会用哪份 QQ,和 resolve_qq_install_path 同一套优先级
+pub fn local_qq_source(components_dir: &Path) -> ncd_domain::LocalQqSource {
+    if (cfg!(target_os = "linux") && components_dir.join("opt/QQ/qq").is_file())
+        || ncd_component::managed_qq_current_dir(&ncd_component::managed_qq_root(components_dir))
+            .is_some()
+    {
+        ncd_domain::LocalQqSource::Managed
+    } else if resolve_system_qq_install_path().is_ok_and(|p| {
+        p.join(if cfg!(windows) { "QQ.exe" } else { "qq" })
+            .is_file()
+    }) {
+        ncd_domain::LocalQqSource::System
+    } else {
+        ncd_domain::LocalQqSource::Missing
+    }
+}
+
+/// 侧装 components/QQ 的 current 优先;没有才用用户自己装的系统 QQ
+pub(crate) fn resolve_qq_install_path(
+    components_dir: &Path,
+) -> Result<PathBuf, RuntimeLaunchPlanError> {
+    if cfg!(target_os = "linux") {
+        let dir = components_dir.join("opt/QQ");
+        if dir.join("qq").is_file() {
+            return Ok(dir);
+        }
+    }
+    if let Some(dir) =
+        ncd_component::managed_qq_current_dir(&ncd_component::managed_qq_root(components_dir))
+    {
+        return Ok(dir);
+    }
+    resolve_system_qq_install_path()
+}
+
+#[cfg(windows)]
+fn resolve_system_qq_install_path() -> Result<PathBuf, RuntimeLaunchPlanError> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+
+    let hkml = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hkml
+        .open_subkey(ncd_component::QQ_REGISTRY_SUBKEY)
+        .map_err(|error| RuntimeLaunchPlanError::UnsupportedPlatform(error.to_string()))?;
+    let install: String = key
+        .get_value("Install")
+        .map_err(|error| RuntimeLaunchPlanError::UnsupportedPlatform(error.to_string()))?;
+    Ok(PathBuf::from(install))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_system_qq_install_path() -> Result<PathBuf, RuntimeLaunchPlanError> {
+    let dir = PathBuf::from("/opt/QQ");
+    ensure_runtime_file(&dir.join("qq"), "未检测到 QQ，请先安装 QQ 组件")?;
+    Ok(dir)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn resolve_system_qq_install_path() -> Result<PathBuf, RuntimeLaunchPlanError> {
+    Err(RuntimeLaunchPlanError::UnsupportedPlatform(
+        "non-windows platform does not support QQ registry lookup".to_string(),
+    ))
+}
+
+#[cfg(all(test, windows))]
+#[path = "plan_tests.rs"]
+mod managed_qq_tests;
+
+#[cfg(test)]
+mod snowluma_plan_tests {
+    //! 本机 Linux 启动布局及 SnowLuma Node / 启动模式计划。
+
+    use super::*;
+    use ncd_domain::bot_config::{
+        AdvancedConfig, AutoRestartSchedule, BotBasicConfig, BotConfig, ConnectConfig,
+        DeploymentType,
+    };
+    use ncd_domain::ids::BotId;
+    use ncd_domain::kinds::RuntimeTarget;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn make_config(start_mode: Option<SnowLumaStartMode>) -> BotConfig {
+        BotConfig {
+            bot: BotBasicConfig {
+                name: "snowluma-bot".to_string(),
+                qq_id: 100200,
+                music_sign_url: String::new(),
+                auto_restart_schedule: AutoRestartSchedule::default(),
+                offline_auto_restart: false,
+                runtime_target: RuntimeTarget::Local,
+                backend_type: BackendType::SnowLuma,
+                deployment_type: DeploymentType::Native,
+                snowluma_start_mode: start_mode,
+                webui_password_takeover: false,
+            },
+            connect: ConnectConfig::default(),
+            advanced: AdvancedConfig::default(),
+            docker: None,
+            status_command: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_launch_uses_the_managed_qq_and_napcat_tree() {
+        let workspace = tempdir().unwrap();
+        let components = workspace.path().join("components");
+        let qq = components.join("opt/QQ");
+        let napcat = components.join(ncd_domain::remote_paths::REL_NAPCAT_ROOT);
+        tokio::fs::create_dir_all(&napcat).await.unwrap();
+        tokio::fs::write(qq.join("qq"), b"fixture").await.unwrap();
+        tokio::fs::write(napcat.join("napcat.mjs"), b"fixture")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            qq.join("resources/app/package.json"),
+            br#"{"main":"./app_launcher/index.js"}"#,
+        )
+        .await
+        .unwrap();
+        let mut config = make_config(None);
+        config.bot.backend_type = BackendType::NapCat;
+        let RuntimeLaunchPlan::NapCat(plan) =
+            build_napcat_launch_plan(&BotId::from("100200"), &config, &components)
+                .await
+                .unwrap()
+        else {
+            panic!("expected NapCat plan");
+        };
+        assert_eq!(plan.program, qq.join("qq"));
+        assert_eq!(plan.args, ["--no-sandbox", "-q", "100200"]);
+        assert_eq!(
+            plan.napcat_dir,
+            crate::DataPaths::new(workspace.path()).napcat_install_dir()
+        );
+        assert!(plan.load_script_path.is_file());
+        assert_eq!(
+            local_qq_source(&components),
+            ncd_domain::LocalQqSource::Managed
+        );
+    }
+
+    /// 没有内置 node.exe 时使用同一组件根下的 Node.js，不依赖测试机的 PATH 或 QQ。
+    #[tokio::test]
+    async fn snowluma_plan_accepts_managed_node_component() {
+        let components = tempdir().unwrap();
+        let node_dir = components.path().join("NodeJs");
+        tokio::fs::create_dir(&node_dir).await.unwrap();
+        let expected = node_dir.join(if cfg!(windows) {
+            "node.exe"
+        } else {
+            "bin/node"
+        });
+        tokio::fs::create_dir_all(expected.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&expected, b"stub").await.unwrap();
+        let node = resolve_snowluma_node_exe(&components.path().join("SnowLuma"))
+            .await
+            .unwrap();
+        assert_eq!(node, expected);
+    }
+
+    /// HotStart 路径:跳过 QQ install path 解析(即便 Windows 注册表查询失败也应该 OK)
+    /// qq_install_path = None,bot_qq_id 与 snowluma_data_root 透传
+    /// PID 不再持久化,由 backend 在 Phase A 按 qq_id 自动匹配
+    #[tokio::test]
+    async fn snowluma_plan_hot_start_skips_qq_install_resolution() {
+        let runtime_root_dir = tempdir().unwrap();
+        let data_root_dir = tempdir().unwrap();
+        let runtime_root = runtime_root_dir.path();
+        let data_root = data_root_dir.path();
+        tokio::fs::write(
+            runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
+            b"stub",
+        )
+        .await
+        .unwrap();
+
+        let bot_id = BotId::from("bot-1");
+        let config = make_config(Some(SnowLumaStartMode::HotStart));
+
+        let plan =
+            build_runtime_launch_plan(&bot_id, &config, runtime_root, runtime_root, data_root)
+                .await
+                .expect("hot start plan");
+
+        let RuntimeLaunchPlan::SnowLuma(plan) = plan else {
+            panic!("expected SnowLuma plan");
+        };
+        assert_eq!(plan.runtime_root, runtime_root);
+        assert_eq!(plan.snowluma_data_root, data_root);
+        assert_eq!(plan.start_mode, SnowLumaStartMode::HotStart);
+        assert!(plan.qq_install_path.is_none());
+        assert_eq!(plan.bot_qq_id, 100200);
+    }
+
+    /// 在非 Windows 平台 ColdStart 路径会因 QQ install 注册表查询失败返回
+    /// UnsupportedPlatform;Windows 平台才走真实分支本测试仅断言"非 Windows
+    /// 上确实在 ColdStart 时调用了注册表解析(因此返回 UnsupportedPlatform)"
+    /// 用以验证 ColdStart 与 HotStart 的分支差异
+    #[cfg(not(any(windows, target_os = "linux")))]
+    #[tokio::test]
+    async fn snowluma_plan_cold_start_attempts_qq_install_lookup() {
+        let runtime_root_dir = tempdir().unwrap();
+        let data_root_dir = tempdir().unwrap();
+        let runtime_root = runtime_root_dir.path();
+        let data_root = data_root_dir.path();
+        tokio::fs::write(
+            runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
+            b"stub",
+        )
+        .await
+        .unwrap();
+
+        let bot_id = BotId::from("bot-1");
+        let config = make_config(Some(SnowLumaStartMode::ColdStart));
+
+        let result =
+            build_runtime_launch_plan(&bot_id, &config, runtime_root, runtime_root, data_root)
+                .await;
+
+        match result {
+            Err(RuntimeLaunchPlanError::UnsupportedPlatform(_)) => {}
+            other => panic!("expected UnsupportedPlatform on non-windows, got {other:?}"),
+        }
+    }
+
+    /// None start_mode 走 ColdStart 默认行为:与显式 ColdStart 走同一分支
+    /// 本测试只验证默认 fallback 触发了 ColdStart 的 QQ install 解析(在非 Windows
+    /// 上会失败为 UnsupportedPlatform,与显式 ColdStart 行为一致)
+    #[cfg(not(any(windows, target_os = "linux")))]
+    #[tokio::test]
+    async fn snowluma_plan_defaults_to_cold_start_when_unset() {
+        let runtime_root_dir = tempdir().unwrap();
+        let data_root_dir = tempdir().unwrap();
+        let runtime_root = runtime_root_dir.path();
+        let data_root = data_root_dir.path();
+        tokio::fs::write(
+            runtime_root.join(if cfg!(windows) { "node.exe" } else { "node" }),
+            b"stub",
+        )
+        .await
+        .unwrap();
+
+        let bot_id = BotId::from("bot-1");
+        let config = make_config(None);
+
+        let result =
+            build_runtime_launch_plan(&bot_id, &config, runtime_root, runtime_root, data_root)
+                .await;
+
+        match result {
+            Err(RuntimeLaunchPlanError::UnsupportedPlatform(_)) => {}
+            other => panic!(
+                "expected UnsupportedPlatform from ColdStart fallback on non-windows, got {other:?}"
+            ),
+        }
+    }
+
+    /// into_runtime_config SnowLuma 分支:launch_command 必须清空
+    /// working_dir 必须设为 snowluma_data_root(不是 runtime_root)
+    #[test]
+    fn snowluma_into_runtime_config_uses_data_root_as_working_dir() {
+        let runtime_root = PathBuf::from("C:/SnowLumaRuntime");
+        let data_root = PathBuf::from("C:/ProgramData/NapCatQQ Desktop/snowluma");
+        let plan = RuntimeLaunchPlan::SnowLuma(SnowLumaLaunchPlan {
+            runtime_root: runtime_root.clone(),
+            snowluma_data_root: data_root.clone(),
+            start_mode: SnowLumaStartMode::ColdStart,
+            qq_install_path: Some(PathBuf::from("C:/QQ")),
+            bot_qq_id: 100200,
+        });
+
+        let cfg = BotRuntimeConfig::default_path(PathBuf::from("/tmp"), BotId::from("bot-1"));
+        let result = plan.into_runtime_config(cfg);
+
+        assert!(
+            result.launch_command.is_empty(),
+            "launch_command must be empty"
+        );
+        assert_eq!(result.working_dir, Some(data_root));
+    }
+}

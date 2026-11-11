@@ -1,0 +1,209 @@
+// NapCatQQ Desktop - IPC Transport
+//
+// 这是 Tauri IPC 的最薄壳：只暴露 invoke / listen / isTauri，不带任何业务字符串。
+// 业务命令名只允许出现在 `core/services/*.service.ts`。
+//
+// 浏览器预览时（非 Tauri webview）由 services 层判断 isTauri，并 fallback 到
+// `core/ipc/mock/*` 提供的纯前端假数据。
+
+import { Channel, invoke as tauriInvoke } from '@tauri-apps/api/core';
+import type { Window as TauriWindow } from '@tauri-apps/api/window';
+import { isTauri } from '../domain/runtime/env';
+import {
+    listen as tauriListen,
+    type UnlistenFn,
+    type Options as ListenOptions,
+} from '@tauri-apps/api/event';
+
+/// 流式数据通道（终端输出）：比事件快、保序，原始字节不转 JSON。只由 services 层 new
+export { Channel };
+
+/// 是否运行在 Tauri webview 内（vs 浏览器预览模式）。权威在 core/domain/runtime/env，
+/// 这里 re-export 兼容 services 层历史 import 路径。
+export { isTauri };
+
+export type WindowResizeDirection = Parameters<TauriWindow['startResizeDragging']>[0];
+
+/** 将边缘拖动交给窗口系统，不在前端逐帧修改尺寸。 */
+export async function startWindowResizeDragging(direction: WindowResizeDirection): Promise<void> {
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().startResizeDragging(direction);
+}
+
+/// 透传到 `@tauri-apps/api/core` 的 invoke。
+/// services 层应在 `if (isTauri)` 分支调用本函数；否则走 mock。
+export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+    return tauriInvoke<T>(cmd, args);
+}
+
+/// Tauri event listener 薄壳。services / hooks 都不该直接 import
+/// `@tauri-apps/api/event`，统一走这里以便集中替换/打桩。
+export async function listen<T = unknown>(
+    event: string,
+    handler: (payload: T) => void,
+    options?: ListenOptions,
+): Promise<UnlistenFn> {
+    return tauriListen<string>(
+        event,
+        (raw) => {
+            // Tauri v2 + serde_json::to_string 序列化的 payload 是字符串，需要手动 parse。
+            try {
+                const text = raw.payload;
+                const parsed = typeof text === 'string' ? (JSON.parse(text) as T) : (text as T);
+                handler(parsed);
+            } catch (err) {
+                console.error(
+                    `[ipc/transport] failed to parse payload of event ${event}:`,
+                    err,
+                    raw,
+                );
+            }
+        },
+        options,
+    );
+}
+
+/// 打开外部 URL（系统默认浏览器）。Tauri webview 不支持 `<a target="_blank">`，
+/// 统一交给后端，Linux 会隔离 AppImage 的库搜索路径。
+///
+/// 安全闸:只放行 http/https。把任意 url 丢给系统 opener 等于把危险 scheme
+/// (javascript: / file: / data: 等)交给 OS 执行,这里收口成 scheme 白名单。
+/// 可信域 / localhost 都属于 http/https,无需再单列。
+export async function openExternalUrl(url: string): Promise<void> {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        throw new Error(`拒绝打开非法 URL: ${url}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`拒绝打开非 http/https 链接(${parsed.protocol})`);
+    }
+    if (!isTauri) {
+        window.open(parsed.href, '_blank', 'noopener,noreferrer');
+        return;
+    }
+    return tauriInvoke('open_external_url', { url: parsed.href });
+}
+
+/// 打开 Windows「设置 → 应用 → 已安装的应用」。归系统管理的组件（VC++ 运行库、
+/// MSI 装的 Desktop 本身）卸载入口走这里，不跑组件任务。
+/// ms-settings: 不是 http/https，故意不进 openExternalUrl 的 scheme 白名单;
+/// URI 字面量只留在这一个函数里，capabilities 配了 ms-settings:* scope。
+export async function openWindowsAppsSettings(): Promise<void> {
+    const { openUrl } = await import('@tauri-apps/plugin-opener');
+    return openUrl('ms-settings:appsfeatures');
+}
+
+/// 弹原生目录选择对话框，返回所选绝对路径；用户取消返回 null。
+/// 走 tauri-plugin-dialog 的 `open` 命令（directory 模式）。webview 无法用
+/// `<input type=file>` 拿真实文件系统路径，必须走插件。capabilities 已配
+/// `dialog:allow-open`。命令名字面量集中在 transport，不外泄到 services。
+export async function pickDirectory(title: string): Promise<string | null> {
+    const selected = await tauriInvoke<string | string[] | null>('plugin:dialog|open', {
+        options: { directory: true, multiple: false, title },
+    });
+    if (Array.isArray(selected)) return selected[0] ?? null;
+    return selected;
+}
+
+/// 选择单个 .zip 文件，返回绝对路径；取消返回 null。
+export async function pickZipFile(title: string): Promise<string | null> {
+    const selected = await tauriInvoke<string | string[] | null>('plugin:dialog|open', {
+        options: {
+            directory: false,
+            multiple: false,
+            title,
+            filters: [{ name: 'ZIP', extensions: ['zip'] }],
+        },
+    });
+    if (Array.isArray(selected)) return selected[0] ?? null;
+    return selected;
+}
+
+/// 选几张图片（表情包上传），返回绝对路径；取消返回空数组。
+export async function pickImageFiles(title: string): Promise<string[]> {
+    const selected = await tauriInvoke<string | string[] | null>('plugin:dialog|open', {
+        options: {
+            directory: false,
+            multiple: true,
+            title,
+            filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+        },
+    });
+    if (!selected) return [];
+    return Array.isArray(selected) ? selected : [selected];
+}
+
+/// 选几个文本文件（导入长期记忆），返回绝对路径；取消返回空数组。
+export async function pickTextFiles(title: string): Promise<string[]> {
+    const selected = await tauriInvoke<string | string[] | null>('plugin:dialog|open', {
+        options: {
+            directory: false,
+            multiple: true,
+            title,
+            filters: [{ name: '文本', extensions: ['txt', 'md', 'json'] }],
+        },
+    });
+    if (!selected) return [];
+    return Array.isArray(selected) ? selected : [selected];
+}
+
+/// 选几个任意文件（终端文件栏上传），返回绝对路径；取消返回空数组。
+export async function pickAnyFiles(title: string): Promise<string[]> {
+    const selected = await tauriInvoke<string | string[] | null>('plugin:dialog|open', {
+        options: { directory: false, multiple: true, title },
+    });
+    if (!selected) return [];
+    return Array.isArray(selected) ? selected : [selected];
+}
+
+/// 另存为，默认文件名由调用方给；filters 为空时不限类型。取消返回 null。
+export async function saveFileAs(
+    title: string,
+    defaultFileName: string,
+    filters: { name: string; extensions: string[] }[] = [],
+): Promise<string | null> {
+    return tauriInvoke<string | null>('plugin:dialog|save', {
+        options: { title, defaultPath: defaultFileName, filters },
+    });
+}
+
+/// 另存为 ZIP，返回用户选的完整路径；取消返回 null。
+export async function saveZipFile(title: string, defaultFileName: string): Promise<string | null> {
+    const selected = await tauriInvoke<string | null>('plugin:dialog|save', {
+        options: {
+            title,
+            defaultPath: defaultFileName,
+            filters: [{ name: 'ZIP', extensions: ['zip'] }],
+        },
+    });
+    return selected;
+}
+
+/// 窗口原生拖放的事件，坐标已换成网页里的 CSS 像素。
+export type FileDragDropEvent =
+    | { type: 'enter'; paths: string[]; position: { x: number; y: number } | null }
+    | { type: 'over'; position: { x: number; y: number } | null }
+    | { type: 'drop'; paths: string[]; position: { x: number; y: number } | null }
+    | { type: 'leave' };
+
+/// 订阅往窗口里拖文件。窗口开着 dragDropEnabled，网页里的 HTML5 drop 拿不到本机路径，只能走这条；
+/// 按需加载 webview 模块，没用到拖放的页面不带它。
+export async function onFileDragDrop(
+    handler: (event: FileDragDropEvent) => void,
+): Promise<UnlistenFn> {
+    const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+    return getCurrentWebview().onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === 'leave') {
+            handler(p);
+            return;
+        }
+        // DPR 同时包含系统 DPI 和页面缩放；每次读取以跟随跨屏与倍率变化。
+        const logical = p.position.toLogical(window.devicePixelRatio);
+        const position = { x: logical.x, y: logical.y };
+        if (p.type === 'over') handler({ type: 'over', position });
+        else handler({ type: p.type, paths: p.paths, position });
+    });
+}

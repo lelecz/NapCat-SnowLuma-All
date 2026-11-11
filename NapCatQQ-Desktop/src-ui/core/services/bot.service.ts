@@ -1,0 +1,409 @@
+// Bot 子领域 IPC 服务（生命周期 / 配置 / 日志 / QQ 进程枚举 / QQ 登录探测）。
+// 集中所有 `*_bot` / `*_bot_config` / `tail_bot_log` / `list_qq_processes`
+// / `probe_qq_login_info` 类 Tauri command 的字面量。
+
+import { invoke, isTauri } from '../ipc/transport';
+import type { BatchResultResponse, BotActorSnapshot, LogSnapshot } from '../ipc/types';
+import type { BotConfig } from '../ipc/generated/domain/BotConfig';
+import type { ImportableRemoteBot } from '../ipc/generated/domain/ImportableRemoteBot';
+import type { BackendType } from '../ipc/generated/domain/BackendType';
+import type { DeploymentType } from '../ipc/generated/domain/DeploymentType';
+import type { ImportedNetworkConfig } from '../ipc/generated/domain/ImportedNetworkConfig';
+import type { QqLoginInfo } from '../ipc/generated/QqLoginInfo';
+import type { ConfigDrift } from '../ipc/generated/ConfigDrift';
+import type { DriftDecision } from '../ipc/generated/DriftDecision';
+import type { BotRuntimeMetrics } from '../ipc/generated/domain/BotRuntimeMetrics';
+import type { MetricsHistoryPoint } from '../ipc/generated/domain/MetricsHistoryPoint';
+import type { SnowLumaAgreementsPayload } from '../ipc/generated/SnowLumaAgreementsPayload';
+import type { QQProcessInfo } from '../ipc/generated/QQProcessInfo';
+import type { NapcatWebuiBindingDto } from '../ipc/generated/NapcatWebuiBindingDto';
+import type { SnowlumaUiSnapshotDto } from '../ipc/generated/domain/SnowlumaUiSnapshotDto';
+import {
+    buildMockBotConfig,
+    mockBatchDelete,
+    mockBatchStart,
+    mockBatchStop,
+    mockDeleteBotConfig,
+    mockLogSnapshot,
+    mockRemoteNetwork,
+    mockSnapshots,
+    mockStartBot,
+    mockStopBot,
+    mockUpsertBotConfig,
+} from '../ipc/mock/bot.mock';
+
+/// QQ 进程信息（SnowLuma HotStart 模式下的 PID picker）。
+export const botService = {
+    // ── 快照 / 配置 ────────────────────────────────────────────────────────
+    listImportableRemoteBots: async (): Promise<ImportableRemoteBot[]> => {
+        if (isTauri) return invoke<ImportableRemoteBot[]>('list_importable_remote_bots');
+        return [];
+    },
+
+    reconcileRuntimes: async (botIds: string[]): Promise<string[]> => {
+        if (isTauri) return invoke<string[]>('reconcile_bot_runtimes', { botIds });
+        return [];
+    },
+
+    refreshStatuses: async (): Promise<BatchResultResponse> => {
+        if (isTauri) return invoke<BatchResultResponse>('refresh_bot_statuses');
+        return { succeeded: mockSnapshots.map((bot) => bot.bot_id), failed: [] };
+    },
+
+    retrySnowlumaUi: async (botId: string): Promise<void> => {
+        if (isTauri) await invoke('retry_snowluma_ui', { botId });
+    },
+
+    /** 导入迁移：按 NC/SL × Native/Docker 拉取远端网络配置；null = 远端无可迁移内容 */
+    fetchImportedNetwork: (
+        serverId: string,
+        qqId: string,
+        backend: BackendType,
+        deployment: DeploymentType,
+        dockerName?: string | null,
+    ): Promise<ImportedNetworkConfig | null> => {
+        if (isTauri)
+            return invoke<ImportedNetworkConfig | null>('fetch_imported_network', {
+                serverId,
+                qqId,
+                backend,
+                deployment,
+                dockerName: dockerName ?? null,
+            });
+        return Promise.resolve(null);
+    },
+
+    /** 已有的远端 Bot 回读远端 onebot 网络配置，只读；null = 远端没有这份文件 */
+    fetchBotRemoteNetwork: (botId: string): Promise<ImportedNetworkConfig | null> => {
+        if (isTauri)
+            return invoke<ImportedNetworkConfig | null>('fetch_bot_remote_network', { botId });
+        return new Promise((resolve) => setTimeout(() => resolve(mockRemoteNetwork()), 400));
+    },
+
+    listSnapshots: async (): Promise<BotActorSnapshot[]> => {
+        if (isTauri) return invoke<BotActorSnapshot[]>('list_bot_snapshots');
+        return new Promise((resolve) => setTimeout(() => resolve([...mockSnapshots]), 200));
+    },
+
+    getRuntimeMetrics: async (botId: string): Promise<BotRuntimeMetrics> => {
+        if (isTauri) {
+            return invoke<BotRuntimeMetrics>('get_bot_runtime_metrics', {
+                botId,
+            });
+        }
+        // 浏览器预览：假快照，便于看卡片摘要与对话框
+        return {
+            v: 1,
+            bot_id: botId,
+            collected_at_ms: Date.now(),
+            source: 'probe',
+            memory: {
+                rss_bytes: 128 * 1024 * 1024,
+                heap_used_bytes: 48 * 1024 * 1024,
+            },
+            nodes: [
+                {
+                    name: 'http-1',
+                    kind: 'httpServer',
+                    events_out: 1204,
+                    actions_in: 86,
+                    bytes_out: 2_400_000,
+                    bytes_in: 180_000,
+                    errors: 0,
+                    last_activity_at_ms: Date.now() - 12_000,
+                },
+                {
+                    name: 'ws-client',
+                    kind: 'wsClient',
+                    events_out: 340,
+                    actions_in: 12,
+                    bytes_out: 90_000,
+                    bytes_in: 40_000,
+                    errors: 1,
+                    last_activity_at_ms: Date.now() - 45_000,
+                },
+            ],
+            probe: 'active',
+        };
+    },
+
+    getRuntimeMetricsHistory: async (
+        botId: string,
+        fromMs?: number,
+        toMs?: number,
+    ): Promise<MetricsHistoryPoint[]> => {
+        if (isTauri) {
+            return invoke<MetricsHistoryPoint[]>('get_bot_runtime_metrics_history', {
+                botId,
+                fromMs,
+                toMs,
+            });
+        }
+        void botId;
+        const end = toMs ?? Date.now();
+        const start = fromMs ?? end - 3600_000;
+        const step = 60_000;
+        const out: MetricsHistoryPoint[] = [];
+        let t = start;
+        let i = 0;
+        while (t <= end && out.length < 120) {
+            const wave = Math.sin(i / 8) * 0.15 + 1;
+            out.push({
+                v: 1,
+                at_ms: t,
+                memory: {
+                    rss_bytes: Math.round(100 * 1024 * 1024 * wave),
+                },
+                nodes_summary: {
+                    events_out_total: Math.round(800 + i * 12 + wave * 40),
+                    actions_in_total: Math.round(40 + i * 2),
+                    bytes_out_total: Math.round(1_000_000 + i * 8000),
+                    bytes_in_total: Math.round(100_000 + i * 900),
+                },
+            });
+            t += step;
+            i += 1;
+        }
+        return out;
+    },
+
+    listRuntimeMetrics: async (): Promise<BotRuntimeMetrics[]> => {
+        if (isTauri) {
+            return invoke<BotRuntimeMetrics[]>('list_bot_runtime_metrics');
+        }
+        // 预览：与 getRuntimeMetrics 同形，供 catalog 批量路径（避免自引用 botService）
+        return [
+            {
+                v: 1,
+                bot_id: 'preview',
+                collected_at_ms: Date.now(),
+                source: 'probe',
+                memory: {
+                    rss_bytes: 128 * 1024 * 1024,
+                    heap_used_bytes: 48 * 1024 * 1024,
+                },
+                nodes: [
+                    {
+                        name: 'http-1',
+                        kind: 'httpServer',
+                        events_out: 1204,
+                        actions_in: 86,
+                        bytes_out: 2_400_000,
+                        bytes_in: 180_000,
+                        errors: 0,
+                        last_activity_at_ms: Date.now() - 12_000,
+                    },
+                ],
+                probe: 'active',
+            },
+        ];
+    },
+
+    /** 内存中的 NapCat WebUI 端点(多实例 port 可能 +1);冷启动 hydrate 用 */
+    listNapcatWebuiBindings: async (): Promise<NapcatWebuiBindingDto[]> => {
+        if (isTauri) {
+            return invoke('list_napcat_webui_bindings');
+        }
+        return [];
+    },
+
+    /** SnowLuma daemon + per-bot 登录/隧道;冷启动 hydrate 用 */
+    listSnowlumaUiSnapshot: async (): Promise<SnowlumaUiSnapshotDto> => {
+        if (isTauri) {
+            return invoke('list_snowluma_ui_snapshot');
+        }
+        return { daemon_state: null, daemon_states: {}, bots: [] };
+    },
+
+    getSnapshot: async (botId: string): Promise<BotActorSnapshot> => {
+        if (isTauri) return invoke<BotActorSnapshot>('get_bot_snapshot', { botId });
+        return new Promise((resolve, reject) => {
+            setTimeout(() => {
+                const snap = mockSnapshots.find((s) => s.bot_id === botId);
+                if (snap) resolve({ ...snap });
+                else reject(new Error(`Bot not found: ${botId}`));
+            }, 200);
+        });
+    },
+
+    getConfig: async (botId: string): Promise<BotConfig | null> => {
+        if (isTauri) return invoke<BotConfig | null>('get_bot_config', { botId });
+        return new Promise((resolve) => {
+            setTimeout(() => {
+                const snap = mockSnapshots.find((s) => s.bot_id === botId);
+                resolve(snap ? buildMockBotConfig(botId) : null);
+            }, 200);
+        });
+    },
+
+    /// 批量拉所有 Bot 的 backend_type，避免列表页 N+1。
+    /// Tauri 端实装见 `commands::bot::list_bot_flavors`。
+    listFlavors: async (): Promise<Record<string, BackendType>> => {
+        if (isTauri) return invoke<Record<string, BackendType>>('list_bot_flavors');
+        return new Promise((resolve) => {
+            setTimeout(() => {
+                const out: Record<string, BackendType> = {};
+                for (const s of mockSnapshots) out[s.bot_id] = 'napcat';
+                resolve(out);
+            }, 100);
+        });
+    },
+
+    // ── 生命周期 ──────────────────────────────────────────────────────────
+    start: async (botId: string): Promise<BotActorSnapshot> => {
+        if (isTauri) return invoke<BotActorSnapshot>('start_bot', { botId });
+        return mockStartBot(botId);
+    },
+
+    stop: async (botId: string): Promise<BotActorSnapshot> => {
+        if (isTauri) return invoke<BotActorSnapshot>('stop_bot', { botId });
+        return mockStopBot(botId);
+    },
+
+    batchStart: async (botIds: string[]): Promise<BatchResultResponse> => {
+        if (isTauri) return invoke<BatchResultResponse>('batch_start_bots', { botIds });
+        return mockBatchStart(botIds);
+    },
+
+    batchStop: async (botIds: string[]): Promise<BatchResultResponse> => {
+        if (isTauri) return invoke<BatchResultResponse>('batch_stop_bots', { botIds });
+        return mockBatchStop(botIds);
+    },
+
+    batchDelete: async (botIds: string[]): Promise<BatchResultResponse> => {
+        if (isTauri) return invoke<BatchResultResponse>('batch_delete_bots', { botIds });
+        return mockBatchDelete(botIds);
+    },
+
+    activeCount: async (): Promise<number> => {
+        if (isTauri) return invoke<number>('active_bot_count');
+        return mockSnapshots.filter(
+            (s) => s.state === 'running' || s.state === 'starting' || s.state === 'stopping',
+        ).length;
+    },
+
+    upsertConfig: async (config: BotConfig): Promise<BotActorSnapshot> => {
+        if (isTauri) return invoke<BotActorSnapshot>('upsert_bot_config', { config });
+        return mockUpsertBotConfig(config);
+    },
+
+    deleteConfig: async (botId: string): Promise<void> => {
+        if (isTauri) return invoke<void>('delete_bot_config', { botId });
+        return mockDeleteBotConfig(botId);
+    },
+
+    /// 定时重启 cron 校验 + 预览：resolve 接下来几次触发（本地时区 ISO），reject = 解析错误文案。
+    previewAutoRestartCron: async (expr: string): Promise<string[]> => {
+        if (isTauri) return invoke<string[]>('preview_auto_restart_cron', { expr });
+        return [];
+    },
+
+    // ── 日志快照 ─────────────────────────────────────────────────────────
+    /// 拉取 Bot 最近 `lines` 行历史日志。BotLogPage 开页一次调用。
+    tailLog: async (botId: string, lines = 1000): Promise<LogSnapshot> => {
+        if (isTauri) return invoke<LogSnapshot>('tail_bot_log', { botId, lines });
+        return new Promise((resolve) => setTimeout(() => resolve(mockLogSnapshot), 100));
+    },
+
+    /// 带用户决议保存配置。前端保存时如果检测到 drift 并确认了决议后调此命令。
+    upsertConfigWithDecisions: async (
+        config: BotConfig,
+        decisions: DriftDecision[],
+    ): Promise<BotActorSnapshot> => {
+        if (isTauri)
+            return invoke<BotActorSnapshot>('upsert_bot_config_with_decisions', {
+                config,
+                decisions,
+            });
+        return mockUpsertBotConfig(config);
+    },
+
+    // ── Config drift 检测 ────────────────────────────────────────────────
+    /// 启动前检测派生配置文件是否被外部修改。返回 null 表示无差异可直接启动。
+    detectConfigDrift: async (botId: string): Promise<ConfigDrift | null> => {
+        if (isTauri) return invoke<ConfigDrift | null>('detect_bot_config_drift', { botId });
+        // 浏览器 mock：无 drift
+        return null;
+    },
+
+    /// 带用户决议启动 Bot。前端在 ConfigDriftDialog 确认后调此命令。
+    startWithDecisions: async (
+        botId: string,
+        decisions: DriftDecision[],
+    ): Promise<BotActorSnapshot> => {
+        if (isTauri)
+            return invoke<BotActorSnapshot>('start_bot_with_drift_decisions', { botId, decisions });
+        return mockStartBot(botId);
+    },
+
+    // ── 系统进程枚举（QQ.exe）─────────────────────────────────────────────
+    listQQProcesses: async (): Promise<QQProcessInfo[]> => {
+        if (isTauri) return invoke<QQProcessInfo[]>('list_qq_processes');
+        return Promise.resolve([
+            { pid: 12345, name: 'QQ.exe', started_at: 0n, command_line: '' },
+            { pid: 23456, name: 'QQ.exe', started_at: 0n, command_line: '' },
+        ]);
+    },
+
+    /// 探测指定 PID 当前登录的 QQ 账号（HOT 模式 PID picker 用）。
+    /// 走 QQ NT 自带的 9210-9219 tencent:// HTTP 端点，response 里夹带的 JWT
+    /// payload 包含 uin / nickName。`null` = 端口全部不响应或当前未登录。
+    /// 实测每个 PID 命中通常 < 200ms，全端口扫超时上限 10s。
+    probeQQLoginInfo: async (pid: number): Promise<QqLoginInfo | null> => {
+        if (isTauri) return invoke<QqLoginInfo | null>('probe_qq_login_info', { pid });
+        // 浏览器 mock：偶数 PID 当作已登录，构造一个伪 uin。
+        return new Promise((resolve) =>
+            setTimeout(() => {
+                if (pid % 2 === 0) {
+                    resolve({
+                        port: 9210,
+                        uin: String(10000 + pid),
+                        uid: '',
+                        nickname: `Mock-${pid}`,
+                        logged_in: true,
+                    });
+                } else {
+                    resolve(null);
+                }
+            }, 80),
+        );
+    },
+
+    getSnowLumaAgreements: async (botId: string): Promise<SnowLumaAgreementsPayload> => {
+        if (isTauri) return invoke<SnowLumaAgreementsPayload>('get_snowluma_agreements', { botId });
+        return {
+            version: 'mock',
+            consent_required: true,
+            documents: [
+                {
+                    id: 'eula',
+                    title: 'SnowLuma 用户协议',
+                    declared_version: 'mock',
+                    text: '浏览器预览模式下的 SnowLuma 用户协议占位文本。',
+                },
+                {
+                    id: 'privacy',
+                    title: 'SnowLuma 隐私政策',
+                    declared_version: 'mock',
+                    text: '浏览器预览模式下的 SnowLuma 隐私政策占位文本。',
+                },
+            ],
+        };
+    },
+
+    acceptSnowLumaAgreements: async (botId: string, version: string): Promise<void> => {
+        if (isTauri) return invoke<void>('accept_snowluma_agreements', { botId, version });
+    },
+
+    prepareSnowLumaAgreements: async (botId: string): Promise<SnowLumaAgreementsPayload | null> => {
+        if (isTauri)
+            return invoke<SnowLumaAgreementsPayload | null>('prepare_snowluma_agreements', {
+                botId,
+            });
+        return null;
+    },
+
+    releaseSnowLumaAgreementSession: async (botId: string): Promise<void> => {
+        if (isTauri) return invoke<void>('release_snowluma_agreement_session', { botId });
+    },
+};

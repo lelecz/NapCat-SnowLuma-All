@@ -1,0 +1,597 @@
+// 机器卡里的一行：一个组件在这台机器上的状态 + 操作。
+
+import React, { useEffect, useState } from 'react';
+import {
+    Copy,
+    Download,
+    ExternalLink,
+    FolderOpen,
+    MessageCircle,
+    RefreshCw,
+    ScrollText,
+    Trash2,
+    X,
+    Zap,
+} from 'lucide-react';
+import {
+    Button,
+    ContextMenu,
+    ContextMenuTrigger,
+    ContextMenuContent,
+    ContextMenuItem,
+    ContextMenuLabel,
+    ContextMenuSeparator,
+} from '../../shared/ui';
+import { openSystemUninstallOrReport, useOpenExternal } from '../../hooks/useOpenExternal';
+import { pushInfoBar } from '../../hooks/ui/globalInfoBarStore';
+import { openComponentDirectory } from '../../hooks/components/useComponents';
+import type { MachineComponentRow } from '../../core/domain/components/types';
+import type { ActionProgressView } from '../../core/domain/components/progress';
+import type { ComponentActionProgress } from '../../hooks/components/useComponentAction';
+import { useLocalQqSource } from '../../hooks/components/useLocalQqSource';
+import { compareSemver, type ReleaseInfoView } from '../../core/domain/release/normalize';
+import { isComponentUnavailable } from '../../core/domain/components/downloadPolicy';
+import {
+    ProgressLine,
+    ProgressBarOverlay,
+    shouldShowProgressBar,
+} from '../../shared/components/progressView';
+import { ComponentManageCard } from './ComponentEntityCard';
+import { componentLogoIcon } from './componentLogos';
+import {
+    hostComponentStatusBadge,
+    isExternalNodeSource,
+    shouldOfferIndependentNodeInstall,
+    uninstallEntryAction,
+} from './componentStatusPresentation';
+import type { ComponentId, StepKind } from '../../core/ipc/types';
+
+export type RowAction =
+    | { kind: 'install' }
+    | { kind: 'install_independent' }
+    | { kind: 'update' }
+    | { kind: 'uninstall' }
+    | { kind: 'retry_detect' }
+    | { kind: 'cancel'; taskId: string };
+
+export function rowActionToStepKind(action: RowAction): StepKind | null {
+    switch (action.kind) {
+        case 'install':
+            return 'ensure_installed';
+        case 'install_independent':
+            return 'force_install';
+        case 'update':
+            return 'update';
+        case 'uninstall':
+            return 'uninstall';
+        default:
+            return null;
+    }
+}
+
+interface Props {
+    row: MachineComponentRow;
+    hostId: string;
+    latestRemoteVersion: string | null;
+    /** 远端 release 元数据（含更新日志）；null 表示尚未拉到 */
+    latestRelease?: ReleaseInfoView | null;
+    activeProgress: ComponentActionProgress | null;
+    disabled?: boolean;
+    /** 本机有活跃 Bot 时限制 update/uninstall；安装仍可用 */
+    lifecycleBlockedReason?: string | null;
+    onAction: (action: { stepKind: StepKind } | { cancelTaskId: string }) => void;
+    onRetryDetect: () => void;
+    onShowReleaseNotes?: () => void;
+    trailingActions?: React.ReactNode;
+}
+
+export const MachineComponentRowView: React.FC<Props> = ({
+    row,
+    hostId,
+    latestRemoteVersion,
+    latestRelease = null,
+    activeProgress,
+    disabled = false,
+    lifecycleBlockedReason = null,
+    onAction,
+    onRetryDetect,
+    onShowReleaseNotes,
+    trailingActions,
+}) => {
+    const { info, status } = row;
+    const openExternal = useOpenExternal();
+    const canOpenDirectory =
+        hostId === 'local' &&
+        (status.state === 'installed' || status.state === 'unusable') &&
+        ['napcat', 'snowluma', 'qq', 'nodejs', 'uv', 'git', 'redis', 'desktop_self'].includes(
+            info.id,
+        );
+    const isLocalQq = info.id === 'qq' && hostId === 'local';
+    const qqSource = useLocalQqSource(isLocalQq);
+    const usesSystemQq = isLocalQq && qqSource === 'system' && status.state === 'installed';
+    const usesSystemNode = info.id === 'nodejs' && shouldOfferIndependentNodeInstall(status);
+    const canInstallIndependent = usesSystemQq || usesSystemNode;
+    const independentInstallLabel = usesSystemNode ? '独立安装' : '转为 NCD 管理';
+    const managedActionsAllowed = !isLocalQq || qqSource === 'managed';
+
+    const isCancelable =
+        activeProgress != null &&
+        activeProgress.cancellable &&
+        activeProgress.progress.status !== 'success' &&
+        activeProgress.progress.status !== 'failed' &&
+        activeProgress.progress.status !== 'cancelled';
+
+    const handle = (action: RowAction) => {
+        if (action.kind === 'retry_detect') {
+            onRetryDetect();
+            return;
+        }
+        if (action.kind === 'cancel') {
+            onAction({ cancelTaskId: action.taskId });
+            return;
+        }
+        const stepKind = rowActionToStepKind(action);
+        if (stepKind) onAction({ stepKind });
+    };
+
+    const showProgressBar = activeProgress && shouldShowProgressBar(activeProgress.progress);
+
+    const inFlight =
+        activeProgress != null &&
+        activeProgress.progress.status !== 'success' &&
+        activeProgress.progress.status !== 'failed' &&
+        activeProgress.progress.status !== 'cancelled';
+
+    const canShowNotes = !!latestRelease && !!onShowReleaseNotes;
+    const lifecycleDisabled = disabled || inFlight || !!lifecycleBlockedReason;
+    const uninstallAction =
+        !inFlight && managedActionsAllowed ? uninstallEntryAction(info.uninstall, status) : 'none';
+
+    const componentActions = canInstallIndependent ? (
+        <Button
+            size="sm"
+            variant="primary"
+            disabled={disabled || inFlight}
+            title={
+                usesSystemNode
+                    ? '在组件目录安装独立的 Node.js，不改动系统或版本管理器中的 Node.js'
+                    : '单独安装一份 QQ，Bot 下次启动时优先使用；不改动系统 QQ'
+            }
+            onClick={() => handle({ kind: 'install_independent' })}
+        >
+            {independentInstallLabel}
+        </Button>
+    ) : status.state !== 'installed' || managedActionsAllowed ? (
+        <ActionButtons
+            status={status}
+            latestRemoteVersion={latestRemoteVersion}
+            disabled={disabled || inFlight}
+            lifecycleBlockedReason={lifecycleBlockedReason}
+            onAction={handle}
+            componentId={info.id}
+        />
+    ) : null;
+
+    const footer = isCancelable ? (
+        <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => handle({ kind: 'cancel', taskId: activeProgress!.taskId })}
+        >
+            <X size={14} strokeWidth={2} />
+            取消
+        </Button>
+    ) : (
+        <>
+            {trailingActions}
+            {componentActions}
+        </>
+    );
+
+    const hasTitleActions = canShowNotes || !!info.repo_url || uninstallAction !== 'none';
+    const titleAside = hasTitleActions ? (
+        <div className="flex items-center gap-0.5">
+            {canShowNotes && (
+                <button
+                    type="button"
+                    onClick={onShowReleaseNotes}
+                    title="查看发版日志"
+                    aria-label="查看发版日志"
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-text-tertiary transition-colors hover:bg-inset hover:text-text"
+                >
+                    <ScrollText size={13} strokeWidth={2} aria-hidden />
+                </button>
+            )}
+            {info.repo_url && (
+                <button
+                    type="button"
+                    onClick={() => openExternal(info.repo_url!)}
+                    title="打开项目仓库"
+                    aria-label="打开项目仓库"
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-text-tertiary transition-colors hover:bg-inset hover:text-brand"
+                >
+                    <ExternalLink size={13} strokeWidth={2} aria-hidden />
+                </button>
+            )}
+            {uninstallAction === 'task' && (
+                <button
+                    type="button"
+                    disabled={lifecycleDisabled}
+                    title={lifecycleBlockedReason ?? '卸载组件'}
+                    aria-label="卸载组件"
+                    onClick={() => handle({ kind: 'uninstall' })}
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-text-tertiary transition-colors hover:bg-danger-soft hover:text-danger disabled:pointer-events-none disabled:opacity-40"
+                >
+                    <Trash2 size={13} strokeWidth={2} aria-hidden />
+                </button>
+            )}
+            {uninstallAction === 'system' && (
+                // 系统页与 Bot 运行状态无关,不吃 lifecycleDisabled
+                <button
+                    type="button"
+                    title="打开系统应用管理页进行卸载"
+                    aria-label="在系统中卸载"
+                    onClick={() => openSystemUninstallOrReport()}
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-text-tertiary transition-colors hover:bg-danger-soft hover:text-danger"
+                >
+                    <Trash2 size={13} strokeWidth={2} aria-hidden />
+                </button>
+            )}
+        </div>
+    ) : undefined;
+
+    const iconNode =
+        componentLogoIcon(info.id) ??
+        (info.id === 'qq' ? (
+            <MessageCircle size={18} strokeWidth={2} className="text-info" />
+        ) : undefined);
+
+    const updatable =
+        status.state === 'installed' &&
+        managedActionsAllowed &&
+        !!latestRemoteVersion &&
+        !isExternalNodeSource(status.detected.source) &&
+        compareSemver(status.detected.version, latestRemoteVersion) > 0;
+
+    const statusBadge = hostComponentStatusBadge(status, {
+        hasUpdate: managedActionsAllowed && hasUpdate(status, latestRemoteVersion),
+        inFlight,
+    });
+    if (status.state === 'installed' && !inFlight && isLocalQq) {
+        if (qqSource === 'system') {
+            statusBadge.label = '系统 QQ';
+            statusBadge.tone = 'neutral';
+        } else if (qqSource === 'managed') {
+            statusBadge.label = 'NCD 管理';
+        }
+    }
+
+    const handleCopyVersion = async (v: string, label: string) => {
+        try {
+            await navigator.clipboard.writeText(v);
+            pushInfoBar({
+                tone: 'info',
+                title: `已复制${label}`,
+                content: v,
+                autoDismissMs: 2000,
+            });
+        } catch {
+            // ignore
+        }
+    };
+
+    return (
+        <ContextMenu>
+            <ContextMenuTrigger asChild>
+                <div className="h-full min-w-0">
+                    <ComponentManageCard
+                        accent={inFlight ? 'brand' : 'none'}
+                        statusBadge={statusBadge}
+                        title={info.display_name}
+                        icon={iconNode}
+                        titleAside={titleAside}
+                        description={
+                            usesSystemQq
+                                ? '单独安装一份 QQ，供 Bot 下次启动时使用'
+                                : info.description || undefined
+                        }
+                        meta={
+                            <StatusMeta
+                                status={status}
+                                latestRemoteVersion={
+                                    managedActionsAllowed ? latestRemoteVersion : null
+                                }
+                                activeProgress={activeProgress}
+                            />
+                        }
+                        footer={footer}
+                        progressOverlay={
+                            showProgressBar ? (
+                                <ProgressBarOverlay progress={activeProgress!.progress} />
+                            ) : undefined
+                        }
+                    />
+                </div>
+            </ContextMenuTrigger>
+
+            <ContextMenuContent className="w-52">
+                <ContextMenuLabel className="font-mono text-2xs truncate">
+                    {info.display_name}
+                </ContextMenuLabel>
+                <ContextMenuSeparator />
+
+                {isCancelable && (
+                    <ContextMenuItem
+                        tone="danger"
+                        onClick={() => handle({ kind: 'cancel', taskId: activeProgress!.taskId })}
+                    >
+                        <X size={13} className="text-danger" />
+                        <span>取消当前任务</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && canInstallIndependent && (
+                    <ContextMenuItem
+                        tone="brand"
+                        disabled={disabled}
+                        onClick={() => handle({ kind: 'install_independent' })}
+                    >
+                        <Download size={13} className="text-brand" />
+                        <span>{independentInstallLabel}</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && status.state === 'installed' && updatable && !isComponentUnavailable(info.id) && (
+                    <ContextMenuItem
+                        tone="brand"
+                        disabled={disabled || !!lifecycleBlockedReason}
+                        onClick={() => handle({ kind: 'update' })}
+                    >
+                        <Zap size={13} className="text-brand" />
+                        <span>更新至 {latestRemoteVersion}</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && uninstallAction === 'task' && (
+                    <ContextMenuItem
+                        tone="danger"
+                        disabled={disabled || !!lifecycleBlockedReason}
+                        onClick={() => handle({ kind: 'uninstall' })}
+                    >
+                        <Trash2 size={13} className="text-danger" />
+                        <span>卸载组件</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && uninstallAction === 'system' && (
+                    <ContextMenuItem onClick={() => openSystemUninstallOrReport()}>
+                        <ExternalLink size={13} />
+                        <span>在系统中卸载…</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && (status.state === 'not_installed' || status.state === 'unusable') && !isComponentUnavailable(info.id) && (
+                    <ContextMenuItem
+                        tone="brand"
+                        disabled={disabled}
+                        onClick={() => handle({ kind: 'install' })}
+                    >
+                        <Download size={13} className="text-brand" />
+                        <span>安装组件</span>
+                    </ContextMenuItem>
+                )}
+
+                {!inFlight && (status.state === 'unknown' || status.state === 'unusable') && (
+                    <ContextMenuItem
+                        disabled={disabled}
+                        onClick={() => handle({ kind: 'retry_detect' })}
+                    >
+                        <RefreshCw size={13} />
+                        <span>重新探测</span>
+                    </ContextMenuItem>
+                )}
+
+                {canOpenDirectory && (
+                    <ContextMenuItem onSelect={() => openComponentDirectory(info.id)}>
+                        <FolderOpen size={13} />
+                        <span>打开本地目录</span>
+                    </ContextMenuItem>
+                )}
+
+                {canShowNotes && (
+                    <ContextMenuItem onClick={onShowReleaseNotes}>
+                        <ScrollText size={13} />
+                        <span>查看发版日志</span>
+                    </ContextMenuItem>
+                )}
+
+                {info.repo_url && (
+                    <ContextMenuItem onClick={() => openExternal(info.repo_url!)}>
+                        <ExternalLink size={13} />
+                        <span>打开项目仓库</span>
+                    </ContextMenuItem>
+                )}
+
+                {(status.state === 'installed' || latestRemoteVersion) && <ContextMenuSeparator />}
+
+                {status.state === 'installed' && (
+                    <ContextMenuItem
+                        onClick={() => handleCopyVersion(status.detected.version, '当前版本号')}
+                    >
+                        <Copy size={13} />
+                        <span>复制当前版本 (v{status.detected.version})</span>
+                    </ContextMenuItem>
+                )}
+
+                {latestRemoteVersion && (
+                    <ContextMenuItem
+                        onClick={() => handleCopyVersion(latestRemoteVersion, '最新版本号')}
+                    >
+                        <Copy size={13} />
+                        <span>复制最新版本 ({latestRemoteVersion})</span>
+                    </ContextMenuItem>
+                )}
+            </ContextMenuContent>
+        </ContextMenu>
+    );
+};
+
+function hasUpdate(status: MachineComponentRow['status'], latest: string | null): boolean {
+    if (status.state !== 'installed' || !latest) return false;
+    if (isExternalNodeSource(status.detected.source)) return false;
+    return compareSemver(status.detected.version, latest) > 0;
+}
+
+const TERMINAL_DISMISS_MS = 3500;
+
+function isTerminalStatus(status: ActionProgressView['status']): boolean {
+    return status === 'success' || status === 'failed' || status === 'cancelled';
+}
+
+/**
+ * 终态进度行短留后自动让位给本地版本号。
+ *
+ * 终态（success/failed/cancelled）保留 {@link TERMINAL_DISMISS_MS} 让用户看清
+ * 「已完成」反馈，到点后回退到本地版本分支。进行中状态始终显示进度行。
+ *
+ * 用 taskId + status 做 key：换任务或同一任务从进行中切到终态时重置计时器，
+ * 确保终态反馈恰好显示固定时长。
+ */
+function useTerminalDismiss(activeProgress: ComponentActionProgress | null): boolean {
+    const [dismissed, setDismissed] = useState(false);
+
+    const terminal = activeProgress != null && isTerminalStatus(activeProgress.progress.status);
+    // 终态的稳定性 key：task + status 都不变才视为「同一个终态」，重置会触发计时器重启。
+    const terminalKey =
+        activeProgress != null && terminal
+            ? `${activeProgress.taskId}::${activeProgress.progress.status}`
+            : null;
+
+    useEffect(() => {
+        // 进行中（含 null）重置 dismissed，让下一次终态重新计时。
+        if (!terminal) {
+            setDismissed(false);
+            return;
+        }
+        setDismissed(false);
+        const timer = setTimeout(() => setDismissed(true), TERMINAL_DISMISS_MS);
+        return () => clearTimeout(timer);
+    }, [terminal, terminalKey]);
+
+    // 只在「终态且已过 dismissed 计时」时不显示进度行；其它情况（进行中 / 终态短留窗口内）都显示。
+    return terminal && dismissed;
+}
+
+const StatusMeta: React.FC<{
+    status: MachineComponentRow['status'];
+    latestRemoteVersion: string | null;
+    activeProgress: ComponentActionProgress | null;
+}> = ({ status, latestRemoteVersion, activeProgress }) => {
+    const dismissProgress = useTerminalDismiss(activeProgress);
+    if (activeProgress && !dismissProgress) {
+        return <ProgressLine progress={activeProgress.progress} className="mt-0" compact />;
+    }
+    switch (status.state) {
+        case 'installed': {
+            const local = status.detected.version;
+            const updatable =
+                !!latestRemoteVersion &&
+                !isExternalNodeSource(status.detected.source) &&
+                compareSemver(local, latestRemoteVersion) > 0;
+            const isSystemPath = isExternalNodeSource(status.detected.source);
+            return (
+                <p className="truncate font-mono text-xs tabular-nums text-text-tertiary">
+                    {isSystemPath ? `系统 PATH (v${local})` : `本地 ${local}`}
+                    {updatable && (
+                        <span className="ml-1.5 text-warning">最新 {latestRemoteVersion}</span>
+                    )}
+                </p>
+            );
+        }
+        case 'not_installed':
+            return latestRemoteVersion ? (
+                <p className="truncate font-mono text-xs tabular-nums text-text-tertiary">
+                    可装版本 {latestRemoteVersion}
+                </p>
+            ) : (
+                <p className="truncate text-xs text-text-disabled">暂无远端版本信息</p>
+            );
+        case 'unusable': {
+            const where = isExternalNodeSource(status.unusable.source) ? '系统 PATH' : '本地';
+            return (
+                <p
+                    className="truncate text-xs text-warning"
+                    title={`${status.unusable.source}\n${status.unusable.reason}`}
+                >
+                    {where}：{status.unusable.reason}
+                </p>
+            );
+        }
+        case 'unsupported':
+            return <p className="truncate text-xs text-text-disabled">当前系统不支持此组件</p>;
+        case 'unknown': {
+            if (status.reason === '正在探测') {
+                return <p className="truncate text-xs text-text-tertiary">正在探测安装状态…</p>;
+            }
+            return <p className="truncate text-xs text-text-tertiary">探测未成功，详见顶部提示</p>;
+        }
+    }
+};
+
+const ActionButtons: React.FC<{
+    status: MachineComponentRow['status'];
+    latestRemoteVersion: string | null;
+    disabled?: boolean;
+    lifecycleBlockedReason?: string | null;
+    onAction: (a: RowAction) => void;
+    componentId: ComponentId;
+}> = ({ status, latestRemoteVersion, disabled, lifecycleBlockedReason, onAction, componentId }) => {
+    const lifecycleDisabled = disabled || !!lifecycleBlockedReason;
+    // 已不再公开分发的组件（如 SnowLuma）：隐藏安装/更新下载入口
+    if (isComponentUnavailable(componentId) && status.state !== 'installed') return null;
+    switch (status.state) {
+        case 'installed': {
+            const updatable =
+                !!latestRemoteVersion &&
+                !isExternalNodeSource(status.detected.source) &&
+                compareSemver(status.detected.version, latestRemoteVersion) > 0;
+            if (!updatable) return null;
+            return (
+                <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={lifecycleDisabled}
+                    title={lifecycleBlockedReason ?? undefined}
+                    onClick={() => onAction({ kind: 'update' })}
+                >
+                    更新
+                </Button>
+            );
+        }
+        case 'not_installed':
+        case 'unusable':
+            return (
+                <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={disabled}
+                    onClick={() => onAction({ kind: 'install' })}
+                >
+                    安装
+                </Button>
+            );
+        case 'unsupported':
+            return null;
+        case 'unknown':
+            return (
+                <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={disabled}
+                    onClick={() => onAction({ kind: 'retry_detect' })}
+                >
+                    重新探测
+                </Button>
+            );
+    }
+};

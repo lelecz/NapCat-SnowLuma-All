@@ -1,0 +1,150 @@
+// Bot 列表页：把快照里的失败/踢线/崩溃从卡片 meta 挪到全局 InfoBar。
+// 边沿检测 + 模块级 prev（切页不丢）；用户关闭持久态条目前写入抑制，状态恢复后再弹。
+
+import { useEffect } from 'react';
+import type {
+    BotActorSnapshot,
+    DaemonState,
+    NapCatLoginInvalidationReason,
+} from '../../core/ipc/types';
+import { errorBarContent } from '../../core/domain/ui/errorBarCopy';
+import { dismissInfoBar, pushInfoBar } from '../ui/globalInfoBarStore';
+import { isQqSystemDependencyError } from '../components/useQqDependencyAlerts';
+import {
+    clearBotSnapshotAlertSuppression,
+    getBotSnapshotPrev,
+    isBotSnapshotAlertSuppressed,
+    pruneBotSnapshotPrev,
+    setBotSnapshotPrev,
+    suppressBotSnapshotAlert,
+} from './botSnapshotAlertState';
+
+export type BotSnapshotAlertRow = {
+    bot: BotActorSnapshot;
+    displayName: string;
+    invalidationReason: NapCatLoginInvalidationReason | null | undefined;
+    isSnowLuma: boolean;
+    snowlumaDaemonState: DaemonState | null | undefined;
+    offlineAutoRestart: boolean;
+};
+
+function normError(v: string | null | undefined): string | null {
+    const t = v?.trim();
+    return t && t.length > 0 ? t : null;
+}
+
+function isSnowLumaConsentError(raw: string): boolean {
+    return (
+        raw.includes('SNOWLUMA_CONSENT_REQUIRED') ||
+        raw.includes('DESKTOP_CONSENT_REQUIRED') ||
+        raw.includes('"consentRequired":true')
+    );
+}
+
+function pushIfNotSuppressed(alertKey: string, opts: Parameters<typeof pushInfoBar>[0]): void {
+    if (isBotSnapshotAlertSuppressed(alertKey)) return;
+    pushInfoBar({
+        ...opts,
+        key: alertKey,
+        onUserDismiss: () => suppressBotSnapshotAlert(alertKey),
+    });
+}
+
+export function useBotSnapshotAlerts(rows: BotSnapshotAlertRow[]): void {
+    useEffect(() => {
+        const nextIds = new Set<string>();
+
+        for (const row of rows) {
+            const id = row.bot.bot_id;
+            nextIds.add(id);
+            const lastError = normError(row.bot.last_error);
+            const kicked = row.invalidationReason === 'kicked';
+            const crashed = row.bot.state === 'crashed';
+            const daemonCrashed = row.isSnowLuma && row.snowlumaDaemonState === 'crashed';
+
+            const prev = getBotSnapshotPrev(id);
+            const label = row.displayName;
+            const consentRequired = lastError ? isSnowLumaConsentError(lastError) : false;
+
+            const keyLastError = `bot-last-error:${id}`;
+            const keyKicked = `bot-kicked:${id}`;
+            const keyCrashed = `bot-crashed:${id}`;
+            const keyDaemon = `bot-daemon-crashed:${id}`;
+
+            if (!lastError) {
+                clearBotSnapshotAlertSuppression(keyLastError);
+                clearBotSnapshotAlertSuppression(`bot-qq-deps:${id}`);
+                dismissInfoBar(`key:${keyLastError}`);
+                dismissInfoBar(`key:bot-qq-deps:${id}`);
+            }
+            if (!kicked) {
+                clearBotSnapshotAlertSuppression(keyKicked);
+                dismissInfoBar(`key:${keyKicked}`);
+            }
+            if (!crashed) {
+                clearBotSnapshotAlertSuppression(keyCrashed);
+                dismissInfoBar(`key:${keyCrashed}`);
+            }
+            if (!daemonCrashed) {
+                clearBotSnapshotAlertSuppression(keyDaemon);
+                dismissInfoBar(`key:${keyDaemon}`);
+            }
+
+            if (lastError && !consentRequired && lastError !== prev.lastError) {
+                if (isQqSystemDependencyError(lastError)) {
+                    pushIfNotSuppressed(`bot-qq-deps:${id}`, {
+                        tone: 'warning',
+                        title: `QQ 系统依赖缺失 · ${label}`,
+                        content: '请到「组件」页按提示一键修复。详情见日志',
+                        autoDismissMs: 0,
+                    });
+                    console.error(`[bots] QQ deps · ${label}:`, lastError);
+                } else if (!crashed) {
+                    pushIfNotSuppressed(keyLastError, {
+                        tone: 'danger',
+                        title: `Bot 异常 · ${label}`,
+                        content: errorBarContent(lastError),
+                    });
+                    console.error(`[bots] ${label}:`, lastError);
+                }
+            }
+
+            if (kicked && !prev.kicked) {
+                pushIfNotSuppressed(keyKicked, {
+                    tone: 'warning',
+                    title: '账号已被踢',
+                    content: row.offlineAutoRestart
+                        ? `${label} 被踢，正在自动重启`
+                        : `${label} 被踢，请手动重启`,
+                    autoDismissMs: row.offlineAutoRestart ? undefined : 0,
+                });
+            }
+
+            if (crashed && !consentRequired && !prev.crashed) {
+                if (lastError) console.error(`[bots] crashed · ${label}:`, lastError);
+                pushIfNotSuppressed(lastError ? keyLastError : keyCrashed, {
+                    tone: 'danger',
+                    title: `Bot 已崩溃 · ${label}`,
+                    content: lastError ? errorBarContent(lastError) : '进程异常退出。详情见日志',
+                });
+            }
+
+            if (daemonCrashed && !prev.daemonCrashed) {
+                pushIfNotSuppressed(keyDaemon, {
+                    tone: 'danger',
+                    title: `SnowLuma daemon 崩溃 · ${label}`,
+                    content: '请查看日志或重启相关 Bot',
+                });
+            }
+
+            setBotSnapshotPrev(id, {
+                lastError,
+                kicked,
+                crashed,
+                daemonCrashed,
+            });
+        }
+
+        pruneBotSnapshotPrev(nextIds);
+    }, [rows]);
+}

@@ -1,0 +1,518 @@
+// 浏览器预览模式下的 Component 假数据库 + 假装安装动画。
+// 真 IPC 实装在 `core/services/component.service.ts`。
+//
+// 本 mock 模拟组件目录 × N 台主机的 detect 结果。"安装 / 取消"动作通过
+// 内置 setInterval 一帧一帧吐 ProgressEvent 给 mock 事件总线，让前端
+// UI 在浏览器预览时也能看到"装到 50%、暂停、继续"的完整动画。
+
+import type {
+    ComponentDetectResult,
+    ComponentId,
+    ComponentInfo,
+    DependencyNode,
+    DependencyPlan,
+    DomainEvent,
+    LocalQqSource,
+    ProgressEvent,
+    RequirementPhase,
+    RuntimeReadiness,
+    StepKind,
+} from '../types';
+import { emitMockEvent } from './events.mock';
+
+// ─── 静态元数据 ─────────────────────────────────────────────────────────
+
+export const mockComponentCatalog: ComponentInfo[] = [
+    {
+        id: 'napcat',
+        display_name: 'NapCat',
+        description: '无 QQ 窗口的协议端',
+        repo_url: 'https://github.com/NapNeko/NapCatQQ',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'framework',
+        uninstall: 'supported',
+    },
+    {
+        id: 'snowluma',
+        display_name: 'SnowLuma',
+        description: '带 QQ 窗口的协议端',
+        repo_url: null,
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'framework',
+        uninstall: 'supported',
+    },
+    {
+        id: 'qq',
+        display_name: 'QQ',
+        description: '框架运行所需的 QQ 客户端',
+        repo_url: 'https://im.qq.com/',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'vcredist',
+        display_name: 'VC++ 运行库',
+        description: 'NapCat 注入器运行所需的 Visual C++ x64 运行库',
+        repo_url: 'https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist',
+        supported_targets: [{ os: 'windows', locality: 'local' }],
+        category: 'runtime_dep',
+        uninstall: 'system_managed',
+    },
+    {
+        id: 'nodejs',
+        display_name: 'Node.js',
+        description: 'JavaScript 运行环境',
+        repo_url: 'https://nodejs.org',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'uv',
+        display_name: 'uv',
+        description: 'Python 包管理与解释器工具链',
+        repo_url: 'https://github.com/astral-sh/uv',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'git',
+        display_name: 'Git',
+        description: '版本管理工具，云崽装本体和插件要用',
+        repo_url: 'https://git-scm.com',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'redis',
+        display_name: 'Redis',
+        description: '键值数据库，云崽存账号绑定和冷却用',
+        repo_url: 'https://github.com/redis-windows/redis-windows',
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'linux', locality: 'local' },
+            { os: 'linux', locality: 'remote' },
+        ],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'novnc',
+        display_name: 'noVNC',
+        description: '远端扫码用的远程桌面',
+        repo_url: 'https://github.com/novnc/noVNC',
+        supported_targets: [{ os: 'linux', locality: 'remote' }],
+        category: 'runtime_dep',
+        uninstall: 'supported',
+    },
+    {
+        id: 'ncd_watch',
+        display_name: 'NCD Watch',
+        description: '本控制台关闭后仍可告警',
+
+        repo_url: 'https://github.com/NapNeko/NapCatQQ-Desktop',
+        supported_targets: [{ os: 'linux', locality: 'remote' }],
+        // 与 Desktop 同属产品侧 SelfApp，不是 QQ/Node 运行时依赖
+        category: 'self_app',
+        uninstall: 'supported',
+    },
+    {
+        id: 'desktop_self',
+        display_name: 'NapCatQQ Desktop',
+        description: '本控制台，可检查更新',
+        repo_url: null,
+        supported_targets: [
+            { os: 'windows', locality: 'local' },
+            { os: 'mac_os', locality: 'local' },
+            { os: 'linux', locality: 'local' },
+        ],
+        category: 'self_app',
+        uninstall: 'system_managed',
+    },
+];
+
+// ─── 假主机注册表 ──────────────────────────────────────────────────────
+//
+// 真后端的 host_id 约定是 "local" / "remote:<id>"。mock 里我们模拟一台本机
+// + 两台远端，让前端的多主机 UI 能在浏览器预览。
+
+interface MockHost {
+    host_id: string;
+    display_name: string;
+    os: 'windows' | 'linux' | 'mac_os';
+    locality: 'local' | 'remote';
+}
+
+export const mockHosts: MockHost[] = [
+    { host_id: 'local', display_name: '本机', os: 'windows', locality: 'local' },
+    {
+        host_id: 'remote:production',
+        display_name: 'remote · production',
+        os: 'linux',
+        locality: 'remote',
+    },
+    { host_id: 'remote:dev', display_name: 'remote · dev', os: 'linux', locality: 'remote' },
+];
+
+// ─── detect 假数据 ─────────────────────────────────────────────────────
+//
+// 用一张二维表表达"哪个主机上装了哪个组件 + 哪个版本"，前端调
+// detectComponent(id, host_id) 时 mock 查表返回。
+
+interface InstalledEntry {
+    version: string;
+    source: string;
+}
+
+const systemQq: InstalledEntry = { version: '9.9.36-53644', source: 'system' };
+
+const installedMatrix: Record<ComponentId, Record<string, InstalledEntry | null>> = {
+    napcat: {
+        local: { version: '4.18.1', source: 'napcat.mjs' },
+        'remote:production': { version: '4.20.0', source: 'napcat.mjs' },
+        'remote:dev': null,
+    },
+    snowluma: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    qq: {
+        local: systemQq,
+        'remote:production': { version: '3.2.25-45758', source: 'qq --version' },
+        'remote:dev': null,
+    },
+    vcredist: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    nodejs: {
+        local: { version: 'v20.10.0', source: 'node -v' },
+        'remote:production': { version: 'v20.10.0', source: 'node -v' },
+        'remote:dev': { version: 'v18.19.0', source: 'node -v' },
+    },
+    novnc: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    ncd_watch: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    windows_agent: {},
+    desktop_self: {
+        local: { version: '0.1.0-alpha.1', source: 'package.json' },
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    uv: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    // 应用端组件按实例安装，不进组件页目录；这里只为类型穷尽
+    karin: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    nonebot2: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    astrbot: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    maibot: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    koishi: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    git: {
+        local: { version: '2.56.0', source: 'cmd/git.exe' },
+        'remote:production': { version: '2.43.0', source: '$PATH/git' },
+        'remote:dev': null,
+    },
+    redis: {
+        local: null,
+        'remote:production': { version: '9.0.6', source: 'bin/valkey-server' },
+        'remote:dev': null,
+    },
+    yunzai: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+    neobot: {
+        local: null,
+        'remote:production': null,
+        'remote:dev': null,
+    },
+};
+
+export function mockDetect(componentId: ComponentId, hostId: string): ComponentDetectResult {
+    const info = mockComponentCatalog.find((c) => c.id === componentId);
+    const host = mockHosts.find((h) => h.host_id === hostId);
+    if (!info || !host) {
+        return {
+            component_id: componentId,
+            host_id: hostId,
+            detected: null,
+            supported: false,
+        };
+    }
+    // 检查 supported_targets 是否覆盖该 host
+    const supported = info.supported_targets.some(
+        (t) => t.os === host.os && t.locality === host.locality,
+    );
+    if (!supported) {
+        return {
+            component_id: componentId,
+            host_id: hostId,
+            detected: null,
+            supported: false,
+        };
+    }
+    const entry = installedMatrix[componentId][hostId] ?? null;
+    return {
+        component_id: componentId,
+        host_id: hostId,
+        detected: entry,
+        supported: true,
+    };
+}
+
+// ─── 依赖解析假数据 ───────────────────────────────────────────────────
+//
+// 真依赖图在 Rust Component::requirements()；这里只给浏览器预览一张够用的假边表。
+
+const mockEdges: Partial<Record<ComponentId, ComponentId[]>> = {
+    // vcredist 与真图一致只在 Windows 本机 NapCat 声明；mockDependencyPlan 按主机过滤
+    napcat: ['qq', 'vcredist'],
+    snowluma: ['qq', 'novnc'],
+};
+
+function mockNode(id: ComponentId, hostId: string, requiredBy: ComponentId[]): DependencyNode {
+    const detect = mockDetect(id, hostId);
+    const status: DependencyNode['status'] = !detect.supported
+        ? { state: 'unsupported' }
+        : detect.detected
+          ? { state: 'satisfied', version: detect.detected.version, source: detect.detected.source }
+          : { state: 'missing' };
+    return {
+        target: { kind: 'component', id },
+        required_by: requiredBy,
+        version_reqs: [],
+        status,
+    };
+}
+
+export function mockDependencyPlan(
+    root: ComponentId,
+    hostId: string,
+    phase: RequirementPhase,
+): DependencyPlan {
+    const host = mockHosts.find((h) => h.host_id === hostId);
+    const nodes = (mockEdges[root] ?? [])
+        .filter((id) => id !== 'novnc' || host?.locality === 'remote')
+        .filter((id) => id !== 'vcredist' || (host?.os === 'windows' && host?.locality === 'local'))
+        .map((id) => mockNode(id, hostId, [root]));
+    return { root, host_id: hostId, phase, nodes };
+}
+
+export function mockRuntimeReadiness(root: ComponentId, hostId: string): RuntimeReadiness {
+    return {
+        root: mockNode(root, hostId, []),
+        plan: mockDependencyPlan(root, hostId, 'run'),
+    };
+}
+
+// 预览初始只有系统 QQ，侧装完成后与组件探测一起切换来源。
+export function mockLocalQqSource(): LocalQqSource {
+    const installed = installedMatrix.qq.local;
+    if (!installed) return 'missing';
+    return installed.source === 'system' ? 'system' : 'managed';
+}
+
+// ─── 假装跑 action：吐进度事件 ─────────────────────────────────────────
+//
+// 真后端是 mpsc → broadcast → Tauri event。mock 里直接走 events.mock 的
+// emitMockEvent，让前端订阅 component_action_progress 时能收到。
+
+const activeMockTasks = new Map<string, ReturnType<typeof setInterval>>();
+let taskCounter = 0;
+
+export function mockRunAction(
+    componentId: ComponentId,
+    hostId: string,
+    kind: StepKind,
+    requestedTaskId?: string,
+): string {
+    taskCounter += 1;
+    const taskId = requestedTaskId ?? `mock-task-${Date.now()}-${taskCounter}`;
+    const startedAt = Date.now();
+
+    const emit = (kindEvt: ProgressEvent) => {
+        emitMockEvent({
+            kind: 'component_action_progress',
+            task_id: taskId,
+            event: kindEvt,
+        } as DomainEvent);
+    };
+
+    // ts-rs 生成的 ProgressEvent.timestamp_ms 是 bigint（u64 默认映射），
+    // mock 侧把 Date.now() 包成 BigInt 与 wire format 对齐。
+    const now = () => BigInt(Date.now());
+
+    // started
+    setTimeout(() => {
+        emit({ v: 1, timestamp_ms: now(), kind: 'started', total_steps: 1 });
+        emit({
+            v: 1,
+            timestamp_ms: now(),
+            kind: 'step_begin',
+            step: 1,
+            message: stepLabel(componentId, kind),
+        });
+    }, 50);
+
+    // 进度推进：300ms 一帧，10 帧到 100%
+    // 0% 阶段模拟 mirror race，10-90% 模拟切片下载（带速度），100% 完成
+    let progress = 0;
+    const TOTAL_BYTES = 28_000_000; // 28 MB 模拟 NapCat.Shell.zip
+    const intervalId = setInterval(() => {
+        progress += 10;
+        if (progress >= 100) {
+            clearInterval(intervalId);
+            activeMockTasks.delete(taskId);
+
+            emit({
+                v: 1,
+                timestamp_ms: now(),
+                kind: 'step_progress',
+                step: 1,
+                percent: 100,
+                message: '完成',
+                speed_bps: null,
+                downloaded_bytes: BigInt(TOTAL_BYTES),
+                total_bytes: BigInt(TOTAL_BYTES),
+                download_stage: 'streaming',
+            });
+            emit({
+                v: 1,
+                timestamp_ms: now(),
+                kind: 'step_end',
+                step: 1,
+                ok: true,
+            });
+            // 终态事件会立即触发重新探测，先提交结果再通知订阅者。
+            applyMockOutcome(componentId, hostId, kind);
+            emit({ v: 1, timestamp_ms: now(), kind: 'finished', ok: true });
+            return;
+        }
+        const stage = progress === 0 ? 'racing' : 'streaming';
+        const downloaded = Math.round((TOTAL_BYTES * progress) / 100);
+        // 速度 ramp 到 1.1 MB/s 上下抖动
+        const baseBps = stage === 'racing' ? 0 : 900_000 + Math.random() * 400_000;
+        emit({
+            v: 1,
+            timestamp_ms: now(),
+            kind: 'step_progress',
+            step: 1,
+            percent: progress,
+            message:
+                stage === 'racing'
+                    ? `${stepLabel(componentId, kind)} · 选择镜像`
+                    : `${stepLabel(componentId, kind)}`,
+            speed_bps: stage === 'racing' ? null : BigInt(Math.round(baseBps)),
+            downloaded_bytes: BigInt(downloaded),
+            total_bytes: BigInt(TOTAL_BYTES),
+            download_stage: stage,
+        });
+    }, 300);
+    activeMockTasks.set(taskId, intervalId);
+
+    void startedAt; // mute lint
+    return taskId;
+}
+
+export function mockCancelAction(taskId: string): void {
+    const interval = activeMockTasks.get(taskId);
+    if (!interval) return;
+    clearInterval(interval);
+    activeMockTasks.delete(taskId);
+    emitMockEvent({
+        kind: 'component_action_progress',
+        task_id: taskId,
+        event: { v: 1, timestamp_ms: BigInt(Date.now()), kind: 'finished', ok: false },
+    } as DomainEvent);
+}
+
+function stepLabel(componentId: ComponentId, kind: StepKind): string {
+    const info = mockComponentCatalog.find((c) => c.id === componentId);
+    const name = info?.display_name ?? componentId;
+    switch (kind) {
+        case 'ensure_installed':
+        case 'force_install':
+            return `正在安装 ${name}`;
+        case 'update':
+            return `正在更新 ${name}`;
+        case 'uninstall':
+            return `正在卸载 ${name}`;
+        case 'verify':
+            return `正在校验 ${name}`;
+        case 'ensure_dependencies':
+            return `正在补全 ${name} 系统依赖`;
+    }
+}
+
+function applyMockOutcome(componentId: ComponentId, hostId: string, kind: StepKind): void {
+    const matrix = installedMatrix[componentId];
+    if (!matrix) return;
+    if (kind === 'uninstall') {
+        matrix[hostId] = componentId === 'qq' && hostId === 'local' ? systemQq : null;
+        return;
+    }
+    if (kind === 'ensure_installed' || kind === 'force_install' || kind === 'update') {
+        matrix[hostId] = {
+            version:
+                componentId === 'qq' ? '9.9.36-53644' : kind === 'update' ? '4.20.0' : '4.18.1',
+            source: 'mock',
+        };
+    }
+}

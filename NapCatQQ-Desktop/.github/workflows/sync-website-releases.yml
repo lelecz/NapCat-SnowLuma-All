@@ -1,0 +1,90 @@
+# 官网 releases 快照同步。repository_dispatch / schedule 只在默认分支生效，
+# 因此本工作流放在 main，checkout web 分支执行同步并负责 Pages 部署。
+# GITHUB_TOKEN 的普通 push 不会触发 web 分支的 docs.yml，所以构建与部署在本工作流内完成。
+
+name: Sync website releases
+
+on:
+  repository_dispatch:
+    types: [desktop-release, watch-release]
+  workflow_dispatch:
+  schedule:
+    # 每日兜底：手动在 GitHub 界面发布 / 转正 draft 等“没有事件可发”的路径靠这里补齐
+    - cron: "37 21 * * *"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# 与 docs.yml 的 website-refs/heads/web 同组互斥，两个部署串行，避免互相覆盖
+concurrency:
+  group: website-refs/heads/web
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    if: github.repository == 'NapNeko/NapCatQQ-Desktop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout web branch
+        uses: actions/checkout@v4
+        with:
+          ref: web
+
+      - name: Sync releases snapshot
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/sync-releases.mjs
+
+      - name: Commit snapshot
+        id: commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/data/releases.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "releases 快照无变化，跳过提交与部署"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/data/releases.json
+            git commit -m "chore(web): 同步官网 releases 快照"
+            git push origin web
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.commit.outputs.changed == 'true'
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        if: steps.commit.outputs.changed == 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Build website
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          SITE_BASE: /NapCatQQ-Desktop/
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm test:changelog
+          pnpm check:docs
+
+      - name: Configure GitHub Pages
+        if: steps.commit.outputs.changed == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload website
+        if: steps.commit.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+      - name: Deploy website
+        if: steps.commit.outputs.changed == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,16 @@
+/* 组件页主滚动区：预留滚动条槽位，避免右列卡片右缘被滚动条/子像素裁切。 */
+.componentsPageScroll {
+    container: components-page / inline-size;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-width: 0;
+    scrollbar-gutter: stable;
+    /* WebKitGTK 的覆盖式滚动条可能忽略 gutter，仍需留下独立的内容间距。 */
+    padding-inline-end: 18px;
+    /* 缩短滚动视口，让原生合成滚动条也停在终端上方。 */
+    margin-block-end: var(--terminal-dock-inset, 0px);
+    /* WebKitGTK 的合成滚动条也必须留在页面绘制边界内，不能盖过终端浮层。 */
+    contain: paint;
+    isolation: isolate;
+    box-sizing: border-box;
+}

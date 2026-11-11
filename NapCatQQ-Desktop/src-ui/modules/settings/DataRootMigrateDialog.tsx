@@ -1,0 +1,342 @@
+// 数据根整树迁移向导：说明 → 选空目录 → 预览路径/结构 → 确认迁移 → 进度 → 完成。
+
+import { useDataRootMigration } from '../../hooks/preferences/useDataRootMigration';
+import type { DataRootMigrateProgress, DataRootTreeEntry } from '../../core/ipc/types';
+import {
+    Button,
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+    Progress,
+} from '../../shared/ui';
+import { DialogStepTransition } from '../../shared/ui/motion';
+import { cn } from '../../shared/utils/cn';
+
+export interface DataRootMigrateDialogProps {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+    currentDataRoot: string;
+}
+
+function formatBytes(n: number | bigint | null | undefined): string {
+    if (n == null) return '—';
+    const v = typeof n === 'bigint' ? Number(n) : n;
+    if (!Number.isFinite(v) || v < 0) return '—';
+    if (v < 1024) return `${Math.round(v)} B`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function progressPercent(p: DataRootMigrateProgress | null): number {
+    if (!p) return 0;
+    const total = Number(p.bytes_total);
+    const done = Number(p.bytes_done);
+    if (!total || total <= 0) return p.phase === 'done' ? 100 : 8;
+    return Math.min(100, Math.round((done / total) * 100));
+}
+
+function kindLabel(kind: string): string {
+    if (kind === 'dir') return '目录';
+    if (kind === 'file') return '文件';
+    if (kind === 'skip') return '跳过';
+    return kind;
+}
+
+function TreePreview({ entries }: { entries: DataRootTreeEntry[] }) {
+    if (entries.length === 0) {
+        return <p className="text-[12px] text-text-tertiary">源目录为空或无法列出结构。</p>;
+    }
+    return (
+        <div className="scrollbar-hide max-h-48 overflow-auto rounded-md border border-border-subtle bg-inset/30">
+            <table className="w-full border-collapse text-left text-[12px]">
+                <thead className="sticky top-0 bg-elevated/95 text-text-tertiary">
+                    <tr className="border-b border-border-subtle">
+                        <th className="px-2.5 py-1.5 font-medium">名称</th>
+                        <th className="w-14 px-2 py-1.5 font-medium">类型</th>
+                        <th className="w-20 px-2 py-1.5 text-right font-medium">大小</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {entries.map((e) => (
+                        <tr
+                            key={`${e.kind}:${e.name}`}
+                            className={cn(
+                                'border-b border-border-subtle/60 last:border-0',
+                                e.kind === 'skip' && 'text-text-tertiary',
+                            )}
+                        >
+                            <td className="px-2.5 py-1.5 font-mono">
+                                {e.name}
+                                {e.note ? (
+                                    <span className="ml-1.5 font-sans text-[11px] text-text-tertiary">
+                                        {e.note}
+                                    </span>
+                                ) : null}
+                            </td>
+                            <td className="px-2 py-1.5 text-text-tertiary">{kindLabel(e.kind)}</td>
+                            <td className="px-2 py-1.5 text-right tabular-nums text-text-tertiary">
+                                {formatBytes(e.bytes)}
+                            </td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+    );
+}
+
+export function DataRootMigrateDialog({
+    open,
+    onOpenChange,
+    currentDataRoot,
+}: DataRootMigrateDialogProps) {
+    const {
+        phase,
+        target,
+        preview,
+        progress,
+        result,
+        errorMsg,
+        picking,
+        deletingOld,
+        oldDeleted,
+        restarting,
+        deleteOldRoot,
+        restartApp,
+        pickTarget,
+        startMigrate,
+        cancelRunning,
+    } = useDataRootMigration(open);
+
+    const handleOpenChange = (next: boolean) => {
+        if (phase === 'running' || deletingOld || restarting) return;
+        onOpenChange(next);
+    };
+
+    const confirmDeleteOldRoot = async () => {
+        if (!result?.old_root || !result.new_root) return;
+        const ok = window.confirm(
+            `确认新数据目录可用后，将永久删除旧目录：\n\n${result.old_root}\n\n此操作不可恢复。`,
+        );
+        if (ok) await deleteOldRoot();
+    };
+
+    return (
+        <Dialog open={open} onOpenChange={handleOpenChange}>
+            <DialogContent size="lg" className="max-w-xl">
+                <DialogHeader>
+                    <DialogTitle>迁移数据目录</DialogTitle>
+                    <DialogDescription>
+                        将数据根整树复制到新位置：配置、密钥、组件。
+                    </DialogDescription>
+                </DialogHeader>
+
+                <DialogStepTransition stepKey={phase} className="space-y-3 text-[13px] text-text">
+                    <div className="rounded-md border border-border-subtle bg-inset/40 px-3 py-2">
+                        <div className="text-[11px] text-text-tertiary">当前数据根</div>
+                        <div className="mt-0.5 break-all font-mono text-[12px]">
+                            {currentDataRoot}
+                        </div>
+                    </div>
+
+                    {phase === 'guide' ? (
+                        <div className="space-y-2 text-text-secondary">
+                            <p>步骤：</p>
+                            <ol className="list-decimal space-y-1 pl-5">
+                                <li>
+                                    选一个<strong>空文件夹</strong>
+                                    作为新数据根（路径本身即 data root，不再拼产品名）。
+                                </li>
+                                <li>确认预览的目标路径与文件结构。</li>
+                                <li>开始迁移。</li>
+                            </ol>
+                            <p className="text-[12px] text-text-tertiary">
+                                无需管理员权限；旧目录仅在你确认后删除。
+                            </p>
+                        </div>
+                    ) : null}
+
+                    {target ? (
+                        <div className="rounded-md border border-border-subtle px-3 py-2">
+                            <div className="text-[11px] text-text-tertiary">目标数据根</div>
+                            <div className="mt-0.5 break-all font-mono text-[12px]">{target}</div>
+                        </div>
+                    ) : null}
+
+                    {preview && (phase === 'preview' || phase === 'running' || phase === 'done') ? (
+                        <div className="space-y-2">
+                            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-text-secondary">
+                                <span>
+                                    预估复制{' '}
+                                    <span className="font-medium text-text">
+                                        {formatBytes(preview.bytes_estimate)}
+                                    </span>
+                                </span>
+                                {preview.local_active_bots > 0 ? (
+                                    <span className="text-text-tertiary">
+                                        本机运行中 Bot {preview.local_active_bots} 个（将先停止）
+                                    </span>
+                                ) : null}
+                            </div>
+
+                            {phase === 'preview' ? (
+                                <>
+                                    <div className="text-[12px] font-medium text-text">
+                                        将复制的结构
+                                    </div>
+                                    <TreePreview entries={preview.tree_entries ?? []} />
+                                </>
+                            ) : null}
+
+                            {preview.blocking_reasons.length > 0 ? (
+                                <ul className="list-disc space-y-1 pl-4 text-danger">
+                                    {preview.blocking_reasons.map((r) => (
+                                        <li key={r}>{r}</li>
+                                    ))}
+                                </ul>
+                            ) : null}
+
+                            {phase === 'preview' && preview.warnings.length > 0 ? (
+                                <ul className="list-disc space-y-1 pl-4 text-[12px] text-text-tertiary">
+                                    {preview.warnings.map((w) => (
+                                        <li key={w}>{w}</li>
+                                    ))}
+                                </ul>
+                            ) : null}
+                        </div>
+                    ) : null}
+
+                    {phase === 'running' ? (
+                        <div className="space-y-2">
+                            <Progress value={progressPercent(progress)} />
+                            <p className="text-text-secondary">
+                                {progress?.message ??
+                                    (progress?.current_rel
+                                        ? `复制中：${progress.current_rel}`
+                                        : '正在迁移…')}
+                            </p>
+                            <p className="text-[12px] text-text-tertiary">
+                                {formatBytes(progress?.bytes_done ?? 0)} /{' '}
+                                {formatBytes(progress?.bytes_total ?? preview?.bytes_estimate ?? 0)}
+                            </p>
+                        </div>
+                    ) : null}
+
+                    {phase === 'done' && result ? (
+                        <div className="space-y-2 text-text-secondary">
+                            <p>迁移完成。新数据根：</p>
+                            <p className="break-all font-mono text-[12px] text-text">
+                                {result.new_root}
+                            </p>
+                            <div className="rounded-md border border-border-subtle px-3 py-2">
+                                <div className="text-[11px] text-text-tertiary">旧数据根</div>
+                                <div className="mt-0.5 break-all font-mono text-[12px] text-text">
+                                    {result.old_root}
+                                </div>
+                                {oldDeleted ? (
+                                    <p className="mt-1.5 text-[12px] text-text-secondary">
+                                        旧目录已删除。
+                                    </p>
+                                ) : (
+                                    <p className="mt-1.5 text-[12px] text-text-tertiary">
+                                        确认新位置正常后可删除旧目录。
+                                    </p>
+                                )}
+                            </div>
+                            <p className="text-[12px] text-text-tertiary">
+                                重启后才会使用新数据目录；确认 Bot 和应用端运行正常后再删除旧目录。
+                            </p>
+                            {result.warnings.length > 0 ? (
+                                <ul className="list-disc pl-4 text-text-tertiary">
+                                    {result.warnings.map((w) => (
+                                        <li key={w}>{w}</li>
+                                    ))}
+                                </ul>
+                            ) : null}
+                        </div>
+                    ) : null}
+
+                    {(phase === 'error' || (phase === 'preview' && errorMsg)) && errorMsg ? (
+                        <p className="text-danger">{errorMsg}</p>
+                    ) : null}
+                </DialogStepTransition>
+
+                <DialogFooter className="gap-2">
+                    {phase === 'running' ? (
+                        <Button variant="secondary" size="sm" onClick={() => void cancelRunning()}>
+                            取消复制
+                        </Button>
+                    ) : null}
+
+                    {phase === 'guide' || phase === 'error' ? (
+                        <>
+                            <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => handleOpenChange(false)}
+                            >
+                                取消
+                            </Button>
+                            <Button size="sm" disabled={picking} onClick={() => void pickTarget()}>
+                                {picking ? '选择中…' : '选择目标文件夹'}
+                            </Button>
+                        </>
+                    ) : null}
+
+                    {phase === 'preview' ? (
+                        <>
+                            <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => handleOpenChange(false)}
+                            >
+                                取消
+                            </Button>
+                            <Button
+                                variant="secondary"
+                                size="sm"
+                                disabled={picking}
+                                onClick={() => void pickTarget()}
+                            >
+                                重选文件夹
+                            </Button>
+                            <Button
+                                size="sm"
+                                disabled={!preview?.ok || picking}
+                                onClick={() => void startMigrate()}
+                            >
+                                开始迁移
+                            </Button>
+                        </>
+                    ) : null}
+
+                    {phase === 'done' && result ? (
+                        <>
+                            {!oldDeleted ? (
+                                <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    disabled={deletingOld || restarting}
+                                    onClick={() => void confirmDeleteOldRoot()}
+                                >
+                                    {deletingOld ? '删除中…' : '删除旧目录'}
+                                </Button>
+                            ) : null}
+                            <Button
+                                size="sm"
+                                disabled={restarting || deletingOld}
+                                onClick={() => void restartApp()}
+                            >
+                                {restarting ? '重启中…' : '重启应用'}
+                            </Button>
+                        </>
+                    ) : null}
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+    );
+}

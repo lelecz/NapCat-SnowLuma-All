@@ -1,0 +1,566 @@
+// 虚拟时间线复用消息段渲染和贴底逻辑，样式与阅读状态独立。
+import {
+    memo,
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type MutableRefObject,
+    type ReactNode,
+} from 'react';
+import { useVirtualizer, type Virtualizer } from '@tanstack/react-virtual';
+import { ArrowDown } from 'lucide-react';
+import { ChatViewContext, useChatView, type MarkdownCommand } from '../../shared/chat/chatContext';
+import { useStickToBottom } from '../../hooks/useStickToBottom';
+import { useMotion } from '../../hooks/preferences/useMotion';
+import { useChatSelector, type ChatAccountStore } from '../../hooks/chat/chatStore';
+import { accountKey, EMPTY_DRAFT, type Contact, type Message } from '../../core/domain/chat/model';
+import { useChatMedia } from '../../hooks/chat/useChatMedia';
+import { useChatSend } from '../../hooks/chat/useChatSend';
+import { ChatImageViewer } from '../../shared/chat/ChatImageViewer';
+import { messagePreview } from '../../core/domain/debug/segments';
+import { useHistoryPaging } from './useHistoryPaging';
+import { MessageSkeleton } from './ChatSkeleton';
+import { preserveTimelineReading } from '../../shared/chat/timelineReadingAnchor';
+import { ChatPresence } from './chatMotion';
+import { TimelineMessage } from './TimelineMessage';
+import { createTimelineSelector, equalTimeline } from './chatViewSelectors';
+import { useTimelinePosition } from './useTimelinePosition';
+import { useChatNotice } from '../../hooks/chat/useChatNotice';
+import { useSmoothWheel } from './useSmoothWheel';
+import { useLatestScroll } from './useLatestScroll';
+import { ChatFileAction } from './files/ChatFileAction';
+import { FORWARD_MESSAGE_LIMIT } from '../../core/domain/chat/messageTransfer';
+import { ChatForwardDialog } from './ChatForwardDialog';
+import { ChatSelectionBar } from './ChatSelectionBar';
+import { recordConversationTimelineMount } from './conversationMotionProbe';
+
+export const NativeTimeline = memo(function NativeTimeline({
+    store,
+    contact,
+    messages,
+    revealRef,
+    visible,
+    onFocusComposer,
+    preventRecall = false,
+    renderAvatar,
+    onSelectionChange,
+}: {
+    store: ChatAccountStore;
+    contact: Contact;
+    messages: Message[];
+    revealRef: MutableRefObject<(key: string) => void>;
+    visible: boolean;
+    onFocusComposer?: () => void;
+    preventRecall?: boolean;
+    renderAvatar?: (message: Message, avatar: ReactNode) => ReactNode;
+    onSelectionChange?: (selecting: boolean) => void;
+}) {
+    const scroll = useRef<HTMLDivElement>(null);
+    const initialMessages = useRef<Set<string> | null>(null);
+    const mountRecorded = useRef(false);
+    useEffect(() => {
+        if (mountRecorded.current) return;
+        mountRecorded.current = true;
+        recordConversationTimelineMount(
+            scroll.current?.closest<HTMLElement>('.native-chat-timeline-frame') ?? null,
+        );
+    }, []);
+    const latest = useRef(messages);
+    latest.current = messages;
+    const canPinToEnd = useRef<() => boolean>(() => true);
+    const [image, showImage] = useState('');
+    const [error, setError] = useState('');
+    const [highlight, setHighlight] = useState('');
+    const [selecting, setSelecting] = useState(false);
+    const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+    const [forwardKeys, setForwardKeys] = useState<string[]>([]);
+    const selectTimeline = useMemo(
+        () => createTimelineSelector(contact.key, messages),
+        [contact.key, messages],
+    );
+    const snapshot = useChatSelector(store, selectTimeline, equalTimeline);
+    // target 经 hook 内部 ref 每次调用时求值，与原闭包直读 store.target 的时机一致。
+    const media = useChatMedia(() => store.target);
+    const chatSend = useChatSend(store);
+    const history = snapshot.history;
+    if (initialMessages.current === null && (messages.length || history?.loaded))
+        initialMessages.current = new Set(
+            messages
+                .filter((message) => message.status !== 'sending')
+                .map((message) => message.key),
+        );
+    useEffect(() => {
+        void store.ensureHistory(contact.key);
+    }, [store, contact.key, snapshot.connection, history]);
+    const motion = useMotion();
+    const sending = useMemo(
+        () => messages.some((message) => message.status === 'sending'),
+        [messages],
+    );
+    const retryDisabled =
+        !store.target.running ||
+        store.target.online === false ||
+        snapshot.connection !== 'connected' ||
+        sending;
+    const getMessageKey = useCallback((index: number) => messages[index]?.key ?? index, [messages]);
+    // 按消息 key 锚定 prepend 和异步行高变化，避免额外 scrollHeight 补偿重复移动视口。
+    const pinLatest = useCallback(
+        (instance: Virtualizer<HTMLDivElement, Element>, scrolling: boolean) => {
+            const element = scroll.current;
+            if (!element || scrolling || !canPinToEnd.current()) return;
+            // 滚动通知不再反向写 scrollTop；直接用已算出的容器高度，避免强制测整条时间线。
+            const end = Math.max(0, instance.getTotalSize() - element.clientHeight);
+            if (Math.abs(element.scrollTop - end) > 1) element.scrollTop = end;
+        },
+        [],
+    );
+    const virtual = useVirtualizer({
+        count: messages.length,
+        getScrollElement: () => scroll.current,
+        estimateSize: () => 80,
+        getItemKey: getMessageKey,
+        overscan: 8,
+        paddingStart: 12,
+        paddingEnd: selecting ? 96 : 24,
+        anchorTo: 'end',
+        directDomUpdates: true,
+        useFlushSync: false,
+        onChange: pinLatest,
+    });
+    // 消息插入时先提交新容器高度，防止旧页锚点被旧 scrollHeight 截断。
+    const containerRef = useCallback(
+        (node: HTMLDivElement | null) => virtual.containerRef(node),
+        [virtual, messages],
+    );
+    preserveTimelineReading(virtual, scroll);
+    const key = `${accountKey(store.target.bot_id, String(store.target.qq_id))}/${contact.key}`;
+    useEffect(() => {
+        setSelecting(false);
+        setSelectedKeys([]);
+        setForwardKeys([]);
+    }, [key]);
+    useEffect(() => {
+        onSelectionChange?.(selecting);
+    }, [selecting, onSelectionChange]);
+    useEffect(() => () => onSelectionChange?.(false), [onSelectionChange]);
+    const beginSelection = useCallback((messageKey: string) => {
+        setSelecting(true);
+        setSelectedKeys([messageKey]);
+    }, []);
+    const toggleSelection = useCallback((messageKey: string) => {
+        setSelectedKeys((selected) =>
+            selected.includes(messageKey)
+                ? selected.filter((value) => value !== messageKey)
+                : selected.length < FORWARD_MESSAGE_LIMIT
+                  ? [...selected, messageKey]
+                  : selected,
+        );
+    }, []);
+    const forwardOne = useCallback((messageKey: string) => setForwardKeys([messageKey]), []);
+    useChatNotice(`${key}:action`, `${contact.name} · 消息操作失败`, error);
+    const savedPosition = useRef(store.initialReadingPosition(contact.key));
+    const stick = useStickToBottom({
+        scrollRef: scroll,
+        virtualizer: virtual,
+        items: messages,
+        memoryKey: null,
+        initialDetached: !!savedPosition.current && !savedPosition.current.atBottom,
+        reattachOnIntent: true,
+        followUntilUserScroll: true,
+        resetToken: key,
+        filterToken: '',
+        animate:
+            motion.enabled &&
+            !!history?.loaded &&
+            !history.loading &&
+            (scroll.current?.clientWidth ?? 0) > 0,
+    });
+    canPinToEnd.current = stick.canPinToEnd;
+    const cancelWheel = useSmoothWheel(scroll, motion.enabled && visible);
+    const latestScroll = useLatestScroll(scroll, {
+        enabled: motion.enabled && visible,
+        duration: motion.duration('slow') * 1000,
+        detach: stick.detach,
+        finish: () => stick.jumpToLatest(false),
+    });
+    const position = useTimelinePosition(
+        store,
+        contact.key,
+        scroll,
+        virtual,
+        messages,
+        stick.isFollowing,
+        latestScroll.isRunning,
+    );
+    const loadEarlier = () => {
+        position.capture();
+        position.cancelRestore();
+        stick.detach();
+        return store.history(contact.key);
+    };
+    useChatNotice(
+        `${key}:history`,
+        `${contact.name} · 历史消息读取失败`,
+        history?.error,
+        () => void loadEarlier(),
+    );
+    const paging = useHistoryPaging({
+        scroll,
+        enabled:
+            snapshot.connection === 'connected' &&
+            !!history?.loaded &&
+            !history.loading &&
+            !history.done &&
+            !history.error,
+        load: loadEarlier,
+        detach: stick.detach,
+    });
+    useEffect(() => {
+        const update = () =>
+            store.setReading(
+                !stick.away &&
+                    document.hasFocus() &&
+                    document.visibilityState === 'visible' &&
+                    (scroll.current?.clientWidth ?? 0) > 0
+                    ? contact.key
+                    : null,
+            );
+        update();
+        document.addEventListener('visibilitychange', update);
+        window.addEventListener('focus', update);
+        window.addEventListener('blur', update);
+        const observer = new ResizeObserver(update);
+        if (scroll.current) observer.observe(scroll.current);
+        return () => {
+            document.removeEventListener('visibilitychange', update);
+            window.removeEventListener('focus', update);
+            window.removeEventListener('blur', update);
+            observer.disconnect();
+            store.setReading(null);
+        };
+    }, [store, contact.key, stick.away, visible]);
+    useEffect(() => {
+        revealRef.current = (messageKey) => {
+            const index = latest.current.findIndex((m) => m.key === messageKey);
+            if (index < 0) return;
+            cancelWheel();
+            latestScroll.cancel();
+            position.cancelRestore();
+            stick.detach();
+            virtual.scrollToIndex(index, { align: 'center' });
+            setHighlight(messageKey);
+        };
+        return () => {
+            revealRef.current = () => {};
+        };
+    }, [
+        revealRef,
+        virtual,
+        stick.detach,
+        position.cancelRestore,
+        cancelWheel,
+        latestScroll.cancel,
+    ]);
+    useEffect(() => {
+        if (!highlight) return;
+        const timer = setTimeout(() => setHighlight(''), 1600);
+        return () => clearTimeout(timer);
+    }, [highlight]);
+    const fallback = useChatView();
+    const messageById = useMemo(
+        () =>
+            new Map(
+                messages.filter((message) => message.id).map((message) => [message.id!, message]),
+            ),
+        [messages],
+    );
+    const view = useMemo(
+        () => ({
+            ...fallback,
+            mediaScope: accountKey(store.target.bot_id, String(store.target.qq_id)),
+            openImage: showImage,
+            imageReadsQueued: true,
+            isImageSourceAlive: media.isImageSourceAlive,
+            readImage: media.image,
+            readForward: media.forward,
+            readRecord: media.record,
+            readVideo: media.video,
+            readRecordText: media.transcript,
+            onMarkdownCommand: async (command: MarkdownCommand) => {
+                if (store.getSnapshot().account.active !== contact.key)
+                    throw new Error('请在原会话操作这个按钮');
+                if (command.reply && !command.messageId)
+                    throw new Error('这条消息没有可引用的标识');
+                if (command.enter) {
+                    await store.command(
+                        contact.key,
+                        command.text,
+                        command.reply ? command.messageId : undefined,
+                    );
+                } else {
+                    const draft = store.getSnapshot().account.drafts[contact.key] ?? EMPTY_DRAFT;
+                    const source = command.messageId
+                        ? messageById.get(command.messageId)
+                        : undefined;
+                    store.draft(contact.key, {
+                        ...draft,
+                        text: draft.text ? `${draft.text}\n${command.text}` : command.text,
+                        reply: command.reply
+                            ? {
+                                  id: command.messageId!,
+                                  name: source?.senderName ?? '引用消息',
+                                  preview: source ? messagePreview(source.segments) : '',
+                              }
+                            : draft.reply,
+                    });
+                }
+                onFocusComposer?.();
+            },
+            fileAction: (data: Record<string, unknown>) => (
+                <ChatFileAction data={data} target={store.target} contact={contact} />
+            ),
+            openLink: (url: string) => {
+                void chatSend.openLink(url).catch((e) => setError(String(e)));
+            },
+            nameOf: (userId: number) => snapshot.names[String(userId)],
+            findMessage: (messageId: number) => {
+                const m = messageById.get(String(messageId));
+                return m
+                    ? {
+                          kind: 'message' as const,
+                          key: m.key,
+                          seq: 0,
+                          at: m.at,
+                          session: m.session,
+                          direction: m.mine ? ('out' as const) : ('in' as const),
+                          senderId: Number(m.senderId),
+                          senderName: m.senderName,
+                          messageId,
+                          segments: m.segments,
+                          raw: {},
+                      }
+                    : undefined;
+            },
+            revealMessage: (messageId: number) => {
+                const m = messageById.get(String(messageId));
+                if (!m) return false;
+                revealRef.current(m.key);
+                return true;
+            },
+        }),
+        [
+            fallback,
+            snapshot.names,
+            messageById,
+            revealRef,
+            store,
+            contact,
+            media,
+            chatSend,
+            onFocusComposer,
+        ],
+    );
+    const cancelLatestScroll = latestScroll.cancel;
+    const cancelPositionRestore = position.cancelRestore;
+    const detachTimeline = stick.detach;
+    const loadGap = useCallback(
+        (message: Message) => {
+            if (!message.id) return;
+            const index = latest.current.findIndex((item) => item.key === message.key);
+            if (index < 0) return;
+            cancelWheel();
+            cancelLatestScroll();
+            cancelPositionRestore();
+            detachTimeline();
+            virtual.scrollToIndex(index, { align: 'start' });
+            void store.history(contact.key, message.id);
+        },
+        [
+            cancelWheel,
+            cancelLatestScroll,
+            cancelPositionRestore,
+            detachTimeline,
+            virtual,
+            store,
+            contact.key,
+        ],
+    );
+    const latestLabel = stick.unseen > 0 ? `回到最新，${stick.unseen} 条新消息` : '回到最新';
+    return (
+        <ChatViewContext.Provider value={view}>
+            <div
+                className="native-chat-timeline-wrap"
+                data-selecting={selecting}
+                onKeyDown={(event) => {
+                    if (
+                        selecting &&
+                        event.key === 'Escape' &&
+                        !event.defaultPrevented &&
+                        !event.nativeEvent.isComposing
+                    ) {
+                        event.preventDefault();
+                        setSelecting(false);
+                        setSelectedKeys([]);
+                    }
+                }}
+            >
+                <div
+                    ref={scroll}
+                    className="native-chat-timeline"
+                    tabIndex={0}
+                    aria-label="消息记录"
+                    aria-busy={!!history?.loading}
+                    onScroll={() => {
+                        if (!position.restoring() && !latestScroll.isRunning())
+                            stick.handlers.onScroll();
+                        if (!latestScroll.isRunning()) {
+                            paging.onScroll();
+                            position.capture();
+                        }
+                    }}
+                    onWheel={(e) => {
+                        latestScroll.cancel();
+                        position.cancelRestore();
+                        stick.handlers.onWheel(e);
+                        paging.onWheel(e);
+                    }}
+                    onKeyDown={(e) => {
+                        if (
+                            [
+                                'ArrowUp',
+                                'ArrowDown',
+                                'PageUp',
+                                'PageDown',
+                                'Home',
+                                'End',
+                                ' ',
+                            ].includes(e.key)
+                        ) {
+                            latestScroll.cancel();
+                            position.cancelRestore();
+                        }
+                        stick.handlers.onKeyDown(e);
+                        paging.onKeyDown(e);
+                    }}
+                    onPointerDown={(e) => {
+                        latestScroll.cancel();
+                        if (e.target === e.currentTarget) position.cancelRestore();
+                        stick.handlers.onPointerDown(e);
+                        if (e.target === e.currentTarget) paging.onPointerDown();
+                    }}
+                    onTouchStart={(e) => {
+                        latestScroll.cancel();
+                        position.cancelRestore();
+                        stick.handlers.onTouchStart(e);
+                        paging.onTouchStart(e);
+                    }}
+                    onTouchMove={(e) => {
+                        stick.handlers.onTouchMove(e);
+                        paging.onTouchMove(e);
+                    }}
+                >
+                    {!messages.length &&
+                        (history?.loading ? (
+                            <MessageSkeleton />
+                        ) : (
+                            <div className="native-chat-message-empty">
+                                还没有消息，从一句问候开始
+                            </div>
+                        ))}
+                    <div ref={containerRef} style={{ position: 'relative' }}>
+                        {virtual.getVirtualItems().map((row) => {
+                            const message = messages[row.index];
+                            return (
+                                <div
+                                    key={row.key}
+                                    data-index={row.index}
+                                    data-message-key={message.key}
+                                    ref={virtual.measureElement}
+                                    style={{ position: 'absolute', top: 0, left: 0, width: '100%' }}
+                                >
+                                    <TimelineMessage
+                                        store={store}
+                                        contact={contact}
+                                        message={message}
+                                        animateEntry={!initialMessages.current?.has(message.key)}
+                                        progress={
+                                            message.requestId
+                                                ? snapshot.sendProgress?.[message.requestId]
+                                                : undefined
+                                        }
+                                        previous={messages[row.index - 1]}
+                                        highlighted={highlight === message.key}
+                                        retryDisabled={retryDisabled}
+                                        preventRecall={preventRecall}
+                                        renderAvatar={renderAvatar}
+                                        onFocusComposer={onFocusComposer}
+                                        onError={setError}
+                                        selecting={selecting}
+                                        selected={selectedKeys.includes(message.key)}
+                                        selectionFull={selectedKeys.length >= FORWARD_MESSAGE_LIMIT}
+                                        onSelect={beginSelection}
+                                        onToggleSelection={toggleSelection}
+                                        onForward={forwardOne}
+                                        onLoadGap={loadGap}
+                                        historyLoading={!!history?.loading}
+                                        enter={row.index >= stick.enterFrom}
+                                        takeEnter={stick.takeEnter}
+                                        order={
+                                            Number.isFinite(stick.enterFrom)
+                                                ? row.index - stick.enterFrom
+                                                : 0
+                                        }
+                                    />
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+                <ChatPresence visible={stick.away || stick.unseen > 0 || latestScroll.running}>
+                    <button
+                        className="native-chat-latest"
+                        data-scrolling={latestScroll.running}
+                        aria-label={latestLabel}
+                        title={latestLabel}
+                        onClick={() => {
+                            position.cancelRestore();
+                            paging.reset();
+                            cancelWheel();
+                            latestScroll.start((signal) => store.latest(contact.key, signal));
+                        }}
+                    >
+                        <ArrowDown size={18} aria-hidden />
+                        {stick.unseen > 0 && (
+                            <span className="native-chat-latest-dot" aria-hidden />
+                        )}
+                    </button>
+                </ChatPresence>
+                <ChatSelectionBar
+                    visible={selecting}
+                    count={selectedKeys.length}
+                    disabled={retryDisabled}
+                    onCancel={() => {
+                        setSelecting(false);
+                        setSelectedKeys([]);
+                    }}
+                    onForward={() => setForwardKeys(selectedKeys)}
+                />
+            </div>
+            <ChatImageViewer src={image} onClose={() => showImage('')} />
+            {forwardKeys.length > 0 && (
+                <ChatForwardDialog
+                    store={store}
+                    messageKeys={forwardKeys}
+                    onClose={() => setForwardKeys([])}
+                    onSent={() => {
+                        setForwardKeys([]);
+                        setSelecting(false);
+                        setSelectedKeys([]);
+                    }}
+                />
+            )}
+        </ChatViewContext.Provider>
+    );
+});

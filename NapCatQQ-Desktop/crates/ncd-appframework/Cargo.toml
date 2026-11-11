@@ -1,0 +1,56 @@
+[package]
+name = "ncd-appframework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# 应用端框架适配器（Karin / NoneBot2 / AstrBot / MaiBot / Koishi）：manifest + Component + Integration。
+# 内部 crate 只依赖 domain / traits / component / host / network；禁止依赖 ncd-backend-* 和 ncd-runtime。
+[dependencies]
+ncd-domain = { path = "../ncd-domain" }
+ncd-traits = { path = "../ncd-traits" }
+ncd-component = { path = "../ncd-component" }
+ncd-host = { path = "../ncd-host" }
+# MaiBot 不发 PyPI：查 GitHub Release、下源码包（镜像竞速）要用共享客户端和镜像表
+ncd-network = { path = "../ncd-network" }
+async-trait = "0.1"
+# 麦麦表情包缩略图、上传前的本地预览以 data URL 交给页面
+base64 = "0.22"
+# MaiBot 标首次配置完成时按上游 datetime.now().isoformat() 的样子写时间
+chrono = "0.4"
+md5 = "0.7"
+pbkdf2 = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "fs"] }
+toml = "0.8"
+toml_edit = "0.22"
+tracing = "0.1"
+ts-rs = { version = "12", features = ["serde-compat"] }
+fancy-regex = "0.14"
+# Koishi：koishi.yml 读写；云崽的配置也全是 YAML，写回走 yaml_patch 按行改，免得丢注释
+serde_yaml = "0.9"
+# 云崽装本体前几个 git 源并发 ls-remote，谁先应答用谁（select_ok）
+futures-util = "0.3"
+# Koishi 控制台只有 WebSocket 通道（/status），运行中改配置、看 Bot 在线都走它
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# Koishi 整包只有 zip，远端很多机器没装 unzip：桌面端解开重打成 tar.gz 再传
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+wiremock = "0.6"
+
+[lints]
+workspace = true

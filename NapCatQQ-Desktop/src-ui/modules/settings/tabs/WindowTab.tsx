@@ -1,0 +1,118 @@
+// 窗口 Tab：关闭按钮、托盘、轻量模式和启动显示策略。
+
+import type { CloseAction } from '../../../core/domain/settings/preferencesStore';
+import { Select, Switch } from '../../../shared/ui';
+import { ExpandPresence } from '../../../shared/ui/motion';
+import type { SettingsDraft } from '../settings-draft';
+import { FieldRow, SettingsSection, SettingsTabSections } from '../_shared';
+
+interface Props {
+    draft: SettingsDraft | null;
+    patchDraft: (patch: Partial<SettingsDraft>) => void;
+}
+
+export function WindowTab({ draft, patchDraft }: Props) {
+    if (!draft) {
+        return <p className="text-[13px] text-text-tertiary">正在加载设置…</p>;
+    }
+
+    return (
+        <SettingsTabSections>
+            <SettingsSection title="关闭与托盘">
+                <FieldRow label="点击关闭按钮" description="有本机 Bot 运行时会拦截退出">
+                    <Select
+                        value={draft.closeAction}
+                        onValueChange={(v) => patchDraft({ closeAction: v as CloseAction })}
+                        items={[
+                            { value: 'close', label: '关闭程序' },
+                            { value: 'tray', label: '最小化到托盘' },
+                        ]}
+                    />
+                </FieldRow>
+
+                <ExpandPresence visible={draft.closeAction === 'tray'}>
+                    <div className="divide-y divide-border-subtle/70 pt-4">
+                        <FieldRow label="关窗后界面">
+                            <Select
+                                value={draft.afterCloseUiBehavior}
+                                onValueChange={(v) =>
+                                    patchDraft({
+                                        afterCloseUiBehavior:
+                                            v as SettingsDraft['afterCloseUiBehavior'],
+                                    })
+                                }
+                                items={[
+                                    {
+                                        value: 'hide',
+                                        label: '保持隐藏（占内存）',
+                                    },
+                                    {
+                                        value: 'delayed_lightweight',
+                                        label: '一段时间不用后释放（默认）',
+                                    },
+                                    {
+                                        value: 'immediate_lightweight',
+                                        label: '立即释放界面内存',
+                                    },
+                                ]}
+                            />
+                        </FieldRow>
+                        <ExpandPresence
+                            visible={draft.afterCloseUiBehavior === 'delayed_lightweight'}
+                        >
+                            <div className="pt-4">
+                                <FieldRow label="释放前等待">
+                                    <Select
+                                        value={String(draft.enterLightweightDelaySecs)}
+                                        onValueChange={(v) =>
+                                            patchDraft({
+                                                enterLightweightDelaySecs: Number(v),
+                                            })
+                                        }
+                                        items={[
+                                            { value: '60', label: '1 分钟' },
+                                            { value: '180', label: '3 分钟' },
+                                            { value: '300', label: '5 分钟' },
+                                            { value: '900', label: '15 分钟' },
+                                            { value: '1800', label: '30 分钟' },
+                                        ]}
+                                    />
+                                </FieldRow>
+                            </div>
+                        </ExpandPresence>
+                    </div>
+                </ExpandPresence>
+            </SettingsSection>
+
+            <SettingsSection title="启动">
+                <FieldRow
+                    label="开机自启"
+                    description="登录当前用户后自动启动；写入用户启动项，无需管理员"
+                >
+                    <Switch
+                        checked={draft.launchOnStartup}
+                        onCheckedChange={(v) => patchDraft({ launchOnStartup: v })}
+                    />
+                </FieldRow>
+                <FieldRow
+                    label="登录自启时"
+                    description="仅托盘：Bot 照常运行；手动启动始终显示主窗口"
+                    isLast
+                >
+                    <Select
+                        value={draft.uiModeOnStartup}
+                        onValueChange={(v) =>
+                            patchDraft({
+                                uiModeOnStartup: v as SettingsDraft['uiModeOnStartup'],
+                            })
+                        }
+                        items={[
+                            { value: 'normal', label: '显示主界面' },
+                            { value: 'tray_only', label: '仅托盘' },
+                        ]}
+                    />
+                </FieldRow>
+            </SettingsSection>
+        </SettingsTabSections>
+    );
+}

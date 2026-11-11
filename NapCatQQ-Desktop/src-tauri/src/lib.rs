@@ -1,0 +1,1197 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ncd_domain::{BootstrapSnapshot, DesktopNotifySettings};
+use ncd_runtime::{
+    BotManager, BroadcastEventBus, DispatchRenderer, EventBus, EventFilter, LocalBotConfigRepo,
+    LocalConfigStore, ReqwestNapCatWebUiClient, SecretStoreImpl,
+};
+use tauri::Emitter;
+use tauri::Manager;
+use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+
+pub mod autostart;
+pub mod avatar_cache;
+pub mod bootstrap;
+pub mod bot_host_resolver;
+pub mod chat_tray;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod chat_tray_panel_native;
+pub mod chat_window;
+pub mod clipboard;
+pub mod commands;
+pub mod container_engine;
+pub mod desktop_consent;
+pub mod desktop_log;
+pub mod desktop_log_format;
+pub mod desktop_notify;
+pub mod desktop_onboarding;
+pub mod desktop_opener;
+pub mod desktop_update;
+pub mod legacy_install_cleanup;
+pub mod lightweight;
+pub mod lightweight_scheduler;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_tray;
+#[cfg(target_os = "linux")]
+pub mod linux_webview;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod native_panel;
+pub mod onebot_endpoint_resolver;
+pub mod product_registry;
+pub mod runtime;
+pub mod screenshot;
+pub mod single_instance;
+pub mod snowluma_offline_listener;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod tray_avatars;
+pub mod tray_icon;
+pub mod tray_panel;
+#[cfg(any(windows, target_os = "linux"))]
+pub mod tray_panel_native;
+pub mod tray_summary;
+pub mod ui_scale;
+pub mod webview_scheduler;
+pub mod window_events;
+pub mod window_frame;
+pub mod window_icon;
+pub mod windows_toast;
+#[cfg(windows)]
+pub mod windows_ui;
+
+pub use bootstrap::{build_snapshot, build_snapshot_for_data_root};
+
+pub type AppBotManager = BotManager<LocalBotConfigRepo<LocalConfigStore>, LocalConfigStore>;
+
+pub struct AppState {
+    pub(crate) data_root: PathBuf,
+    pub(crate) snapshot: BootstrapSnapshot,
+    pub(crate) event_bus: BroadcastEventBus,
+    pub(crate) runtime: runtime::AppRuntime,
+    pub(crate) bot_manager: Arc<AppBotManager>,
+    pub(crate) server_manager: Arc<ncd_runtime::ServerManager>,
+    pub(crate) snowluma_daemon: Arc<ncd_runtime::SnowLumaDaemon>,
+    /// 部署/安装任务事实源与资源调度器。
+    pub(crate) deployment_tasks: ncd_runtime::DeploymentTaskManager,
+    /// 组件动作执行器:活跃任务表、远端库存缓存都归它,Bot 启动预检共用这一份
+    pub(crate) components: Arc<ncd_runtime::ComponentExecutor>,
+    pub(crate) desktop_notify: Arc<RwLock<DesktopNotifySettings>>,
+    pub(crate) app_settings: Arc<RwLock<ncd_domain::AppSettings>>,
+    pub(crate) network: Arc<ncd_runtime::desktop::network::NetworkManager>,
+    pub(crate) network_update_gate: Mutex<()>,
+    /// 离线告警 fan-out(桌面 Toast / Webhook / Email / OneBot)
+    pub(crate) offline_notifier: Arc<ncd_runtime::CompositeOfflineNotifier>,
+    pub(crate) lightweight_scheduler: Arc<lightweight_scheduler::LightweightScheduler>,
+    /// 远程主机健康探活 walker 的取消令牌
+    /// 由启动 wiring 和 set_app_settings 根据 enabled 变化来条件 spawn / cancel + restart
+    pub(crate) health_probe_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// 本机 Bot 指标采集（读 net-stats + 节流写 history.jsonl）；远端历史由 ncd-watch 写
+    pub(crate) metrics_collector: ncd_runtime::metrics::MetricsCollector,
+    /// 数据根整树迁移闸门(进行中拒绝其它写盘 command)
+    pub(crate) migrate_gate: Arc<commands::data_root_migrate::DataRootMigrateGate>,
+    /// 应用端框架（Karin 等）实例表 + 起停 + 对接编排
+    pub(crate) app_manager: Arc<ncd_runtime::AppManager>,
+    /// 内嵌终端会话；和网页无关，进轻量模式也不断
+    pub(crate) terminals: Arc<ncd_runtime::terminal::TerminalManager>,
+    /// OneBot 调试台：Bot 的调用通道、事件接收器、工作区 / 收藏 / 历史落盘。
+    /// 功能开关 = app-settings 的 `features.apiDebug`：启动时按落盘值调一次
+    /// `set_enabled`（关着就不起接收器），设置保存时按新值热生效
+    pub(crate) onebot_debug: Arc<ncd_runtime::onebot_debug::DebugManager>,
+    pub(crate) chat: Arc<ncd_runtime::chat::ChatManager>,
+    /// 调试台对外（本机 agent）的 MCP 服务；默认关，随设置的 `mcp.enabled` 起停
+    pub(crate) mcp: Arc<ncd_mcp::McpServer>,
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    window_icon::prepare_application_identity(&context.config().identifier);
+    let data_root = bootstrap::resolve_data_root();
+    let snapshot = build_snapshot_for_data_root(&data_root);
+    let event_bus = BroadcastEventBus::default();
+    desktop_log::init_desktop_logging(&data_root, event_bus.clone());
+    #[cfg(target_os = "linux")]
+    tracing::info!(
+        "Linux WebView 渲染配置: WEBKIT_DISABLE_DMABUF_RENDERER={:?}, WEBKIT_DISABLE_COMPOSITING_MODE={:?}, 硬件合成={:?}",
+        std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER"),
+        std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE"),
+        linux_webview::effective_acceleration()
+    );
+    container_engine::initialize(&data_root);
+    #[cfg(windows)]
+    {
+        let reg = product_registry::ensure_product_paths_registered(&data_root);
+        if reg.wrote_install_dir || reg.wrote_data_root {
+            tracing::info!(
+                target: "ncd_tauri::product_registry",
+                install_dir = ?reg.install_dir.as_ref().map(|p| p.display().to_string()),
+                data_root = ?reg.data_root.as_ref().map(|p| p.display().to_string()),
+                wrote_install_dir = reg.wrote_install_dir,
+                wrote_data_root = reg.wrote_data_root,
+                "ensured product path registry values"
+            );
+        }
+        for err in &reg.errors {
+            tracing::debug!(
+                target: "ncd_tauri::product_registry",
+                error = %err,
+                "product path registry ensure skipped or failed"
+            );
+        }
+        let cleanup = legacy_install_cleanup::purge_legacy_install_orphans();
+
+        if let Some(reason) = cleanup.skipped_reason.as_deref() {
+            tracing::debug!(
+                target: "ncd_tauri::install_cleanup",
+                install_dir = %cleanup.install_dir.display(),
+                reason,
+                "legacy install orphan cleanup skipped"
+            );
+        }
+        for name in &cleanup.removed {
+            tracing::info!(
+                target: "ncd_tauri::install_cleanup",
+                install_dir = %cleanup.install_dir.display(),
+                name = %name,
+                "removed legacy install orphan"
+            );
+        }
+        for (name, err) in &cleanup.failed {
+            tracing::warn!(
+                target: "ncd_tauri::install_cleanup",
+                install_dir = %cleanup.install_dir.display(),
+                name = %name,
+                error = %err,
+                "failed to remove legacy install orphan"
+            );
+        }
+
+        let broken_reg = legacy_install_cleanup::purge_broken_hkcu_product_key();
+        if broken_reg.removed {
+            tracing::info!(
+                target: "ncd_tauri::install_cleanup",
+                "removed broken HKCU product key Software{{{{product_name}}}}"
+            );
+        } else if let Some(err) = broken_reg.error.as_deref() {
+            tracing::warn!(
+                target: "ncd_tauri::install_cleanup",
+                error = %err,
+                "failed to remove broken HKCU product key Software{{{{product_name}}}}"
+            );
+        } else if broken_reg.found {
+            tracing::debug!(
+                target: "ncd_tauri::install_cleanup",
+                "broken HKCU product key present but not removed"
+            );
+        }
+    }
+    tracing::info!(
+        target: "ncd_tauri",
+        data_root = %data_root.display(),
+        "NapCatQQ Desktop 进程已启动"
+    );
+    desktop_log::write_session_line(
+        "INFO",
+        "ncd::desktop",
+        &format!("NapCatQQ Desktop 已启动，data_root={}", data_root.display()),
+    );
+    let runtime = runtime::AppRuntime::new(&data_root, event_bus.clone());
+    let runtime_watcher = runtime.clone();
+
+    let store = Arc::new(LocalConfigStore::new(&data_root));
+    let paths = ncd_runtime::DataPaths::new(&data_root);
+    let secrets: Arc<dyn ncd_traits::SecretStore + Send + Sync> =
+        Arc::new(SecretStoreImpl::new(paths.secrets_dir()));
+    let repo = Arc::new(LocalBotConfigRepo::new(
+        Arc::clone(&store),
+        Arc::clone(&secrets),
+    ));
+    let renderer = Arc::new(DispatchRenderer::new(
+        paths.napcat_config_dir(),
+        paths.snowluma_config_dir(),
+    ));
+    let launch_planner = Arc::new(
+        ncd_runtime::FileSystemRuntimeLaunchPlanner::new(paths.components_dir())
+            .with_snowluma_runtime_root(paths.snowluma_install_dir())
+            .with_snowluma_data_root(paths.snowluma_data_dir()),
+    );
+    // NativeDeployment 替代旧 LocalRuntimeBackend:通过适配器壳对外仍是 BotBackend
+    let local_host: Arc<dyn ncd_host::Host> = ncd_host::local::local_host_for_data_root(&data_root);
+    let event_sink: Arc<dyn ncd_deploy::NativeRuntimeEventSink> =
+        Arc::new(ncd_runtime::EventBusSink::new(Arc::new(event_bus.clone())));
+    let translator: Arc<dyn ncd_deploy::NativeLaunchTranslator> =
+        Arc::new(ncd_runtime::RuntimeLaunchPlannerAdapter::new(
+            launch_planner.clone() as Arc<dyn ncd_runtime::RuntimeLaunchPlanner>,
+        ));
+    let native_deployment = Arc::new(ncd_deploy::NativeDeployment::new(
+        translator,
+        event_sink,
+        Some(paths.bot_log_dir()),
+    ));
+    let bot_backend: Arc<dyn ncd_traits::runtime_backend::BotBackend> =
+        Arc::new(ncd_runtime::NativeDeploymentBackend::new(
+            native_deployment,
+            Arc::clone(&local_host),
+            "bot-manager-local",
+            ncd_domain::kinds::BotFlavor::NapCat,
+        ));
+    // NapCat WebUI 登录轮询依赖:WebUI client + 离线告警 fan-out(桌面 Toast / Webhook / Email)
+    // 启动期建不起 HTTP 客户端就没法继续，只能带着原因退出
+    #[allow(clippy::expect_used)]
+    let webui_client: Arc<dyn ncd_runtime::NapCatWebUiClient> = Arc::new(
+        ReqwestNapCatWebUiClient::new()
+            .expect("初始化 NapCat WebUI HTTP 客户端失败：rustls-tls 构建异常"),
+    );
+    let loaded_settings = ncd_runtime::desktop::load_app_settings_checked(&data_root);
+    let mut app_settings = loaded_settings.as_ref().cloned().unwrap_or_default();
+    if loaded_settings.is_ok() {
+        ncd_runtime::desktop::backfill_snowluma_package(&data_root, &mut app_settings);
+    }
+    let configured_network = loaded_settings
+        .and_then(|_| ncd_runtime::desktop::network::read_proxy_password(secrets.as_ref()))
+        .and_then(|password| {
+            ncd_runtime::desktop::network::NetworkManager::new(
+                &app_settings.network,
+                password.as_deref().unwrap_or_default(),
+            )
+        });
+    #[allow(clippy::expect_used)]
+    let network = Arc::new(configured_network.unwrap_or_else(|error| {
+        tracing::error!(%error, "网络设置无法应用，外网请求已停用，请在设置中修复");
+        ncd_runtime::desktop::network::NetworkManager::blocked(&app_settings.network)
+            .expect("构建停用网络客户端失败")
+    }));
+    #[allow(clippy::expect_used)]
+    ncd_network::client::install_network_provider(network.clone()).expect("网络服务重复初始化");
+    // 以 app-settings 为准收敛 HKCU Run(开=刷新路径,关=删本产品值)
+    autostart::reconcile_launch_on_startup(app_settings.launch_on_startup);
+    let app_settings_shared = Arc::new(RwLock::new(app_settings.clone()));
+    let initial_ui_scale = ui_scale::UiScale::new(&app_settings.ui_preferences);
+    let metrics_prefs = {
+        let mut p = ncd_runtime::metrics::BotRuntimeMetricsPrefs::from_app(&app_settings);
+        p.normalize();
+        Arc::new(RwLock::new(p))
+    };
+    let metrics_collector =
+        ncd_runtime::metrics::MetricsCollector::new(data_root.clone(), Arc::clone(&metrics_prefs));
+    let lightweight_scheduler = Arc::new(lightweight_scheduler::LightweightScheduler::new(
+        Arc::clone(&app_settings_shared),
+    ));
+    let startup_tray_only = autostart::start_in_tray(
+        &app_settings.ui_mode_on_startup,
+        autostart::is_autostart_launch(std::env::args_os()),
+    );
+    let poller_settings = Arc::new(RwLock::new(app_settings.poller.clone()));
+    let desktop_notify = Arc::new(RwLock::new(app_settings.desktop_notify_flags()));
+    let tauri_notifier = desktop_notify::TauriOfflineNotifier::new(Arc::clone(&desktop_notify));
+    let webhook_settings = Arc::new(RwLock::new(app_settings.offline_webhook.clone()));
+    let email_settings = Arc::new(RwLock::new(app_settings.offline_email.clone()));
+    let onebot_settings = Arc::new(RwLock::new(app_settings.offline_onebot.clone()));
+    let onebot_resolver = ncd_runtime::SwappableOneBotEndpointResolver::new(Arc::new(
+        ncd_runtime::NoopOneBotEndpointResolver,
+    ));
+    let offline_notifier = ncd_runtime::CompositeOfflineNotifier::new(
+        Some(ncd_runtime::DesktopToastSink::new(
+            tauri_notifier.clone() as Arc<dyn ncd_runtime::OfflineNotifier>,
+            Arc::clone(&desktop_notify),
+        )),
+        Arc::clone(&poller_settings),
+        Arc::clone(&webhook_settings),
+        Arc::clone(&email_settings),
+        Arc::clone(&onebot_settings),
+        onebot_resolver.clone() as Arc<dyn ncd_runtime::OneBotEndpointResolver>,
+    );
+    let offline_notifier_trait: Arc<dyn ncd_runtime::OfflineNotifier> = offline_notifier.clone();
+    // ServerManager 提前构造,既给下面 AppState 用,也给 HostResolver 用(让
+    // BotManager 能按 runtime_target 把 bot 启到本机 / 远端)
+    // 注入 event_bus,用于发布 HostConnectionLost / Recovered
+    let mut server_mgr =
+        ncd_runtime::ServerManager::new(&data_root, Arc::new(ncd_runtime::KeyringCredentialStore));
+    server_mgr.set_event_bus(Arc::new(event_bus.clone()));
+    let server_manager = Arc::new(server_mgr);
+    let host_resolver: Arc<dyn ncd_runtime::HostResolver> =
+        Arc::new(bot_host_resolver::TauriHostResolver::new(
+            Arc::clone(&server_manager),
+            Arc::clone(&local_host),
+        ));
+    let host_resolver_for_apps = Arc::clone(&host_resolver);
+    let host_resolver_for_terminals = Arc::clone(&host_resolver);
+    let host_resolver_for_debug = Arc::clone(&host_resolver);
+    // 应用端注册表只建这一份:组件执行器和 AppManager 用的是同一批适配器实例
+    let app_registry = Arc::new(ncd_runtime::AppFrameworkRegistry::with_builtin());
+    let deployment_tasks = ncd_runtime::DeploymentTaskManager::new(event_bus.clone());
+    let components = Arc::new(ncd_runtime::ComponentExecutor::new(
+        ncd_runtime::components::ComponentExecutorDeps {
+            deployment_tasks: deployment_tasks.clone(),
+            server_manager: Arc::clone(&server_manager),
+            event_bus: event_bus.clone(),
+            app_settings: Arc::clone(&app_settings_shared),
+            data_root: data_root.clone(),
+            local_snowluma_version: snapshot.local_versions.snowluma.clone(),
+            desktop_product_version: desktop_update::product_version_str().to_string(),
+            registry: Arc::clone(&app_registry),
+        },
+    ));
+    let runtime_gate: Arc<dyn ncd_runtime::RuntimeReadinessGate> =
+        Arc::new(ncd_runtime::components::ComponentRuntimeGate::new(
+            Arc::clone(&host_resolver),
+            Arc::clone(&components),
+        ));
+    let bot_manager = Arc::new(
+        BotManager::new(
+            repo,
+            Arc::clone(&store),
+            renderer,
+            bot_backend,
+            launch_planner,
+            Arc::new(event_bus.clone()),
+            webui_client,
+            offline_notifier_trait,
+            poller_settings,
+            Arc::clone(&desktop_notify),
+        )
+        .with_host_resolver(host_resolver)
+        .with_server_manager(Arc::clone(&server_manager))
+        .with_remote_inventory(components.shared_inventory())
+        .with_runtime_gate(runtime_gate)
+        .with_docker_webui_secret_store(Arc::clone(&secrets)),
+    );
+
+    // SnowLuma daemon + backend wiring
+    // 路径来自 DataPaths 布局 v1:
+    // - 数据根:state/snowluma
+    // - 安装根:components/SnowLuma
+    let snowluma_data_root = paths.snowluma_data_dir();
+    let snowluma_runtime_root = paths.snowluma_install_dir();
+    let snowluma_factory: Arc<dyn ncd_runtime::SnowLumaWebUiClientFactory> =
+        Arc::new(ncd_runtime::ReqwestSnowLumaWebUiClientFactory::new());
+    let snowluma_daemon = ncd_runtime::SnowLumaDaemon::new(
+        snowluma_data_root,
+        snowluma_runtime_root,
+        Arc::new(event_bus.clone()),
+        snowluma_factory,
+    );
+    snowluma_daemon.set_node_bin_override(app_settings.snowluma_node_override().map(PathBuf::from));
+    let snowluma_backend: Arc<dyn ncd_traits::runtime_backend::BotBackend> =
+        Arc::new(ncd_runtime::SnowLumaRuntimeBackend::new(
+            ncd_domain::ids::BotId::new("snowluma-backend-local"),
+            Arc::clone(&snowluma_daemon),
+            Arc::new(event_bus.clone()),
+        ));
+    // 到这里 bot_manager 还没交给任何人，try_unwrap 必然成功
+    #[allow(clippy::expect_used)]
+    let bot_manager = Arc::new(
+        Arc::try_unwrap(bot_manager)
+            .ok()
+            .expect("bot_manager Arc not yet shared")
+            .with_snowluma(snowluma_backend, Arc::clone(&snowluma_daemon)),
+    );
+    // 调试台要 BotManager 收尾后的那一份（with_snowluma 之后）
+    let chat = Arc::new(ncd_runtime::chat::ChatManager::new(
+        Arc::clone(&bot_manager) as Arc<dyn ncd_runtime::DebugBotPort>,
+        Arc::clone(&host_resolver_for_debug),
+        data_root.clone(),
+    ));
+    let onebot_debug = Arc::new(ncd_runtime::onebot_debug::DebugManager::new(
+        Arc::clone(&bot_manager) as Arc<dyn ncd_runtime::DebugBotPort>,
+        host_resolver_for_debug,
+        data_root.clone(),
+    ));
+    // 功能开关按落盘值起停（M7）：关着就不该有接收器起来；设置保存时 set_app_settings 按新值热生效
+    tauri::async_runtime::block_on(onebot_debug.set_enabled(app_settings.features.api_debug));
+    tauri::async_runtime::block_on(chat.set_enabled(app_settings.features.chat));
+    // BotManager 就绪后再挂 OneBot messenger 解析
+    tauri::async_runtime::block_on(onebot_resolver.set(Arc::new(
+        onebot_endpoint_resolver::BotManagerOneBotEndpointResolver::new(Arc::clone(&bot_manager)),
+    )));
+
+    // 应用端框架：实例表 + 进程骨架 + 对接编排（对接热推复用 BotManager::upsert_bot_config）
+    let app_manager = {
+        let store = match ncd_runtime::AppInstanceStore::load(&data_root) {
+            Ok(s) => Arc::new(s),
+            Err(err) => {
+                let (store, kept) =
+                    ncd_runtime::AppInstanceStore::quarantine_and_start_empty(&data_root);
+                let kept = kept
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(move failed, left in place)".into());
+                desktop_log::write_session_line(
+                    "EROR",
+                    "ncd::app_framework",
+                    &format!(
+                        "app-instances.json unreadable, starting empty, original kept at {kept}: {err}"
+                    ),
+                );
+                Arc::new(store)
+            }
+        };
+        let app_runtime = Arc::new(ncd_runtime::NativeAppRuntime::new(
+            Arc::new(event_bus.clone()),
+            Arc::clone(&store),
+        ));
+        Arc::new(
+            ncd_runtime::AppManager::new(
+                app_registry,
+                store,
+                app_runtime,
+                Arc::clone(&host_resolver_for_apps),
+                Arc::clone(&bot_manager) as Arc<dyn ncd_runtime::BotConfigPort>,
+                Arc::new(event_bus.clone()),
+                &data_root,
+            )
+            .with_secret_store(Arc::clone(&secrets))
+            .with_component_executor(Arc::clone(&components)),
+        )
+    };
+    // 迁移恢复先建立主机交接保护，再开放 reconcile / auto_start。
+    if let Err(error) = tauri::async_runtime::block_on(app_manager.recover_bot_migrations()) {
+        tracing::error!(%error, "bot migration recovery failed");
+        desktop_log::write_session_line(
+            "EROR",
+            "ncd::bot_migration",
+            &format!("bot migration recovery failed: {error}"),
+        );
+    }
+    let app_manager_reconcile = Arc::clone(&app_manager);
+    let app_manager_host_recovery = Arc::clone(&app_manager);
+    let app_manager_migration_monitor = Arc::clone(&app_manager);
+
+    let mcp = Arc::new(
+        ncd_mcp::McpServer::new(
+            Arc::clone(&onebot_debug),
+            Arc::new(ncd_runtime::SystemSecretStore),
+        )
+        .with_inspection(Arc::new(ncd_mcp::McpInspection::new(
+            Arc::clone(&bot_manager),
+            Arc::clone(&app_manager),
+            Arc::clone(&server_manager),
+            Arc::clone(&components),
+        ))),
+    );
+    tauri::async_runtime::block_on(commands::mcp::apply_mcp_settings(
+        &mcp,
+        &data_root,
+        &app_settings_shared,
+        &app_settings.mcp,
+    ));
+
+    let terminals = Arc::new(ncd_runtime::terminal::TerminalManager::new(Arc::new(
+        ncd_runtime::terminal::DesktopTerminalPlanner::new(
+            host_resolver_for_terminals,
+            Arc::clone(&server_manager),
+            Arc::clone(&bot_manager) as Arc<dyn ncd_runtime::BotConfigPort>,
+            Arc::clone(&app_manager),
+            data_root.clone(),
+        ),
+    )));
+
+    let bot_manager_bootstrap = Arc::clone(&bot_manager);
+    let data_root_for_bootstrap = data_root.clone();
+    let bot_manager_listener = Arc::clone(&bot_manager);
+    let bot_manager_login_listener = Arc::clone(&bot_manager);
+    let bot_manager_snowluma_listener = Arc::clone(&bot_manager);
+    let bot_manager_offline_listener = Arc::clone(&bot_manager);
+    let bot_manager_host_recovery_listener = Arc::clone(&bot_manager);
+    let bot_manager_auto_restart = Arc::clone(&bot_manager);
+    let onebot_debug_listener = Arc::clone(&onebot_debug);
+    let onebot_debug_sweeper = Arc::clone(&onebot_debug);
+    let chat_listener = Arc::clone(&chat);
+    let chat_sweeper = Arc::clone(&chat);
+
+    let mut builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(single_instance::plugin());
+    }
+    // Tauri 应用建不起来没有降级可走，expect 让 panic 钩子记下原因
+    #[allow(clippy::expect_used)]
+    builder
+        // 用系统默认浏览器打开外部 URL(例如 NapCat WebUI)
+        // webview 自身不支持 target=_blank
+        .plugin(tauri_plugin_opener::init())
+        // 配置导入导出用原生文件 / 目录选择对话框(webview 无法拿真实文件系统路径)
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .manage(AppState {
+            data_root,
+            snapshot,
+            event_bus: event_bus.clone(),
+            runtime,
+            bot_manager,
+            server_manager,
+            snowluma_daemon: Arc::clone(&snowluma_daemon),
+            deployment_tasks,
+            components,
+            desktop_notify: Arc::clone(&desktop_notify),
+            app_settings: Arc::clone(&app_settings_shared),
+            offline_notifier: Arc::clone(&offline_notifier),
+            network,
+            network_update_gate: Mutex::new(()),
+            lightweight_scheduler: Arc::clone(&lightweight_scheduler),
+            health_probe_cancel: Arc::new(Mutex::new(None)),
+            metrics_collector: metrics_collector.clone(),
+            migrate_gate: Arc::new(commands::data_root_migrate::DataRootMigrateGate::default()),
+            app_manager: app_manager.clone(),
+            terminals,
+            onebot_debug,
+            chat,
+            mcp,
+        })
+        // 页面开始（重新）加载时，旧页面的调试台事件订阅已经没人收了，但 Channel 还能 send 成功、探不出来，
+        // 在这里按窗口摘掉，否则接收器一直算「有人在看」，空闲停不下来
+        .manage(chat_window::ChatWindowCoordinator::default())
+        .manage(initial_ui_scale)
+        .manage(chat_tray::ChatTrayState::default())
+        .manage(webview_scheduler::WebviewScheduler::default())
+        .manage(screenshot::ScreenshotCoordinator::default())
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Some(state) = webview.try_state::<AppState>()
+            {
+                state
+                    .onebot_debug
+                    .page_loading(webview.label(), std::time::Instant::now());
+                state
+                    .chat
+                    .page_loading(webview.label(), std::time::Instant::now());
+                let chat = Arc::clone(&state.chat);
+                let page = webview.label().to_owned();
+                let before = std::time::Instant::now();
+                tauri::async_runtime::spawn(async move {
+                    chat.release_page_before(&page, before).await;
+                });
+            }
+        })
+        .setup(move |app| {
+            if let Some(window) = app.get_webview_window(lightweight::MAIN_WINDOW_LABEL) {
+                ui_scale::apply_to_window(&window).map_err(std::io::Error::other)?;
+                window_frame::apply(&window).map_err(std::io::Error::other)?;
+            }
+            if startup_tray_only {
+                if let Err(err) = lightweight::enter_lightweight_mode(app.handle()) {
+                    desktop_log::write_session_line(
+                        "WARN",
+                        "ncd::lightweight",
+                        &format!("startup tray_only failed: {err}"),
+                    );
+                }
+            }
+
+            windows_toast::prepare_windows_toast_identity(app.handle());
+            tauri_notifier.bind_app(app.handle().clone());
+            desktop_notify::spawn_desktop_notify_listener(
+                app.handle().clone(),
+                event_bus.clone(),
+                Arc::clone(&desktop_notify),
+            );
+            snowluma_offline_listener::spawn_snowluma_offline_listener(
+                event_bus.clone(),
+                Arc::clone(&offline_notifier),
+                bot_manager_offline_listener,
+            );
+            let handle = app.handle().clone();
+            let mut subscription = event_bus.subscribe(EventFilter::all());
+            tauri::async_runtime::spawn(async move {
+                while let Some(event) = subscription.next().await {
+                    let event_name = event.tauri_event_name();
+                    // 带顶层 v envelope 序列化(R14):payload 形如 {"v":1,"kind":...}
+                    if let Ok(payload) = event.to_envelope_json() {
+                        let emit_result = handle.emit(event_name, payload);
+                        if let Err(err) = emit_result {
+                            desktop_log::write_session_line(
+                                "WARN",
+                                "ncd::event_emit",
+                                &format!("FAILED to emit {event_name}: {err}"),
+                            );
+                        }
+                    } else {
+                        desktop_log::write_session_line(
+                            "WARN",
+                            "ncd::event_emit",
+                            &format!("FAILED to serialize event {event_name}"),
+                        );
+                    }
+                    // Bot 状态变化时，开着的原生托盘面板跟着刷一轮
+                    use ncd_domain::domain_event::DomainEventKind as EK;
+                    if matches!(
+                        event.kind(),
+                        EK::BotStateChanged
+                            | EK::BotStatusChanged
+                            | EK::BotProcessExited
+                            | EK::NapCatWebuiAvailable
+                            | EK::SnowLumaDockerEndpointsReady
+                    ) {
+                        #[cfg(any(windows, target_os = "linux"))]
+                        tray_panel_native::refresh_if_visible(&handle);
+                        #[cfg(target_os = "linux")]
+                        {
+                            let handle = handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(error) = linux_tray::refresh(&handle).await {
+                                    tracing::warn!(%error, "更新系统托盘菜单失败");
+                                }
+                            });
+                        }
+                        #[cfg(any(windows, target_os = "linux"))]
+                        chat_tray_panel_native::refresh_if_visible(&handle);
+                    }
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let delay = Duration::from_secs(runtime_watcher.watcher_interval_secs().await);
+                    tokio::time::sleep(delay).await;
+                    runtime_watcher.publish_runtime_status_changes().await;
+                }
+            });
+            // 订阅必须先于 bootstrap:reconcile attach 会立刻发 napcat_webui_available,
+            // broadcast 无 backlog。login listener 在 subscribe 后 oneshot ready,
+            // bootstrap 等 ready 再跑,避免多实例真实 port(+1) 丢失。
+            // event emit 的 subscribe 在上面已同步完成(spawn 前 register)。
+            let (login_ready_tx, login_ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let (sl_ready_tx, sl_ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let (host_ready_tx, host_ready_rx) = tokio::sync::oneshot::channel::<()>();
+            tauri::async_runtime::spawn(async move {
+                (*bot_manager_listener)
+                    .clone()
+                    .run_runtime_event_listener()
+                    .await;
+            });
+            tauri::async_runtime::spawn(async move {
+                bot_manager_login_listener
+                    .run_napcat_login_listener(Some(login_ready_tx))
+                    .await;
+            });
+            tauri::async_runtime::spawn(async move {
+                bot_manager_snowluma_listener
+                    .run_snowluma_listener(Some(sl_ready_tx))
+                    .await;
+            });
+            // 主机连上后补跑 bootstrap 时因「未连接」被跳过的远端运行态恢复
+            tauri::async_runtime::spawn(async move {
+                (*bot_manager_host_recovery_listener)
+                    .clone()
+                    .run_host_connection_listener(Some(host_ready_tx))
+                    .await;
+            });
+            tauri::async_runtime::spawn(async move {
+                app_manager_host_recovery
+                    .run_host_connection_recovered_listener()
+                    .await;
+            });
+            // 调试台：Bot 停了就收掉它的事件接收器和会话；没人看的接收器 30 分钟后清掉。
+            // 两个任务只拿 Weak，管理器丢了就自己退出
+            let onebot_debug_bus: Arc<dyn EventBus> = Arc::new(event_bus.clone());
+            let chat_bus: Arc<dyn EventBus> = Arc::new(event_bus.clone());
+            tauri::async_runtime::spawn(async move {
+                chat_listener.listen(chat_bus).await;
+            });
+            tauri::async_runtime::spawn(async move {
+                chat_sweeper.sweep().await;
+            });
+            tauri::async_runtime::spawn(async move {
+                onebot_debug_listener
+                    .run_bot_event_listener(onebot_debug_bus)
+                    .await;
+            });
+            tauri::async_runtime::spawn(async move {
+                onebot_debug_sweeper.run_idle_sweeper().await;
+            });
+            // 定时自动重启（间隔 / cron）：须在 bootstrap 前订阅，reattach 的 Running 事件才能落锚点
+            tauri::async_runtime::spawn(async move {
+                bot_manager_auto_restart.run_auto_restart_scheduler().await;
+            });
+            tauri::async_runtime::spawn(async move {
+                if login_ready_rx.await.is_err() {
+                    desktop_log::write_session_line(
+                        "WARN",
+                        "ncd::bot_manager",
+                        "login listener ready signal dropped; bootstrap continues",
+                    );
+                }
+                if sl_ready_rx.await.is_err() {
+                    desktop_log::write_session_line(
+                        "WARN",
+                        "ncd::bot_manager",
+                        "snowluma listener ready signal dropped; bootstrap continues",
+                    );
+                }
+                if host_ready_rx.await.is_err() {
+                    desktop_log::write_session_line(
+                        "WARN",
+                        "ncd::bot_manager",
+                        "host listener ready signal dropped; bootstrap continues",
+                    );
+                }
+                // 未同意当前 Desktop 协议时只恢复 Actor / reconcile，不 auto_start
+                let allow_auto_start =
+                    !crate::desktop_consent::is_consent_required(&data_root_for_bootstrap);
+                if !allow_auto_start {
+                    desktop_log::write_session_line(
+                        "INFO",
+                        "ncd::bot_manager",
+                        "desktop consent pending; bootstrap skips auto_start",
+                    );
+                }
+                match bot_manager_bootstrap
+                    .bootstrap_with_auto_start(allow_auto_start)
+                    .await
+                {
+                    Ok(result) => {
+                        if !result.skipped.is_empty() {
+                            desktop_log::write_session_line(
+                                "WARN",
+                                "ncd::bot_manager",
+                                &format!(
+                                    "bootstrap skipped {} bot(s) (over limit)",
+                                    result.skipped.len()
+                                ),
+                            );
+                        }
+                        if !result.started.failed.is_empty() {
+                            desktop_log::write_session_line(
+                                "WARN",
+                                "ncd::bot_manager",
+                                &format!(
+                                    "bootstrap auto-start failed for {} bot(s)",
+                                    result.started.failed.len()
+                                ),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        desktop_log::write_session_line(
+                            "EROR",
+                            "ncd::bot_manager",
+                            &format!("bootstrap failed: {err}"),
+                        );
+                    }
+                }
+                tauri::async_runtime::spawn(
+                    app_manager_migration_monitor.run_bot_migration_monitor(),
+                );
+            });
+
+            if !startup_tray_only {
+                if let Err(err) = commands::window::apply_main_window_startup_geometry(app.handle())
+                {
+                    desktop_log::write_session_line(
+                        "WARN",
+                        "ncd::window",
+                        &format!("startup geometry failed: {err}"),
+                    );
+                }
+                // 先提交初始几何，再显示以推进 WebKitGTK 的 rAF，避免小窗闪现后放大。
+                #[cfg(target_os = "linux")]
+                if let Some(window) = app.get_webview_window(lightweight::MAIN_WINDOW_LABEL) {
+                    window.show()?;
+                }
+            }
+
+            if let Err(err) = window_icon::apply_main_window_icon(app.handle()) {
+                desktop_log::write_session_line(
+                    "WARN",
+                    "ncd::window",
+                    &format!("set window icon failed: {err}"),
+                );
+            }
+
+            chat_tray::spawn(app.handle().clone());
+            if let Err(err) = commands::tray::attach_tray(app.handle()) {
+                desktop_log::write_session_line(
+                    "WARN",
+                    "ncd::tray",
+                    &format!("attach failed: {err}"),
+                );
+            }
+            // 应用端实例冷启动对账：按 pid 文件判 Running / Stopped；连不上的远端跳过
+            let app_manager_auto_start = Arc::clone(&app_manager);
+            let app_settings_for_auto = Arc::clone(&app_settings_shared);
+            tauri::async_runtime::spawn(async move {
+                app_manager_reconcile.reconcile_all().await;
+                // 对账完成后自动启动实例
+                let global_enabled = app_settings_for_auto
+                    .read()
+                    .await
+                    .app_instances_auto_start_effective();
+                app_manager_auto_start
+                    .auto_start_instances(global_enabled)
+                    .await;
+            });
+            // 远端 ncd-watch:周期写 desktop_present + 同步 notify.json
+            commands::ncd_watch::spawn_ncd_watch_heartbeat(app.handle().clone());
+            // 本机实例指标：读 net-stats 并节流写 history（远端 history 由 ncd-watch）
+            commands::bot_metrics::spawn_local_metrics_collector(app.handle().clone());
+            // 主动探活:启动期根据初始 AppSettings 决定是否 spawn 后台健康 walker
+            // 由于 .setup 闭包是 sync 的,这里 spawn 一个一次性 async 任务来做条件判断 + spawn walker
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        let enabled = state
+                            .app_settings
+                            .read()
+                            .await
+                            .remote_host_health_probe_enabled;
+                        if enabled {
+                            let cancel_token = CancellationToken::new();
+                            let child = cancel_token.child_token();
+                            {
+                                let mut guard = state.health_probe_cancel.lock().await;
+                                *guard = Some(cancel_token);
+                            }
+                            let sm = Arc::clone(&state.server_manager);
+                            let settings = Arc::clone(&state.app_settings);
+                            // 注意:这里 spawn 的 walker 任务会一直跑,直到 cancel
+                            tauri::async_runtime::spawn(async move {
+                                sm.run_health_probe_loop(settings, child).await;
+                            });
+                        }
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Focused(false)) {
+                window
+                    .state::<AppState>()
+                    .chat
+                    .clear_reading(window.label());
+            }
+            // 焦点进出决定 WebView 休眠；拿焦点时也兜底放出漏了恢复的 WebView
+            webview_scheduler::handle_window_event(window, event);
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == chat_window::CHAT_WINDOW_LABEL {
+                    api.prevent_close();
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = chat_window::close_chat_window(app, false).await {
+                            tracing::warn!("close chat: {e}");
+                        }
+                    });
+                    return;
+                }
+                // 调试台弹出窗只是工具窗:点了 X 就直接关,不走主窗的托盘 / 退出闸门
+                if window.label() == commands::window::DEBUG_WINDOW_LABEL {
+                    return;
+                }
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppState>();
+                    let close_action = state.app_settings.read().await.close_action.clone();
+                    if matches!(close_action, ncd_domain::CloseAction::Tray) {
+                        if let Err(err) =
+                            commands::tray::hide_main_window_to_tray(app.clone()).await
+                        {
+                            tracing::warn!("hide main window to tray failed: {err}");
+                        }
+                        return;
+                    }
+                    let _ = app.emit(
+                        window_events::DESKTOP_REQUEST_CLOSE,
+                        window_events::WindowSignal::V1,
+                    );
+                });
+            }
+            // 弹出窗销毁后,盘上的调试台工作区 / 收藏可能已被它改写:通知主窗作废旧内存状态
+            if let tauri::WindowEvent::Destroyed = event {
+                screenshot::owner_destroyed(window.app_handle(), window.label());
+                let chat = Arc::clone(&window.state::<AppState>().chat);
+                let page = window.label().to_owned();
+                let before = std::time::Instant::now();
+                chat.clear_reading(&page);
+                tauri::async_runtime::spawn(async move {
+                    chat.release_page_before(&page, before).await;
+                });
+                if window.label() == commands::window::DEBUG_WINDOW_LABEL {
+                    let _ = window.app_handle().emit_to(
+                        lightweight::MAIN_WINDOW_LABEL,
+                        window_events::DEBUG_POPOUT_CLOSED,
+                        window_events::WindowSignal::V1,
+                    );
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            desktop_opener::open_external_url,
+            container_engine::container_engine_get,
+            container_engine::container_engine_set,
+            commands::connect_remote_host,
+            commands::export_migration_report,
+            commands::get_bootstrap_status,
+            commands::get_remote_runtime_status,
+            commands::get_remote_webui_endpoint,
+            commands::list_remote_files,
+            commands::open_data_dir,
+            commands::data_root_migrate::preview_migrate_data_root,
+            commands::cache_cleanup::scan_download_cache,
+            commands::cache_cleanup::clean_download_cache,
+            commands::data_root_migrate::start_migrate_data_root,
+            commands::data_root_migrate::cancel_migrate_data_root,
+            commands::data_root_migrate::delete_retired_data_root,
+            commands::data_root_migrate::restart_after_data_root_migrate,
+            commands::desktop_log::open_desktop_log_location,
+            commands::desktop_log::desktop_log_directory,
+            commands::desktop_log::tail_desktop_log,
+            commands::publish_demo_event,
+            commands::publish_runtime_status,
+            commands::release::get_release_snapshot,
+            commands::app_settings::get_app_settings,
+            commands::app_settings::set_app_settings,
+            commands::network::list_download_mirrors,
+            commands::network::test_network_settings,
+            commands::desktop_consent::get_desktop_agreements,
+            commands::desktop_consent::accept_desktop_agreements,
+            commands::desktop_onboarding::get_desktop_onboarding,
+            commands::desktop_onboarding::start_desktop_onboarding,
+            commands::desktop_onboarding::skip_desktop_onboarding,
+            commands::desktop_onboarding::complete_desktop_onboarding,
+            commands::desktop_onboarding::reopen_desktop_onboarding,
+            commands::app_settings::test_offline_webhook,
+            commands::app_settings::test_offline_email,
+            commands::app_settings::list_offline_delivery_history,
+            commands::app_settings::clear_offline_delivery_history,
+            commands::app_settings::list_onebot_messenger_candidates,
+            commands::app_settings::ensure_onebot_messenger_http,
+            commands::mcp::mcp_status,
+            commands::mcp::mcp_connection_config,
+            commands::mcp::mcp_rotate_token,
+            commands::system_metrics::get_system_resource_snapshot,
+            commands::config_transfer::export_config,
+            commands::config_transfer::import_config,
+            commands::config_transfer::preview_config_import,
+            commands::config_transfer::list_pending_framework_config_restores,
+            commands::config_transfer::retry_framework_config_restore,
+            commands::components::list_components,
+            commands::components::local_qq_source,
+            commands::components::detect_component,
+            commands::components::open_component_directory,
+            commands::components::probe_local_node_candidates,
+            commands::components::probe_node_binary_version,
+            commands::components::qq_deps::detect_qq_dependencies,
+            commands::components::qq_deps::install_qq_dependencies,
+            commands::components::qq_deps::remember_sudo_password,
+            commands::components::run_component_action,
+            commands::components::cancel_component_action,
+            commands::components::resolve_component_dependencies,
+            commands::components::resolve_runtime_readiness,
+            commands::app_framework::list_app_frameworks,
+            commands::app_framework::list_app_instances,
+            commands::app_framework::list_app_config_documents,
+            commands::app_framework::read_app_config_text,
+            commands::app_framework::write_app_config_text,
+            commands::app_framework::open_app_instance_directory,
+            commands::app_framework::create_app_instance,
+            commands::app_framework::probe_app_project,
+            commands::app_framework::list_app_framework_versions,
+            commands::app_framework::import_app_instance,
+            commands::app_framework::preview_app_install_dir,
+            commands::app_framework::install_app_instance,
+            commands::app_framework::refresh_app_instance,
+            commands::app_framework::tail_app_instance_log,
+            commands::app_framework::start_app_instance,
+            commands::app_framework::app_pending_terms,
+            commands::app_framework::accept_app_terms,
+            commands::app_framework::stop_app_instance,
+            commands::app_framework::delete_app_instance,
+            commands::app_framework::preview_app_link,
+            commands::app_framework::apply_app_link,
+            commands::app_framework::unlink_app_instance,
+            commands::app_framework::get_app_instance_webui,
+            commands::app_framework::get_app_instance_webui_account,
+            commands::app_framework::reset_app_instance_webui_password,
+            commands::app_framework::set_app_instance_auto_start,
+            commands::desktop_update::check_desktop_update,
+            commands::desktop_update::precheck_desktop_update,
+            commands::desktop_update::install_desktop_update,
+            commands::desktop_update::consume_desktop_update_startup_notice,
+            commands::ncd_watch::sync_ncd_watch_notify,
+            commands::ncd_watch::touch_ncd_watch_present,
+            commands::deployment_tasks::list_deployment_tasks,
+            commands::deployment_tasks::cancel_deployment_task,
+            commands::deployment_tasks::delete_deployment_task,
+            commands::deployment_tasks::clear_finished_deployment_tasks,
+            commands::bot::list_bot_snapshots,
+            commands::bot_migration::preview_bot_migration,
+            commands::bot_migration::start_bot_migration,
+            commands::bot_migration::get_bot_migration,
+            commands::bot_migration::rollback_bot_migration,
+            commands::bot::refresh_bot_statuses,
+            commands::bot::list_importable_remote_bots,
+            commands::bot::reconcile_bot_runtimes,
+            commands::bot::retry_snowluma_ui,
+            commands::bot_metrics::get_bot_runtime_metrics,
+            commands::bot_metrics::get_bot_runtime_metrics_history,
+            commands::bot_metrics::list_bot_runtime_metrics,
+            commands::bot::list_bot_flavors,
+            commands::bot::list_napcat_webui_bindings,
+            commands::bot::list_snowluma_ui_snapshot,
+            commands::bot::get_bot_snapshot,
+            commands::bot::get_bot_config,
+            commands::bot::upsert_bot_config,
+            commands::bot::preview_auto_restart_cron,
+            commands::bot::delete_bot_config,
+            commands::bot::start_bot,
+            commands::bot::detect_bot_config_drift,
+            commands::bot::fetch_bot_remote_network,
+            commands::bot::start_bot_with_drift_decisions,
+            commands::bot::upsert_bot_config_with_decisions,
+            commands::bot::stop_bot,
+            commands::bot::batch_start_bots,
+            commands::bot::batch_stop_bots,
+            commands::bot::batch_delete_bots,
+            commands::bot::active_bot_count,
+            commands::bot::tail_bot_log,
+            commands::snowluma::list_qq_processes,
+            commands::snowluma::probe_qq_login_info,
+            commands::snowluma::get_snowluma_app_config,
+            commands::snowluma::set_snowluma_app_config,
+            commands::snowluma::get_snowluma_agreements,
+            commands::snowluma::accept_snowluma_agreements,
+            commands::snowluma::prepare_snowluma_agreements,
+            commands::snowluma::release_snowluma_agreement_session,
+            commands::snowluma::open_snowluma_webui,
+            commands::snowluma::open_snowluma_novnc,
+            commands::snowluma::remote_snowluma_qr_login_enabled,
+            commands::snowluma::remote_snowluma_qr_login_snapshot,
+            commands::snowluma::close_remote_snowluma_qr_login,
+            commands::servers::list_servers,
+            commands::servers::add_server,
+            commands::servers::update_server,
+            commands::servers::setup_server_key_auth,
+            commands::servers::delete_server,
+            commands::servers::test_server_connection,
+            commands::servers::confirm_server_host_key,
+            commands::servers::scan_local_ssh_keys,
+            commands::servers::discover_local_ssh_hosts,
+            commands::servers::refresh_remote_inventory,
+            commands::servers::get_remote_windows_info,
+            commands::servers::fetch_imported_network,
+            commands::docker::ops::docker_probe,
+            commands::docker::install::docker_install,
+            commands::docker::ops::docker_list_containers,
+            commands::docker::ops::docker_list_images,
+            commands::docker::management::docker_container_details,
+            commands::docker::management::docker_container_stats,
+            commands::docker::management::docker_list_networks,
+            commands::docker::management::docker_list_volumes,
+            commands::docker::management::docker_remove_resource,
+            commands::docker::ops::docker_remove_image,
+            commands::docker::ops::docker_container_action,
+            commands::docker::ops::docker_logs,
+            commands::docker::ops::docker_image_ready_for_flavor,
+            commands::docker::deploy::docker_deploy,
+            commands::docker::ops::docker_compose_down,
+            commands::tray::window_show,
+            commands::tray::window_hide_to_tray,
+            commands::tray::consume_pending_tray_exit,
+            commands::exit::prepare_exit_desktop,
+            commands::exit::request_exit_app,
+            commands::window::show_main_window,
+            commands::window::open_debug_window,
+            commands::window::reveal_debug_window,
+            commands::window::focus_debug_window,
+            commands::window::webview_memory_report,
+            commands::terminal::terminal_local_shells,
+            commands::terminal::terminal_list,
+            commands::terminal::terminal_open,
+            commands::terminal::terminal_attach,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_ack,
+            commands::terminal::terminal_restart,
+            commands::terminal::terminal_close,
+            commands::terminal::terminal_clear_history,
+            commands::terminal::terminal_fill_sudo,
+            commands::terminal::terminal_open_external,
+            commands::terminal::terminal_stats,
+            commands::terminal::terminal_list_dir,
+            commands::terminal::terminal_read_text,
+            commands::terminal::terminal_write_text,
+            commands::terminal::terminal_make_dir,
+            commands::terminal::terminal_rename,
+            commands::terminal::terminal_remove,
+            commands::terminal::terminal_upload,
+            commands::terminal::terminal_download,
+            commands::terminal::terminal_export_text,
+            commands::terminal::read_clipboard_text,
+            commands::terminal::write_clipboard_text,
+            commands::onebot_debug::onebot_debug_targets,
+            commands::chat::chat_targets,
+            commands::chat::chat_call,
+            commands::chat::chat_call_stream,
+            commands::chat::chat_subscribe,
+            commands::chat::chat_unsubscribe,
+            commands::chat::chat_archive_load,
+            commands::chat::chat_archive_save,
+            commands::chat::chat_desktop_status,
+            commands::chat::chat_set_preference,
+            commands::chat::chat_set_group_ignored,
+            commands::chat::chat_merge_hidden_groups,
+            commands::chat::chat_select_account,
+            commands::chat::chat_view_load,
+            commands::chat::chat_view_save,
+            commands::chat::chat_set_reading,
+            commands::chat::chat_mark_read,
+            commands::chat::chat_flush,
+            commands::chat::chat_release_account,
+            commands::chat::chat_read_local_image,
+            commands::chat_clipboard::chat_stage_attachment,
+            commands::chat_clipboard::chat_copy_message,
+            commands::chat_clipboard::chat_cache_file,
+            commands::chat_screenshot::chat_screenshot_capture,
+            commands::chat_screenshot::chat_screenshot_cancel,
+            commands::chat_screenshot::chat_screenshot_shortcut,
+            commands::chat::chat_group_files,
+            commands::chat::chat_group_file_space,
+            commands::chat::chat_group_file_act,
+            commands::chat::chat_file_download,
+            commands::chat::chat_cancel,
+            commands::chat::chat_open_download,
+            chat_window::open_chat_window,
+            chat_window::reveal_chat_window,
+            chat_window::focus_chat_window,
+            chat_window::close_chat_window,
+            chat_window::chat_window_state,
+            chat_window::chat_window_handoff_ready,
+            chat_window::chat_take_tray_navigation,
+            commands::onebot_debug::onebot_debug_channels,
+            commands::onebot_debug::onebot_debug_test_channel,
+            commands::onebot_debug::onebot_debug_catalog,
+            commands::onebot_debug::onebot_debug_describe,
+            commands::onebot_debug::onebot_debug_call,
+            commands::onebot_debug::onebot_debug_call_stream,
+            commands::onebot_debug::onebot_debug_cancel,
+            commands::onebot_debug::onebot_debug_save_response,
+            commands::onebot_debug::onebot_debug_subscribe,
+            commands::onebot_debug::onebot_debug_unsubscribe,
+            commands::onebot_debug::onebot_debug_receivers,
+            commands::onebot_debug::onebot_debug_stop_receiver,
+            commands::onebot_debug::onebot_debug_read_events,
+            commands::onebot_debug::onebot_debug_workspace,
+            commands::onebot_debug::onebot_debug_save_workspace,
+            commands::onebot_debug::onebot_debug_collections,
+            commands::onebot_debug::onebot_debug_save_collections,
+            commands::onebot_debug::onebot_debug_export_collections,
+            commands::onebot_debug::onebot_debug_import_collections,
+            commands::onebot_debug::onebot_debug_history,
+            commands::onebot_debug::onebot_debug_history_entry,
+            commands::onebot_debug::onebot_debug_clear_history,
+            commands::onebot_debug::onebot_debug_storage_notices,
+        ])
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if lightweight::should_prevent_exit(app, code) {
+                    api.prevent_exit();
+                }
+            }
+        });
+}

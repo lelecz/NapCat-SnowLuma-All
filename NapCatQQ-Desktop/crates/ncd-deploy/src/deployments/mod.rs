@@ -1,0 +1,20 @@
+//! Deployment trait 的具体实装
+//!
+//! 当前三种形态:
+//! - [native]:原生部署,宿主机上装 NapCat / SL 二进制并 spawn 进程
+//! - [docker]:Docker 部署,写 compose.yml + docker compose up尚未实装
+//! - [external]:外接部署,对接用户已有的 OneBot 服务尚未实装
+
+pub mod docker;
+pub mod external;
+pub mod native;
+
+pub use docker::{
+    DockerDeployment, bot_docker_container_candidates, bot_docker_container_name,
+    docker_project_dir, ensure_managed_bot_container, resolve_bot_container_name,
+};
+pub use external::ExternalDeployment;
+pub use native::{
+    EventBusSink, NativeDeployment, NativeRuntimeEventSink, NullRuntimeEventSink,
+    parse_napcat_webui_line, strip_ansi_escapes,
+};

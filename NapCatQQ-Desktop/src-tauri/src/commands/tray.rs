@@ -1,0 +1,176 @@
+// 系统托盘与主窗口显隐/退出收口
+// 左键显示主窗口,右键弹原生托盘面板(tray_panel_native.rs)
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+
+use crate::AppState;
+use crate::commands::exit;
+use crate::window_events::{DESKTOP_EXIT_BLOCKED, DesktopExitBlocked};
+
+static TRAY_ATTACHED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct PendingTrayExit(AtomicBool);
+
+impl PendingTrayExit {
+    fn request(&self) -> bool {
+        !self.0.swap(true, Ordering::SeqCst)
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+static PENDING_TRAY_EXIT: PendingTrayExit = PendingTrayExit(AtomicBool::new(false));
+
+pub const TRAY_ID: &str = "main-tray";
+
+fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    app.get_webview_window("main")
+        .ok_or_else(|| "主窗口未找到".to_string())
+}
+
+/// 显示并前置主窗口(从托盘或隐藏状态恢复;轻量模式下重建 WebView)
+#[tauri::command]
+pub async fn window_show(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.lightweight_scheduler.cancel_pending().await;
+    if crate::lightweight::is_lightweight_mode() || app.get_webview_window("main").is_none() {
+        return crate::lightweight::exit_lightweight_mode(&app).await;
+    }
+    let window = main_window(&app)?;
+    crate::webview_scheduler::show_window(&window).await?;
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+/// 隐藏主窗口到托盘,并在 close_action=tray 时按设置启动延迟/立即轻量计时
+pub async fn hide_main_window_to_tray(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    // 连 WebView 一起藏、降到休眠：只藏原生窗口时页面仍当自己可见，动画照跑、缓存不放
+    crate::webview_scheduler::hide_window(&window)?;
+    let state = app.state::<AppState>();
+    state
+        .lightweight_scheduler
+        .on_main_window_hidden(app.clone())
+        .await;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::tray_summary::refresh_tray_tooltip(&app2).await;
+    });
+    Ok(())
+}
+
+/// 隐藏主窗口(最小化到托盘,进程继续运行)
+#[tauri::command]
+pub async fn window_hide_to_tray(app: AppHandle) -> Result<(), String> {
+    hide_main_window_to_tray(app).await
+}
+
+/// 注册托盘；Linux 只使用 AppIndicator 系统菜单。
+pub fn attach_tray(app: &AppHandle) -> Result<(), String> {
+    if TRAY_ATTACHED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let icon = crate::tray_icon::idle_tray_icon(app)?;
+
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon.clone())
+        .tooltip("NapCatQQ Desktop")
+        .on_tray_icon_event(crate::tray_panel::handle_tray_icon_event);
+    // AppIndicator 把 title 作为面板文字标签；Linux 只显示图标。
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.title("NapCatQQ Desktop");
+    // AppIndicator 由桌面环境负责定位菜单；不再创建第二个 XEmbed 图标。
+    #[cfg(target_os = "linux")]
+    let builder = builder
+        .menu(&crate::linux_tray::menu(app)?)
+        .show_menu_on_left_click(true)
+        .on_menu_event(crate::linux_tray::handle_menu_event);
+    if let Err(error) = builder.build(app) {
+        TRAY_ATTACHED.store(false, Ordering::SeqCst);
+        return Err(error.to_string());
+    }
+
+    let app_refresh = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::tray_summary::refresh_tray_tooltip(&app_refresh).await;
+    });
+    crate::tray_summary::spawn_tray_tooltip_refresh_loop(app.clone());
+
+    Ok(())
+}
+
+/// 托盘面板「退出」:有本机 Bot 在跑则拦截并拉起主窗;否则停 Bot、关 runtime、退出进程。
+pub async fn tray_panel_quit(app: AppHandle) -> Result<(), String> {
+    quit_from_tray(app).await
+}
+
+/// 重建主窗时通知可能早于 React 监听；监听就绪后再原子领取一次退出请求。
+#[tauri::command]
+pub fn consume_pending_tray_exit(window: WebviewWindow) -> bool {
+    window.label() == crate::lightweight::MAIN_WINDOW_LABEL
+        && window.is_visible().unwrap_or(false)
+        && PENDING_TRAY_EXIT.take()
+}
+
+/// 托盘面板「释放界面内存」:进轻量模式销毁主 WebView。
+pub async fn tray_panel_enter_lightweight(app: AppHandle) -> Result<(), String> {
+    crate::chat_window::release_control_panel(&app).await
+}
+
+async fn quit_from_tray(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let local_active = exit::local_active_bots(&state).await?;
+    if local_active > 0 {
+        if PENDING_TRAY_EXIT.request() {
+            if let Err(error) = window_show(app.clone()).await {
+                PENDING_TRAY_EXIT.take();
+                tracing::warn!(%error, "tray exit: main window could not be restored");
+                return Err(error);
+            }
+            if let Err(error) = app.emit_to(
+                crate::lightweight::MAIN_WINDOW_LABEL,
+                DESKTOP_EXIT_BLOCKED,
+                DesktopExitBlocked::new(local_active),
+            ) {
+                tracing::warn!(%error, "tray exit: confirmation notification failed");
+            }
+        }
+        return Err(exit::exit_blocked_message(local_active));
+    }
+    PENDING_TRAY_EXIT.take();
+    exit::shutdown_and_exit(&app, &state, "tray_panel_quit").await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingTrayExit;
+
+    #[test]
+    fn pending_tray_exit_is_delivered_once_after_rebuilding_the_window() {
+        let pending = PendingTrayExit::default();
+        assert!(!pending.take());
+        assert!(pending.request());
+        assert!(
+            !pending.request(),
+            "repeated clicks keep the pending request"
+        );
+        assert!(
+            pending.take(),
+            "listener-ready or live notification claims it"
+        );
+        assert!(
+            !pending.take(),
+            "the other notification must not reopen the gate"
+        );
+        assert!(pending.request(), "a later exit request can be delivered");
+    }
+}

@@ -1,0 +1,63 @@
+//! ncd-host:NapCatQQ-Desktop 的"主机"抽象层
+//!
+//! Host trait 把"一台机器"(本地 Windows、Linux / 远端 Linux、Windows /
+//! 未来的 macOS / Docker / Agent)抽成统一接口,所有"装组件 / 跑命令 / 传文件 /
+//! 开隧道 / 提权"操作都通过它完成
+//!
+//! 设计意图是消除 legacy "本地"和"远端"两套完全独立实装(installation/ vs remote/)
+//! 同段逻辑写两遍的问题:Host trait 让上层代码(ncd-component 中的
+//! NapCatComponent::install 等)只关心"我要做什么",不关心"在哪台机器上"
+//!
+//! 与 ncd-component(Component 维度),ncd-deploy(编排 Action)合起来构成
+//! Component × Host × Action 三维模型
+//!
+//! 实装清单:
+//! - Host / HostShell trait 定义,Linux 包管理器身份与命令拼装([LinuxPackageManager])
+//! - HostPath / HostCommand / CommandOutput / HostProcess 跨平台数据类型
+//! - HostError 错误体系
+//! - LocalWindowsHost / LocalLinuxHost 实装(local 模块，按编译平台启用)
+//! - RemoteLinuxHost 实装(基于 russh / russh-sftp)
+//! - RemoteWindowsHost 实装(Windows OpenSSH / PowerShell / Agent)
+//!
+//! 跨平台约束:
+//! - 所有路径用 [HostPath] 表达,内部统一 POSIX 风格,落地时由各 Host 实装做转换
+//! - 所有命令用 [HostCommand] 构建,shell escape 委托给 [HostShell]
+//! - 各 OS 差异由 [Host::os] / [Host::shell] 暴露,Linux 上用哪个包管理器由
+//!   [LinuxPackageManager::detect] 现探,Component 内部 match host.os() { ... } 决策
+
+pub mod appimage;
+pub mod apt_lock;
+pub mod command;
+pub mod error;
+pub mod host;
+pub mod linux_pkg;
+pub mod local;
+pub mod path;
+pub mod pkg_output;
+pub mod process;
+pub mod pty;
+pub mod remote;
+pub mod remote_file;
+pub mod shell;
+pub mod stream_chunk;
+pub mod subprocess;
+
+pub use apt_lock::{host_command_wrap_dpkg_wait_for_apt, output_indicates_dpkg_lock_hold};
+pub use command::{CommandOutput, HostCommand};
+pub use error::HostError;
+pub use host::{Arch, Host, Locality, Os, SshDialTarget, StreamSource};
+pub use linux_pkg::LinuxPackageManager;
+pub use path::{ArchiveKind, DirEntry, DriveEntry, DriveKind, HostPath, PathStyle};
+pub use pkg_output::{PkgPhase, parse_pkg_mgr_line, truncate_pkg_line};
+pub use process::{ExitStatus, HostProcess, ProcessId};
+pub use pty::{
+    PtyBackend, PtyControl, PtyExit, PtyInput, PtyProgram, PtyRequest, PtySession, PtySize,
+    pty_channel_pair,
+};
+pub use remote::download_progress::{CurlProgressParser, DownloadProgress, WgetProgressParser};
+pub use remote::url_download::{curl_url_download_command, wget_url_download_command};
+pub use remote_file::{
+    LOG_FOLLOW_CHUNK_BYTES, remote_file_size, remote_read_from, remote_tail_lines,
+};
+pub use shell::{HostShell, ShellKind, shell_single_quote};
+pub use subprocess::hide_console_window;

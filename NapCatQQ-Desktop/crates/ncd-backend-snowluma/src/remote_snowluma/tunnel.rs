@@ -1,0 +1,322 @@
+//! 远端 SnowLuma Native:SSH 本地转发 WebUI / noVNC
+//!
+//! WebUI / noVNC 远端端口均由调用方探测实际监听后传入，
+//! 不写死 5099 / 6081。对齐 legacy SnowLumaTunnelManager:
+//! 多 Bot 同 server_id 共享隧道,引用计数归零后关闭
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ncd_host::remote::{TunnelHandle, TunnelSpec};
+use ncd_host::{Host, HostError};
+use tokio::sync::Mutex;
+
+pub const REMOTE_WEBUI_PORT: u16 = 5099;
+pub const REMOTE_NOVNC_PORT: u16 = 6081;
+pub const PREFERRED_WEBUI_LOCAL_PORT: u16 = 47099;
+pub const PREFERRED_NOVNC_LOCAL_PORT: u16 = 47609;
+
+#[derive(Debug, Clone)]
+pub struct RemoteSnowLumaTunnelEndpoints {
+    pub webui_local_port: u16,
+    pub novnc_local_port: u16,
+    pub webui_password: String,
+    pub vnc_password: String,
+}
+
+struct TunnelBundle {
+    webui: TunnelHandle,
+    novnc: TunnelHandle,
+    webui_password: String,
+    vnc_password: String,
+    remote_webui_port: u16,
+    remote_webui_host: String,
+    remote_novnc_port: u16,
+    refcount: u32,
+}
+
+pub struct RemoteSnowLumaTunnelRegistry {
+    by_server: Mutex<HashMap<String, TunnelSlot>>,
+}
+
+type TunnelSlot = Arc<Mutex<Option<TunnelBundle>>>;
+
+impl Default for RemoteSnowLumaTunnelRegistry {
+    fn default() -> Self {
+        Self {
+            by_server: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl RemoteSnowLumaTunnelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn endpoints_for_server(
+        &self,
+        server_id: &str,
+    ) -> Option<RemoteSnowLumaTunnelEndpoints> {
+        let slot = self.by_server.lock().await.get(server_id).cloned()?;
+        let guard = slot.lock().await;
+        if !self.is_current(server_id, &slot).await {
+            return None;
+        }
+        guard
+            .as_ref()
+            .filter(|b| !b.webui.is_closed() && !b.novnc.is_closed())
+            .map(|b| RemoteSnowLumaTunnelEndpoints {
+                webui_local_port: b.webui.local_port(),
+                novnc_local_port: b.novnc.local_port(),
+                webui_password: b.webui_password.clone(),
+                vnc_password: b.vnc_password.clone(),
+            })
+    }
+
+    /// 隧道 +1;首次建立双隧道密码由调用方在 daemon 就绪后从远端 secret 读出传入。
+    /// `remote_webui_port` / `remote_novnc_port` 必须是探测到的实际口，不能假定默认值。
+    pub async fn acquire(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+        webui_password: String,
+        vnc_password: String,
+        remote_webui_port: u16,
+        remote_novnc_port: u16,
+    ) -> Result<RemoteSnowLumaTunnelEndpoints, HostError> {
+        self.acquire_at(
+            server_id,
+            host,
+            webui_password,
+            vnc_password,
+            "127.0.0.1",
+            remote_webui_port,
+            remote_novnc_port,
+        )
+        .await
+    }
+
+    pub(crate) async fn acquire_at(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+        webui_password: String,
+        vnc_password: String,
+        remote_webui_host: &str,
+        remote_webui_port: u16,
+        remote_novnc_port: u16,
+    ) -> Result<RemoteSnowLumaTunnelEndpoints, HostError> {
+        let slot = self
+            .by_server
+            .lock()
+            .await
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        // Only this server waits for SSH. Dropping its slot invalidates every pending opener.
+        let mut guard = slot.lock().await;
+        if !self.is_current(server_id, &slot).await {
+            return Err(HostError::Cancelled);
+        }
+        if let Some(bundle) = guard.as_ref() {
+            if tunnel_remote_ports_changed(
+                bundle.remote_webui_port,
+                remote_webui_port,
+                bundle.remote_novnc_port,
+                remote_novnc_port,
+            ) || bundle.remote_webui_host != remote_webui_host
+                || bundle.webui.is_closed()
+                || bundle.novnc.is_closed()
+            {
+                tracing::info!(
+                    target: "ncd_runtime::remote_snowluma",
+                    server_id,
+                    old_webui = bundle.remote_webui_port,
+                    new_webui = remote_webui_port,
+                    "SnowLuma 远端端口已变，重建 SSH 隧道"
+                );
+                *guard = None;
+            }
+        }
+        if let Some(bundle) = guard.as_mut() {
+            // 复用隧道句柄，但密码以本次从 secret 读到的为准（接管会换密）。
+            bundle.webui_password = adopt_incoming_secret(&bundle.webui_password, &webui_password);
+            bundle.vnc_password = adopt_incoming_secret(&bundle.vnc_password, &vnc_password);
+            bundle.refcount = bundle.refcount.saturating_add(1);
+            return Ok(RemoteSnowLumaTunnelEndpoints {
+                webui_local_port: bundle.webui.local_port(),
+                novnc_local_port: bundle.novnc.local_port(),
+                webui_password: bundle.webui_password.clone(),
+                vnc_password: bundle.vnc_password.clone(),
+            });
+        }
+
+        let remote_webui = if remote_webui_port == 0 {
+            REMOTE_WEBUI_PORT
+        } else {
+            remote_webui_port
+        };
+        let remote_novnc = if remote_novnc_port == 0 {
+            REMOTE_NOVNC_PORT
+        } else {
+            remote_novnc_port
+        };
+        let opened = async {
+            let webui = open_tunnel_preferred(
+                host,
+                PREFERRED_WEBUI_LOCAL_PORT,
+                remote_webui_host,
+                remote_webui,
+            )
+            .await?;
+            let novnc =
+                open_tunnel_preferred(host, PREFERRED_NOVNC_LOCAL_PORT, "127.0.0.1", remote_novnc)
+                    .await?;
+            Ok::<_, HostError>((webui, novnc))
+        }
+        .await;
+        let (webui, novnc) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.remove_current(server_id, &slot).await;
+                return Err(error);
+            }
+        };
+
+        let eps = RemoteSnowLumaTunnelEndpoints {
+            webui_local_port: webui.local_port(),
+            novnc_local_port: novnc.local_port(),
+            webui_password: webui_password.clone(),
+            vnc_password: vnc_password.clone(),
+        };
+        let current = self.by_server.lock().await;
+        if !current
+            .get(server_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &slot))
+        {
+            return Err(HostError::Cancelled);
+        }
+        *guard = Some(TunnelBundle {
+            webui,
+            novnc,
+            webui_password,
+            vnc_password,
+            remote_webui_port: remote_webui,
+            remote_webui_host: remote_webui_host.to_owned(),
+            remote_novnc_port: remote_novnc,
+            refcount: 1,
+        });
+        Ok(eps)
+    }
+
+    pub async fn release(&self, server_id: &str) {
+        let Some(slot) = self.by_server.lock().await.get(server_id).cloned() else {
+            return;
+        };
+        let mut guard = slot.lock().await;
+        let Some(bundle) = guard.as_mut() else {
+            self.remove_current(server_id, &slot).await;
+            return;
+        };
+        if bundle.refcount == 0 {
+            return;
+        }
+        bundle.refcount -= 1;
+        if bundle.refcount == 0 {
+            *guard = None;
+            self.remove_current(server_id, &slot).await;
+        }
+    }
+
+    async fn is_current(&self, server_id: &str, slot: &TunnelSlot) -> bool {
+        self.by_server
+            .lock()
+            .await
+            .get(server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+    }
+
+    async fn remove_current(&self, server_id: &str, slot: &TunnelSlot) {
+        let mut entries = self.by_server.lock().await;
+        if entries
+            .get(server_id)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
+        {
+            entries.remove(server_id);
+        }
+    }
+
+    /// SSH 重连后旧 session 已毒死，必须拆掉本机转发，不能只减引用。
+    pub async fn drop_server(&self, server_id: &str) {
+        self.by_server.lock().await.remove(server_id);
+    }
+
+    pub async fn shutdown_all(&self) {
+        self.by_server.lock().await.clear();
+    }
+}
+
+/// 空串表示这次没读到 secret，保留缓存；非空则覆盖（接管换密）。
+fn adopt_incoming_secret(cached: &str, incoming: &str) -> String {
+    if incoming.is_empty() {
+        cached.to_string()
+    } else {
+        incoming.to_string()
+    }
+}
+
+fn tunnel_remote_ports_changed(
+    existing_webui: u16,
+    requested_webui: u16,
+    existing_novnc: u16,
+    requested_novnc: u16,
+) -> bool {
+    (requested_webui != 0 && existing_webui != requested_webui)
+        || (requested_novnc != 0 && existing_novnc != requested_novnc)
+}
+
+async fn open_tunnel_preferred(
+    host: &dyn Host,
+    preferred_local: u16,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<TunnelHandle, HostError> {
+    let mut spec_fixed = TunnelSpec::local_to_remote(preferred_local, remote_port);
+    spec_fixed.remote_host = remote_host.to_owned();
+    if let Ok(h) = host.open_tunnel(spec_fixed).await {
+        return Ok(h);
+    }
+    let mut fallback = TunnelSpec::local_to_remote(0, remote_port);
+    fallback.remote_host = remote_host.to_owned();
+    host.open_tunnel(fallback).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adopt_incoming_secret;
+
+    #[test]
+    fn adopt_incoming_secret_keeps_cache_when_empty() {
+        assert_eq!(adopt_incoming_secret("cached", ""), "cached");
+        assert_eq!(adopt_incoming_secret("cached", "fresh"), "fresh");
+        assert_eq!(adopt_incoming_secret("", "fresh"), "fresh");
+    }
+
+    #[tokio::test]
+    async fn drop_server_is_safe_when_empty() {
+        let registry = super::RemoteSnowLumaTunnelRegistry::new();
+        registry.drop_server("missing").await;
+        assert!(registry.endpoints_for_server("missing").await.is_none());
+    }
+
+    #[test]
+    fn rebuild_tunnel_when_webui_port_changes() {
+        assert!(super::tunnel_remote_ports_changed(5099, 13105, 6081, 6081));
+        assert!(!super::tunnel_remote_ports_changed(
+            13105, 13105, 6081, 6081
+        ));
+        assert!(!super::tunnel_remote_ports_changed(13105, 0, 6081, 0));
+        assert!(super::tunnel_remote_ports_changed(13105, 13105, 6081, 6082));
+    }
+}

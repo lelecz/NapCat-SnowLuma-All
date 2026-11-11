@@ -1,0 +1,441 @@
+// 服务器档案表单弹窗：新增 / 编辑两用。
+//
+// 走 shared/ui Dialog（Radix），输入框走"裸 input + bg-inset/transparent"
+// 风格，对齐 BotLogPage.next 的搜索框语言。
+//
+// initialProfile 为 null = 新增模式；非空 = 编辑模式（带 id，提交走 update）。
+// 编辑时表单预填该档案字段；密码框留空表示"不改已存的凭据"。
+//
+// 提交时：远端页只管"档案"——password 仅作可选凭据存进 keyring，是否记忆
+// 由 rememberCredential 字段控制；连接测试由用户在卡片上点"测试连接"完成。
+
+import React, { useEffect, useState } from 'react';
+import { Eye, EyeOff } from 'lucide-react';
+import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogDescription,
+    DialogFooter,
+    DialogClose,
+    Button,
+} from '../../shared/ui';
+import { ActionMotionIcon, DialogStepTransition, ExpandPresence } from '../../shared/ui/motion';
+import { cn } from '../../shared/utils/cn';
+import { useLocalSshKeys } from '../../hooks/remote/useLocalSsh';
+import type { ServerProfile } from '../../core/ipc/generated/domain/ServerProfile';
+import type { AuthMethod } from '../../core/ipc/generated/domain/AuthMethod';
+
+interface AddServerDialogProps {
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+    isSubmitting: boolean;
+    /// null = 新增；非空 = 编辑该档案。
+    initialProfile?: ServerProfile | null;
+    onSubmit: (profile: ServerProfile, password: string | undefined, autoKey: boolean) => void;
+}
+
+export const AddServerDialog: React.FC<AddServerDialogProps> = ({
+    open,
+    onOpenChange,
+    isSubmitting,
+    initialProfile,
+    onSubmit,
+}) => {
+    const isEdit = !!initialProfile;
+
+    const [name, setName] = useState('');
+    const [host, setHost] = useState('');
+    const [port, setPort] = useState(22);
+    const [username, setUsername] = useState('');
+    const [platform, setPlatform] = useState('auto');
+    const [password, setPassword] = useState('');
+    const [authMethod, setAuthMethod] = useState<AuthMethod>('password');
+    const [keyPath, setKeyPath] = useState('');
+    const [remember, setRemember] = useState(true);
+    // 密码模式下勾选：添加后用这次密码自动配置免密登录。
+    const [autoKey, setAutoKey] = useState(true);
+    const formId = React.useId();
+    const nameId = `${formId}-name`;
+    const hostId = `${formId}-host`;
+    const portId = `${formId}-port`;
+    const usernameId = `${formId}-username`;
+    const platformId = `${formId}-platform`;
+    const authMethodId = `${formId}-auth-method`;
+    const passwordId = `${formId}-password`;
+    const autoKeyId = `${formId}-auto-key`;
+    const keyPathSelectId = `${formId}-key-path-select`;
+    const keyPathCustomId = `${formId}-key-path-custom`;
+    const rememberId = `${formId}-remember`;
+
+    // 打开弹窗时按模式初始化表单：编辑预填档案字段，新增回到默认值。
+    // 密码框永远从空开始——编辑时留空表示不动已存凭据。
+    useEffect(() => {
+        if (!open) return;
+        if (initialProfile) {
+            setName(initialProfile.name);
+            setHost(initialProfile.host);
+            setPort(initialProfile.port);
+            setUsername(initialProfile.username);
+            setPlatform(initialProfile.platform ?? 'auto');
+            setAuthMethod(initialProfile.authMethod);
+            setKeyPath(initialProfile.privateKeyPath ?? '');
+            setRemember(initialProfile.rememberCredential);
+        } else {
+            setName('');
+            setHost('');
+            setPort(22);
+            setUsername('');
+            setPlatform('auto');
+            setAuthMethod('password');
+            setKeyPath('');
+            setRemember(true);
+        }
+        setPassword('');
+    }, [open, initialProfile]);
+
+    // 切到密钥认证 / 打开弹窗时扫一次本地 ~/.ssh/。
+    // 候选项不为空时默认选第一个（ed25519 优先），用户也可手填路径。
+    const { data: scannedKeys = [] } = useLocalSshKeys(open && authMethod === 'key');
+    useEffect(() => {
+        // keyPath 为空时自动填第一个候选；用户已选则不覆盖。重开弹窗时扫描结果可能没变，
+        // 上面那段已把 keyPath 清空，所以跟着 open / 认证方式也再填一次
+        if (!open || authMethod !== 'key') return;
+        const first = scannedKeys[0];
+        if (first) setKeyPath((current) => current || first);
+    }, [scannedKeys, open, authMethod]);
+
+    const handleSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        const profile: ServerProfile = {
+            id: initialProfile?.id ?? '',
+            name: name.trim() || host.trim(),
+            host: host.trim(),
+            port,
+            username: username.trim(),
+            platform: platform === 'auto' ? null : platform,
+            authMethod,
+            privateKeyPath: authMethod === 'key' ? keyPath.trim() || null : null,
+            rememberCredential: remember,
+            // 编辑时保留原状态（连接态由 test_connection 维护，表单不该重置它）。
+            state: initialProfile?.state ?? 'disconnected',
+            webuiUrl: initialProfile?.webuiUrl ?? null,
+            health: initialProfile?.health ?? null,
+            pathOverrides: initialProfile?.pathOverrides ?? null,
+            inventory: initialProfile?.inventory ?? null,
+        };
+        // 密码为空：新增=不存凭据；编辑=不改已存凭据。两种都传 undefined。
+        const pw = authMethod === 'password' && password ? password : undefined;
+        // 仅新增 + 密码模式 + 填了密码 + 勾选时，才在添加后配免密。
+        const wantAutoKey = !isEdit && authMethod === 'password' && !!password && autoKey;
+        onSubmit(profile, pw, wantAutoKey);
+    };
+
+    const canSubmit = host.trim().length > 0 && username.trim().length > 0;
+
+    return (
+        <Dialog open={open} onOpenChange={onOpenChange}>
+            <DialogContent size="md" dismissOnOutsideClick={false}>
+                <DialogHeader>
+                    <DialogTitle>{isEdit ? '编辑远端服务器' : '添加远端服务器'}</DialogTitle>
+                    <DialogDescription>
+                        {isEdit ? null : '凭据经系统 keyring 加密存储。'}
+                    </DialogDescription>
+                </DialogHeader>
+
+                <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+                    <Field id={nameId} label="名称" description="留空时使用主机地址作为档案名。">
+                        <TextInput
+                            id={nameId}
+                            ariaDescribedBy={`${nameId}-desc`}
+                            placeholder="例如：生产服务器"
+                            value={name}
+                            onChange={setName}
+                        />
+                    </Field>
+
+                    <Field id={hostId} label="主机地址" required>
+                        <TextInput
+                            id={hostId}
+                            placeholder="IP 或域名"
+                            value={host}
+                            onChange={setHost}
+                            autoFocus
+                        />
+                    </Field>
+
+                    <Field id={platformId} label="目标系统">
+                        <select
+                            id={platformId}
+                            className="h-8 w-full rounded-sm bg-inset px-2 text-sm text-text outline-none focus:ring-1 focus:ring-brand"
+                            value={platform}
+                            onChange={(event) => setPlatform(event.target.value)}
+                        >
+                            <option value="auto">自动识别</option>
+                            <option value="windows">Windows</option>
+                            <option value="linux">Linux</option>
+                        </select>
+                    </Field>
+
+                    <div className="grid min-w-0 grid-cols-[80px_minmax(0,1fr)] gap-2">
+                        <Field id={portId} label="端口">
+                            <TextInput
+                                id={portId}
+                                type="number"
+                                value={String(port)}
+                                onChange={(v) => setPort(Number(v) || 22)}
+                            />
+                        </Field>
+                        <Field id={usernameId} label="用户名" required>
+                            <TextInput
+                                id={usernameId}
+                                placeholder={
+                                    platform === 'windows'
+                                        ? '本地账户或 域\\用户名'
+                                        : 'SSH 登录账户'
+                                }
+                                value={username}
+                                onChange={setUsername}
+                            />
+                        </Field>
+                    </div>
+
+                    <Field id={authMethodId} label="认证方式">
+                        <select
+                            id={authMethodId}
+                            className="h-8 w-full rounded-sm bg-inset px-2 text-sm text-text outline-none focus:ring-1 focus:ring-brand"
+                            value={authMethod}
+                            onChange={(e) => setAuthMethod(e.target.value as AuthMethod)}
+                        >
+                            <option value="password">密码认证</option>
+                            <option value="key">密钥认证</option>
+                        </select>
+                    </Field>
+
+                    <DialogStepTransition
+                        stepKey={authMethod}
+                        className="flex min-w-0 flex-col gap-3"
+                    >
+                        {authMethod === 'password' && (
+                            <Field
+                                id={passwordId}
+                                label="SSH 密码"
+                                description={
+                                    isEdit
+                                        ? '留空表示不改动已保存的凭据。'
+                                        : '留空时仅添加档案，下次连接时再填。'
+                                }
+                            >
+                                <TextInput
+                                    id={passwordId}
+                                    ariaDescribedBy={`${passwordId}-desc`}
+                                    type="password"
+                                    placeholder="SSH 密码"
+                                    value={password}
+                                    onChange={setPassword}
+                                />
+                            </Field>
+                        )}
+
+                        {!isEdit && authMethod === 'password' && (
+                            <label
+                                htmlFor={autoKeyId}
+                                className="flex cursor-pointer items-center gap-2 text-xs text-text-secondary"
+                            >
+                                <input
+                                    id={autoKeyId}
+                                    type="checkbox"
+                                    className="h-3.5 w-3.5 rounded-sm accent-brand"
+                                    checked={autoKey}
+                                    onChange={(e) => setAutoKey(e.target.checked)}
+                                />
+                                <span>自动配置免密登录</span>
+                            </label>
+                        )}
+
+                        {authMethod === 'key' && (
+                            <Field
+                                id={scannedKeys.length > 0 ? keyPathSelectId : keyPathCustomId}
+                                label="私钥文件路径"
+                                description={
+                                    scannedKeys.length > 0
+                                        ? `已在 ~/.ssh/ 中发现 ${scannedKeys.length} 个标准密钥。`
+                                        : '~/.ssh/ 下未发现标准命名密钥，手动填路径。'
+                                }
+                            >
+                                {scannedKeys.length > 0 ? (
+                                    <div className="flex flex-col gap-1.5">
+                                        <select
+                                            id={keyPathSelectId}
+                                            aria-describedby={`${keyPathSelectId}-desc`}
+                                            className="h-8 w-full rounded-sm bg-inset px-2 text-sm text-text outline-none focus:ring-1 focus:ring-brand"
+                                            value={
+                                                scannedKeys.includes(keyPath)
+                                                    ? keyPath
+                                                    : '__custom__'
+                                            }
+                                            onChange={(e) => {
+                                                if (e.target.value === '__custom__') {
+                                                    setKeyPath('');
+                                                } else {
+                                                    setKeyPath(e.target.value);
+                                                }
+                                            }}
+                                        >
+                                            {scannedKeys.map((path) => (
+                                                <option key={path} value={path}>
+                                                    {fileName(path)}
+                                                </option>
+                                            ))}
+                                            <option value="__custom__">自定义路径…</option>
+                                        </select>
+                                        <ExpandPresence visible={!scannedKeys.includes(keyPath)}>
+                                            <TextInput
+                                                id={keyPathCustomId}
+                                                placeholder="例：~/.ssh/id_ed25519"
+                                                value={keyPath}
+                                                onChange={setKeyPath}
+                                            />
+                                        </ExpandPresence>
+                                    </div>
+                                ) : (
+                                    <div className="flex min-w-0 flex-col gap-1">
+                                        <TextInput
+                                            id={keyPathCustomId}
+                                            ariaDescribedBy={`${keyPathCustomId}-desc`}
+                                            placeholder="例：~/.ssh/id_ed25519"
+                                            value={keyPath}
+                                            onChange={setKeyPath}
+                                        />
+                                    </div>
+                                )}
+                            </Field>
+                        )}
+                    </DialogStepTransition>
+
+                    <label
+                        htmlFor={rememberId}
+                        className="mt-1 flex cursor-pointer items-center gap-2 text-xs text-text-secondary"
+                    >
+                        <input
+                            id={rememberId}
+                            type="checkbox"
+                            className="h-3.5 w-3.5 rounded-sm accent-brand"
+                            checked={remember}
+                            onChange={(e) => setRemember(e.target.checked)}
+                        />
+                        <span>记住凭据（存入系统 keyring）</span>
+                    </label>
+
+                    <DialogFooter>
+                        <DialogClose asChild>
+                            <Button size="sm" variant="ghost" type="button">
+                                取消
+                            </Button>
+                        </DialogClose>
+                        <Button
+                            size="sm"
+                            variant="primary"
+                            type="submit"
+                            disabled={!canSubmit || isSubmitting}
+                        >
+                            {isSubmitting
+                                ? isEdit
+                                    ? '保存中…'
+                                    : '添加中…'
+                                : isEdit
+                                  ? '保存'
+                                  : '添加'}
+                        </Button>
+                    </DialogFooter>
+                </form>
+            </DialogContent>
+        </Dialog>
+    );
+};
+
+// ─── Field / TextInput 子件 ──────────────────────────────────────────────
+
+interface FieldProps {
+    id: string;
+    label: string;
+    required?: boolean;
+    description?: string;
+    children: React.ReactNode;
+}
+
+const Field: React.FC<FieldProps> = ({ id, label, required, description, children }) => (
+    <div className="flex min-w-0 flex-col gap-1">
+        <label htmlFor={id} className="text-2xs font-medium text-text-secondary">
+            {label}
+            {required && <span className="ml-0.5 text-danger">*</span>}
+        </label>
+        {children}
+        {description && (
+            <p id={`${id}-desc`} className="text-2xs text-text-tertiary">
+                {description}
+            </p>
+        )}
+    </div>
+);
+
+interface TextInputProps {
+    id: string;
+    value: string;
+    onChange: (v: string) => void;
+    placeholder?: string;
+    type?: 'text' | 'number' | 'password';
+    autoFocus?: boolean;
+    ariaDescribedBy?: string;
+}
+
+const TextInput: React.FC<TextInputProps> = ({
+    id,
+    value,
+    onChange,
+    placeholder,
+    type = 'text',
+    autoFocus,
+    ariaDescribedBy,
+}) => {
+    const isPassword = type === 'password';
+    const [reveal, setReveal] = useState(false);
+    return (
+        <div className="relative w-full min-w-0">
+            <input
+                id={id}
+                type={isPassword ? (reveal ? 'text' : 'password') : type}
+                value={value}
+                onChange={(e) => onChange(e.target.value)}
+                placeholder={placeholder}
+                autoFocus={autoFocus}
+                aria-describedby={ariaDescribedBy}
+                className={cn(
+                    'h-8 w-full rounded-sm bg-inset px-2 text-sm text-text outline-none transition-colors placeholder:text-text-tertiary focus:ring-1 focus:ring-brand',
+                    isPassword && 'pr-8',
+                )}
+            />
+            {isPassword && (
+                <button
+                    type="button"
+                    onClick={() => setReveal((r) => !r)}
+                    className="absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-sm text-text-tertiary transition-colors hover:bg-surface hover:text-text focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-brand"
+                    aria-label={reveal ? '隐藏密码' : '显示密码'}
+                >
+                    {reveal ? (
+                        <ActionMotionIcon icon={EyeOff} size={14} />
+                    ) : (
+                        <ActionMotionIcon icon={Eye} size={14} />
+                    )}
+                </button>
+            )}
+        </div>
+    );
+};
+
+/// 取路径最后一段（兼容 / 和 \）。
+function fileName(path: string): string {
+    const idx = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+    return idx >= 0 ? path.slice(idx + 1) : path;
+}

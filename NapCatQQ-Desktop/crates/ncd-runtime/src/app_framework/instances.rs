@@ -1,0 +1,357 @@
+//! 应用实例表：`data_root/config/app-instances.json`
+//!
+//! 与 bot.json 同一套 ConfigStore 原子写 + .bak 轮转；内存缓存一份，所有改动走
+//! [AppInstanceStore::update] 保证读改写不撕裂。
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ncd_domain::{AppInstance, AppInstanceId};
+use ncd_traits::{AppFrameworkError, ConfigStore};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
+
+use crate::config_store_impl::LocalConfigStore;
+
+pub const APP_INSTANCES_FILE: &str = "app-instances.json";
+const FILE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInstancesFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    instances: Vec<AppInstance>,
+}
+
+pub struct AppInstanceStore {
+    store: LocalConfigStore,
+    path: PathBuf,
+    cache: RwLock<Vec<AppInstance>>,
+    /// 写盘在阻塞线程上跑，这把锁跟着写盘任务走：调用方的 future 半路被丢掉、缓存写锁先放了，
+    /// 下一次写盘也得等这次写完，新旧两版落盘的先后不会颠倒
+    write_gate: Arc<Mutex<()>>,
+}
+
+impl AppInstanceStore {
+    /// 同步读一次磁盘（启动期调用）；文件不存在视为空表
+    pub fn load(data_root: &Path) -> Result<Self, AppFrameworkError> {
+        let store = LocalConfigStore::new(data_root);
+        let path = store.config_dir().join(APP_INSTANCES_FILE);
+        let instances = match store.read_json(&path) {
+            Ok(value) => {
+                serde_json::from_value::<AppInstancesFile>(value)
+                    .map_err(|e| AppFrameworkError::Store(format!("{APP_INSTANCES_FILE}: {e}")))?
+                    .instances
+            }
+            Err(ncd_domain::errors::ConfigError::NotFound(_)) => Vec::new(),
+            Err(e) => return Err(AppFrameworkError::Store(e.to_string())),
+        };
+        Ok(Self {
+            store,
+            path,
+            cache: RwLock::new(instances),
+            write_gate: Arc::default(),
+        })
+    }
+
+    /// 文件读不出来时的兜底：原件改名成 `app-instances.json.corrupt.<秒>` 挪开，再空表起步。
+    /// 不能指望 .bak 轮转保住原件：.bak 只留最近几份，多保存几次它就被挤掉了。
+    /// 返回挪到哪了，挪不动（比如被别的进程占着）时是 None，原件留在原地
+    pub fn quarantine_and_start_empty(data_root: &Path) -> (Self, Option<PathBuf>) {
+        let store = Self::empty(data_root);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let target = store
+            .path
+            .with_file_name(format!("{APP_INSTANCES_FILE}.corrupt.{stamp}"));
+        let kept = std::fs::rename(&store.path, &target).ok().map(|()| target);
+        (store, kept)
+    }
+
+    pub fn empty(data_root: &Path) -> Self {
+        let store = LocalConfigStore::new(data_root);
+        let path = store.config_dir().join(APP_INSTANCES_FILE);
+        Self {
+            store,
+            path,
+            cache: RwLock::new(Vec::new()),
+            write_gate: Arc::default(),
+        }
+    }
+
+    pub async fn list(&self) -> Vec<AppInstance> {
+        self.cache.read().await.clone()
+    }
+
+    /// Commit an imported file while excluding instance updates, then replace the loaded cache.
+    pub async fn replace_with<R>(
+        &self,
+        instances: Option<Vec<AppInstance>>,
+        write: impl std::future::Future<Output = Result<R, String>>,
+    ) -> Result<R, String> {
+        let Some(instances) = instances else {
+            return write.await;
+        };
+        let mut cache = self.cache.write().await;
+        let _gate = self.write_gate.lock().await;
+        let result = write.await?;
+        *cache = instances;
+        Ok(result)
+    }
+
+    pub async fn get(&self, id: &AppInstanceId) -> Option<AppInstance> {
+        self.cache
+            .read()
+            .await
+            .iter()
+            .find(|i| &i.id == id)
+            .cloned()
+    }
+
+    pub async fn require(&self, id: &AppInstanceId) -> Result<AppInstance, AppFrameworkError> {
+        self.get(id)
+            .await
+            .ok_or_else(|| AppFrameworkError::InstanceNotFound(id.as_str().to_string()))
+    }
+
+    /// 新建或整体替换（按 id）
+    pub async fn upsert(&self, instance: AppInstance) -> Result<AppInstance, AppFrameworkError> {
+        let mut cache = self.cache.write().await;
+        match cache.iter_mut().find(|i| i.id == instance.id) {
+            Some(slot) => *slot = instance.clone(),
+            None => cache.push(instance.clone()),
+        }
+        self.persist(&cache).await?;
+        Ok(instance)
+    }
+
+    /// 读改写一体；实例不存在返回 InstanceNotFound
+    pub async fn update<F>(
+        &self,
+        id: &AppInstanceId,
+        f: F,
+    ) -> Result<AppInstance, AppFrameworkError>
+    where
+        F: FnOnce(&mut AppInstance),
+    {
+        let mut cache = self.cache.write().await;
+        let slot = cache
+            .iter_mut()
+            .find(|i| &i.id == id)
+            .ok_or_else(|| AppFrameworkError::InstanceNotFound(id.as_str().to_string()))?;
+        f(slot);
+        let updated = slot.clone();
+        self.persist(&cache).await?;
+        Ok(updated)
+    }
+
+    pub async fn remove(
+        &self,
+        id: &AppInstanceId,
+    ) -> Result<Option<AppInstance>, AppFrameworkError> {
+        let mut cache = self.cache.write().await;
+        let pos = cache.iter().position(|i| &i.id == id);
+        let removed = pos.map(|p| cache.remove(p));
+        if removed.is_some() {
+            self.persist(&cache).await?;
+        }
+        Ok(removed)
+    }
+
+    /// 调用方拿着缓存写锁等它写完，锁的范围和原来同步写时一样；只是文件 IO 挪到阻塞线程，不占异步线程
+    async fn persist(&self, instances: &[AppInstance]) -> Result<(), AppFrameworkError> {
+        let payload = serde_json::to_value(AppInstancesFile {
+            version: FILE_VERSION,
+            instances: instances.to_vec(),
+        })
+        .map_err(|e| AppFrameworkError::Store(e.to_string()))?;
+        let gate = Arc::clone(&self.write_gate).lock_owned().await;
+        let store = self.store.clone();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            store.write_json_atomic(&path, &payload)
+        })
+        .await
+        .map_err(|e| AppFrameworkError::Store(e.to_string()))?
+        .map_err(|e| AppFrameworkError::Store(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ncd_domain::{AppFrameworkId, AppInstanceState, AppPlacement};
+
+    fn sample(id: &str) -> AppInstance {
+        AppInstance {
+            id: AppInstanceId::new(id),
+            framework_id: AppFrameworkId::new("karin"),
+            display_name: "Karin".into(),
+            placement: AppPlacement::LocalNative,
+            host_id: "local".into(),
+            install_dir: "/c/apps/karin/x".into(),
+            port: 7777,
+            state: AppInstanceState::NotInstalled,
+            link: None,
+            installed_version: None,
+            last_error: None,
+            created_at_ms: 1,
+            install_renderer: true,
+            origin: ncd_domain::AppInstanceOrigin::Created,
+            auto_start: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn imported_instances_survive_the_next_update_and_reload() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let store = AppInstanceStore::load(temp.path()).unwrap();
+        store.upsert(sample("old")).await.unwrap();
+        let imported = vec![sample("imported")];
+        let payload = serde_json::json!({"version": 1, "instances": imported});
+        let result = store
+            .replace_with(Some(imported), async {
+                store
+                    .store
+                    .apply_transaction(
+                        ncd_traits::JsonTransaction::new().write(store.path.clone(), payload),
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.written, vec![store.path.clone()]);
+        store
+            .update(&AppInstanceId::new("imported"), |instance| {
+                instance.port = 8888
+            })
+            .await
+            .unwrap();
+        let reloaded = AppInstanceStore::load(temp.path()).unwrap().list().await;
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].id.as_str(), "imported");
+        assert_eq!(reloaded[0].port, 8888);
+    }
+
+    #[tokio::test]
+    async fn failed_import_keeps_instances_for_the_next_save() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let store = AppInstanceStore::load(temp.path()).unwrap();
+        store.upsert(sample("old")).await.unwrap();
+        let result = store
+            .replace_with(Some(vec![sample("imported")]), async {
+                Err::<(), _>("transaction failed".to_owned())
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), "transaction failed");
+        store
+            .update(&AppInstanceId::new("old"), |instance| instance.port = 8888)
+            .await
+            .unwrap();
+        let reloaded = AppInstanceStore::load(temp.path()).unwrap().list().await;
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].id.as_str(), "old");
+        assert_eq!(reloaded[0].port, 8888);
+    }
+
+    #[tokio::test]
+    async fn absent_instance_import_does_not_wait_for_cache_or_write_locks() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let store = AppInstanceStore::load(temp.path()).unwrap();
+        let _cache = store.cache.write().await;
+        let _write = store.write_gate.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.replace_with(None, async { Ok::<_, String>(42) }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn round_trips_through_disk() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let store = AppInstanceStore::load(temp.path()).unwrap();
+        assert!(store.list().await.is_empty());
+
+        store.upsert(sample("a")).await.unwrap();
+        store
+            .update(&AppInstanceId::new("a"), |i| {
+                i.state = AppInstanceState::Installed;
+                i.installed_version = Some("1.17.0".into());
+            })
+            .await
+            .unwrap();
+
+        let reloaded = AppInstanceStore::load(temp.path()).unwrap();
+        let list = reloaded.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].state, AppInstanceState::Installed);
+        assert_eq!(list[0].installed_version.as_deref(), Some("1.17.0"));
+
+        assert!(
+            reloaded
+                .remove(&AppInstanceId::new("a"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reloaded
+                .remove(&AppInstanceId::new("a"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            AppInstanceStore::load(temp.path())
+                .unwrap()
+                .list()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_missing_is_not_found() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let store = AppInstanceStore::load(temp.path()).unwrap();
+        let err = store
+            .update(&AppInstanceId::new("nope"), |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppFrameworkError::InstanceNotFound(_)));
+    }
+
+    // 损坏的原件要一直留着给人手动救，不能在之后几次保存的 .bak 轮转里被删掉
+    #[tokio::test]
+    async fn unreadable_file_survives_later_saves() {
+        let temp = ncd_test_support::TempWorkspace::new().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(APP_INSTANCES_FILE), b"{ not json").unwrap();
+        assert!(AppInstanceStore::load(temp.path()).is_err());
+
+        let (store, kept) = AppInstanceStore::quarantine_and_start_empty(temp.path());
+        let kept = kept.expect("unreadable file should be moved aside");
+        for n in 0..6 {
+            store.upsert(sample(&format!("i{n}"))).await.unwrap();
+        }
+        assert_eq!(std::fs::read(&kept).unwrap(), b"{ not json");
+        assert_eq!(
+            AppInstanceStore::load(temp.path())
+                .unwrap()
+                .list()
+                .await
+                .len(),
+            6
+        );
+    }
+}

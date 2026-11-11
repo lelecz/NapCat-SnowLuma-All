@@ -1,0 +1,174 @@
+// 手动高度保留为界面偏好，窗口缩小时只限制显示高度。
+import {
+    useCallback,
+    useLayoutEffect,
+    useRef,
+    useState,
+    type ComponentProps,
+    type RefObject,
+} from 'react';
+import { usePointerDrag } from '../../hooks/ui/usePointerDrag';
+import { setChatPreferences, useChatPreferences } from './chatPreferences';
+
+export function useComposerResize(
+    input: RefObject<HTMLTextAreaElement>,
+    composer: RefObject<HTMLDivElement>,
+    text: string,
+    collapsed = false,
+) {
+    const preference = useChatPreferences().composerHeight;
+    const [manual, setManual] = useState(preference);
+    const [bounds, setBounds] = useState({ height: 52, max: 420 });
+    const drag = useRef<{
+        y: number;
+        height: number;
+        original: string;
+        current: number;
+        max: number;
+        handle: HTMLButtonElement;
+    } | null>(null);
+    const measure = useRef(() => {});
+    const remeasure = useCallback(() => measure.current(), []);
+    const clamp = (value: number) => Math.round(Math.max(52, Math.min(bounds.max, value)));
+    useLayoutEffect(() => {
+        setManual(preference);
+    }, [preference]);
+    useLayoutEffect(() => {
+        measure.current = () => {
+            const element = input.current;
+            const container = composer.current;
+            if (!element || !container) return;
+            if (drag.current || collapsed || container.dataset.collapseAnimating === 'true') return;
+            const pane = container.parentElement;
+            const overhead = container.offsetHeight - element.offsetHeight;
+            const available = pane?.clientHeight || window.innerHeight;
+            const max = Math.round(
+                Math.max(52, Math.min(420, available * 0.55, available - overhead - 180)),
+            );
+            let height: number;
+            if (manual === null) {
+                element.style.height = '0px';
+                height = Math.min(max, 140, Math.max(52, element.scrollHeight));
+            } else height = Math.min(max, Math.max(52, manual));
+            element.style.height = `${height}px`;
+            setBounds((previous) =>
+                previous.height === height && previous.max === max ? previous : { height, max },
+            );
+        };
+        measure.current();
+    }, [text, manual, input, composer, collapsed]);
+    useLayoutEffect(() => {
+        const element = input.current;
+        const container = composer.current;
+        const pane = container?.parentElement;
+        if (!element || !container || !pane) return;
+        let width = element.clientWidth;
+        let paneHeight = pane.clientHeight;
+        let overhead = container.offsetHeight - element.offsetHeight;
+        const observer = new ResizeObserver(() => {
+            if (drag.current || container.dataset.collapseAnimating === 'true') return;
+            const nextOverhead = container.offsetHeight - element.offsetHeight;
+            if (
+                width === element.clientWidth &&
+                paneHeight === pane.clientHeight &&
+                overhead === nextOverhead
+            )
+                return;
+            width = element.clientWidth;
+            paneHeight = pane.clientHeight;
+            overhead = nextOverhead;
+            measure.current();
+        });
+        observer.observe(pane);
+        observer.observe(container);
+        observer.observe(element);
+        return () => observer.disconnect();
+    }, [input, composer]);
+    const commit = (height: number | null) => {
+        setManual(height);
+        setChatPreferences({ composerHeight: height });
+    };
+    const resize = usePointerDrag<HTMLButtonElement>({
+        cursor: 'row-resize',
+        onStart: (event) => {
+            const element = input.current;
+            if (!element || collapsed) return false;
+            event.currentTarget.focus();
+            drag.current = {
+                y: event.clientY,
+                height: bounds.height,
+                current: bounds.height,
+                max: bounds.max,
+                original: element.style.height,
+                handle: event.currentTarget,
+            };
+            return true;
+        },
+        onMove: (event) => {
+            const current = drag.current;
+            const element = input.current;
+            if (!current || !element) return;
+            const next = Math.round(
+                Math.max(52, Math.min(current.max, current.height + current.y - event.clientY)),
+            );
+            if (next === current.current) return;
+            current.current = next;
+            element.style.height = `${next}px`;
+            current.handle.setAttribute('aria-valuenow', String(next));
+        },
+        onEnd: (reason) => {
+            const current = drag.current;
+            drag.current = null;
+            if (!current) return;
+            if (reason === 'commit') {
+                setBounds({ height: current.current, max: current.max });
+                commit(current.current);
+            } else {
+                if (input.current) input.current.style.height = current.original;
+                current.handle.setAttribute('aria-valuenow', String(current.height));
+                if (reason !== 'unmount') measure.current();
+            }
+        },
+    });
+    const cancelResize = resize.cancel;
+    useLayoutEffect(() => {
+        if (collapsed) cancelResize();
+    }, [collapsed, cancelResize]);
+    return {
+        remeasure,
+        handle: {
+            type: 'button',
+            role: 'separator',
+            className: 'native-chat-composer-resize',
+            'aria-label': '调整输入框高度',
+            'aria-orientation': 'horizontal',
+            'aria-valuemin': 52,
+            'aria-valuemax': bounds.max,
+            'aria-valuenow': bounds.height,
+            title: '拖动调整高度，双击恢复自动高度',
+            onDoubleClick: () => commit(null),
+            onKeyDown: (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    commit(null);
+                    return;
+                }
+                const next =
+                    event.key === 'ArrowUp'
+                        ? bounds.height + 16
+                        : event.key === 'ArrowDown'
+                          ? bounds.height - 16
+                          : event.key === 'Home'
+                            ? 52
+                            : event.key === 'End'
+                              ? bounds.max
+                              : null;
+                if (next !== null) {
+                    event.preventDefault();
+                    commit(clamp(next));
+                }
+            },
+            onPointerDown: resize.start,
+        } satisfies ComponentProps<'button'>,
+    };
+}

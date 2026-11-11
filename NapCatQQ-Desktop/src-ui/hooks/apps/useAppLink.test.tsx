@@ -1,0 +1,114 @@
+import React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { OneBotLinkPlan } from '../../core/ipc/types';
+
+const previewLink = vi.fn();
+const pushErrorBar = vi.fn();
+
+vi.mock('../../core/services/app-framework.service', () => ({
+    appFrameworkService: {
+        previewLink: (...args: unknown[]) => previewLink(...args),
+    },
+}));
+
+vi.mock('../ui/pushErrorBar', () => ({
+    pushErrorBar: (...args: unknown[]) => pushErrorBar(...args),
+}));
+
+import { useAppLinkPlan } from './useAppLink';
+
+function planFor(botId: string): OneBotLinkPlan {
+    return { bot_id: botId } as OneBotLinkPlan;
+}
+
+function deferred<T>() {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+function mount(initial: { instanceId: string; botId: string; enabled: boolean }) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    return renderHook((p: typeof initial) => useAppLinkPlan(p.instanceId, p.botId, p.enabled), {
+        wrapper,
+        initialProps: initial,
+    });
+}
+
+beforeEach(() => {
+    previewLink.mockReset();
+    pushErrorBar.mockReset();
+});
+
+describe('useAppLinkPlan', () => {
+    it('没打开或没选齐时不去要计划', () => {
+        const { result, rerender } = mount({ instanceId: 'i1', botId: '', enabled: true });
+        rerender({ instanceId: 'i1', botId: '10001', enabled: false });
+        expect(result.current).toMatchObject({ plan: null, previewing: false, previewError: null });
+        expect(previewLink).not.toHaveBeenCalled();
+    });
+
+    it('换了 Bot 重新生成的途中不再给上一份计划', async () => {
+        previewLink.mockResolvedValueOnce(planFor('10001'));
+        const { result, rerender } = mount({ instanceId: 'i1', botId: '10001', enabled: true });
+        await waitFor(() => expect(result.current.plan?.bot_id).toBe('10001'));
+
+        const next = deferred<OneBotLinkPlan>();
+        previewLink.mockReturnValueOnce(next.promise);
+        rerender({ instanceId: 'i1', botId: '10002', enabled: true });
+        expect(result.current).toMatchObject({ plan: null, previewing: true, previewError: null });
+
+        next.resolve(planFor('10002'));
+        await waitFor(() => expect(result.current.plan?.bot_id).toBe('10002'));
+        expect(result.current.previewing).toBe(false);
+    });
+
+    it('生成失败时没有计划可点，也不自己重试', async () => {
+        previewLink.mockRejectedValueOnce('Bot 不在线');
+        const { result } = mount({ instanceId: 'i1', botId: '10001', enabled: true });
+        await waitFor(() => expect(result.current.previewing).toBe(false));
+        expect(result.current.plan).toBeNull();
+        expect(result.current.previewError).toBe('Bot 不在线');
+        expect(previewLink).toHaveBeenCalledTimes(1);
+        expect(pushErrorBar).toHaveBeenCalledTimes(1);
+    });
+
+    it('关掉对话框后才失败的那次不再弹错误条', async () => {
+        const pending = deferred<OneBotLinkPlan>();
+        previewLink.mockReturnValueOnce(pending.promise);
+        const { result, rerender } = mount({ instanceId: 'i1', botId: '10001', enabled: true });
+        await waitFor(() => expect(previewLink).toHaveBeenCalledTimes(1));
+
+        rerender({ instanceId: 'i1', botId: '10001', enabled: false });
+        expect(result.current).toMatchObject({ plan: null, previewing: false, previewError: null });
+
+        pending.reject('Bot 不在线');
+        await new Promise((r) => setTimeout(r, 0));
+        expect(pushErrorBar).not.toHaveBeenCalled();
+        expect(previewLink).toHaveBeenCalledTimes(1);
+    });
+
+    it('显示后端计划失败原因，手动重试成功后清理错误', async () => {
+        previewLink.mockRejectedValueOnce('目标主机没有可用的 Docker 网桥地址');
+        const { result } = mount({ instanceId: 'i1', botId: '10001', enabled: true });
+        await waitFor(() => expect(result.current.previewError).toContain('Docker 网桥地址'));
+
+        previewLink.mockResolvedValueOnce(planFor('10001'));
+        await act(async () => {
+            await result.current.retryPreview();
+        });
+
+        await waitFor(() => expect(result.current.plan?.bot_id).toBe('10001'));
+        expect(result.current.previewError).toBeNull();
+        expect(previewLink).toHaveBeenCalledTimes(2);
+    });
+});

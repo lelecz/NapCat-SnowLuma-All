@@ -1,0 +1,790 @@
+//! NoneBot2Component：一个应用实例目录 = 一个 uv 项目（`.venv` 在项目内）。
+//!
+//! 安装流程（不引入 nb-cli，脚手架文件由桌面端直接写）：
+//! 1. 解析 uv（调用方指定 → 上次安装记录 `.ncd-uv` → PATH），记下所用 uv
+//! 2. 写脚手架：`pyproject.toml`（依赖 + `[tool.nonebot]`）、`bot.py`、`.env`、`.env.prod`；已有文件不覆盖
+//! 3. `uv sync`：解析 / 下载 Python（uv 托管）、建 `.venv`、装 nonebot2 + onebot 适配器
+//! 4. 写 `.env.prod` 的 PORT / HOST
+//!
+//! 探测：`pyproject.toml` 存在 + `uv.lock` 里 nonebot2 的版本；有 pyproject 无 `.venv` 视为「依赖未同步」（Unusable）。
+
+use async_trait::async_trait;
+use ncd_component::{
+    ActionCtx, ActionError, Component, ComponentId, DetectOutcome, DetectedVersion, LaunchArgs,
+    ProgressKind, Requirement, UnusableInstall, VerifyReport,
+};
+use ncd_host::{Host, HostCommand, HostPath, Locality, Os};
+use std::time::Duration;
+
+use super::manifest::{
+    DRIVER_FASTAPI, ENV_DRIVER, ENV_HOST, ENV_PORT, LOCK_PACKAGE_NONEBOT2, NONEBOT2_BOT_PY,
+    NONEBOT2_ENV_FILE, NONEBOT2_ENV_PROD_FILE, NONEBOT2_PYPROJECT, NONEBOT2_PYTHON_REQUIRES,
+    NONEBOT2_UV_LOCK, NONEBOT2_UV_VERSION_RANGE, PYPI_ADAPTER_ONEBOT, PYPI_NONEBOT2, PYPI_TOMLI,
+};
+use crate::env_file::EnvFile;
+use crate::uv_tooling::{read_uv_marker, resolve_uv, venv_python, write_uv_marker};
+
+fn managed_bot_py_rev(text: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# ncd-managed-bot-py:")?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+fn looks_like_ncd_dynamic_bot_py(text: &str) -> bool {
+    text.contains("def _register_adapters")
+        && text.contains("importlib.import_module")
+        && text.contains("load_from_toml")
+}
+
+const SUPPORTED: &[(Os, Locality)] = &[
+    (Os::Windows, Locality::Local),
+    (Os::Windows, Locality::Remote),
+    (Os::Linux, Locality::Local),
+    (Os::Linux, Locality::Remote),
+];
+
+const LONG_STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+#[derive(Debug, Clone)]
+pub struct NoneBot2Component {
+    pub install_dir: HostPath,
+    pub port: u16,
+    /// 桌面端管理的 uv；None 只看实例标记 / PATH
+    pub uv_bin: Option<HostPath>,
+    /// PyPI 索引镜像（`uv sync --default-index`）；None 用默认源
+    pub pypi_index: Option<String>,
+    /// 领养已有项目：只同步依赖，不写脚手架 / 端口
+    pub adopt_existing: bool,
+}
+
+impl NoneBot2Component {
+    pub fn new(install_dir: HostPath, port: u16) -> Self {
+        Self {
+            install_dir,
+            port,
+            uv_bin: None,
+            pypi_index: None,
+            adopt_existing: false,
+        }
+    }
+
+    pub fn with_adopt_existing(mut self, adopt: bool) -> Self {
+        self.adopt_existing = adopt;
+        self
+    }
+
+    pub fn with_uv_bin(mut self, uv_bin: Option<HostPath>) -> Self {
+        self.uv_bin = uv_bin;
+        self
+    }
+
+    pub fn with_pypi_index(mut self, index: Option<String>) -> Self {
+        self.pypi_index = index
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self
+    }
+
+    fn sync_command(&self, uv: &HostPath) -> HostCommand {
+        let mut cmd = HostCommand::new(uv.as_posix())
+            .arg("sync")
+            .working_dir(self.install_dir.clone())
+            .env("UV_PROJECT_ENVIRONMENT", ".venv");
+        if let Some(index) = &self.pypi_index {
+            cmd = cmd.arg("--default-index").arg(index);
+        }
+        cmd
+    }
+
+    pub fn pyproject(&self) -> HostPath {
+        self.install_dir.join(NONEBOT2_PYPROJECT)
+    }
+
+    pub fn uv_lock(&self) -> HostPath {
+        self.install_dir.join(NONEBOT2_UV_LOCK)
+    }
+
+    pub fn bot_py(&self) -> HostPath {
+        self.install_dir.join(NONEBOT2_BOT_PY)
+    }
+
+    pub fn env_file(&self) -> HostPath {
+        self.install_dir.join(NONEBOT2_ENV_FILE)
+    }
+
+    pub fn env_prod_file(&self) -> HostPath {
+        self.install_dir.join(NONEBOT2_ENV_PROD_FILE)
+    }
+
+    pub fn venv_python(&self, os: Os) -> HostPath {
+        venv_python(&self.install_dir, os)
+    }
+
+    async fn preferred_uvs(&self, host: &dyn Host) -> Vec<HostPath> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(p) = &self.uv_bin {
+            out.push(p.clone());
+        }
+        if let Some(p) = read_uv_marker(host, &self.install_dir).await {
+            out.push(p);
+        }
+        out
+    }
+
+    /// 运行时启动命令：`.venv` 里的解释器直接跑 `bot.py`，不需要 uv 在 PATH
+    pub async fn resolve_launch_command(
+        &self,
+        host: &dyn Host,
+        args: &LaunchArgs,
+    ) -> Result<HostCommand, ActionError> {
+        let python = self.venv_python(host.os());
+        if host.exists(&python).await? {
+            return Ok(self.launch_with(host.os(), args));
+        }
+        let preferred = self.preferred_uvs(host).await;
+        if let Ok(uv) = resolve_uv(host, &preferred).await {
+            let cmd = HostCommand::new(uv.uv_bin.as_posix())
+                .arg("run")
+                .arg("python")
+                .arg("-u")
+                .arg(NONEBOT2_BOT_PY)
+                .working_dir(self.install_dir.clone())
+                .env("PYTHONUNBUFFERED", "1")
+                .env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
+                .long_running();
+            return Ok(args.apply_to(cmd));
+        }
+        Err(ActionError::other(format!(
+            "实例虚拟环境不存在（{}），请先安装 / 重新安装",
+            python.as_posix()
+        )))
+    }
+
+    fn launch_with(&self, os: Os, args: &LaunchArgs) -> HostCommand {
+        // 不注入 ENVIRONMENT：官方默认就是 prod；项目 .env 里写了 dev 也不能被桌面端盖掉
+        let cmd = HostCommand::new(self.venv_python(os).as_posix())
+            .arg("-u")
+            .arg(NONEBOT2_BOT_PY)
+            .working_dir(self.install_dir.clone())
+            .env("PYTHONUNBUFFERED", "1")
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .long_running();
+        args.apply_to(cmd)
+    }
+
+    async fn run_step(
+        &self,
+        host: &dyn Host,
+        ctx: &mut ActionCtx,
+        step: u32,
+        name: &str,
+        cmd: HostCommand,
+    ) -> Result<(), ActionError> {
+        if ctx.is_cancelled() {
+            return Err(ActionError::Cancelled);
+        }
+        ctx.emit(ProgressKind::StepBegin {
+            step,
+            message: name.to_string(),
+        })
+        .await;
+        let out =
+            crate::uv_tooling::run_uv_logged(host, ctx, step, name, cmd, LONG_STEP_TIMEOUT).await?;
+        if !out.success() {
+            ctx.emit(ProgressKind::StepEnd { step, ok: false }).await;
+            return Err(ActionError::install_step(
+                name,
+                format!(
+                    "exit={:?}: {}",
+                    out.exit_code,
+                    out.stderr.trim().lines().last().unwrap_or_default()
+                ),
+            ));
+        }
+        ctx.emit(ProgressKind::StepEnd { step, ok: true }).await;
+        Ok(())
+    }
+
+    /// 首装 / 更新共用：解析 uv → 脚手架 → uv sync → 写 .env.prod
+    async fn provision(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        if self.adopt_existing {
+            return self.adopt_provision(host, ctx).await;
+        }
+        const TOTAL: u32 = 4;
+        ctx.emit(ProgressKind::Started { total_steps: TOTAL }).await;
+
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: "解析 uv".to_string(),
+        })
+        .await;
+        let preferred = self.preferred_uvs(host).await;
+        let uv = resolve_uv(host, &preferred).await?;
+        ctx.info(format!("uv {}: {}", uv.version, uv.uv_bin.as_posix()))
+            .await;
+        host.create_dir_all(&self.install_dir).await?;
+        write_uv_marker(host, &self.install_dir, &uv).await?;
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+
+        ctx.emit(ProgressKind::StepBegin {
+            step: 2,
+            message: "写入项目脚手架".to_string(),
+        })
+        .await;
+        self.ensure_project_scaffold(host).await?;
+        ctx.emit(ProgressKind::StepEnd { step: 2, ok: true }).await;
+
+        // 3. uv sync：托管 Python + .venv + 依赖，一步到位
+        let sync = self.sync_command(&uv.uv_bin);
+        self.run_step(host, ctx, 3, "同步 Python 依赖（uv sync）", sync)
+            .await?;
+
+        ctx.emit(ProgressKind::StepBegin {
+            step: 4,
+            message: "写入实例端口".to_string(),
+        })
+        .await;
+        self.write_env_port(host).await?;
+        ctx.emit(ProgressKind::StepEnd { step: 4, ok: true }).await;
+
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    /// 已有项目：只补 uv 标记 + sync，不改 bot.py / dotenv
+    async fn adopt_provision(
+        &self,
+        host: &dyn Host,
+        ctx: &mut ActionCtx,
+    ) -> Result<(), ActionError> {
+        ctx.emit(ProgressKind::Started { total_steps: 2 }).await;
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: "解析 uv".to_string(),
+        })
+        .await;
+        let preferred = self.preferred_uvs(host).await;
+        let uv = resolve_uv(host, &preferred).await?;
+        ctx.info(format!("uv {}: {}", uv.version, uv.uv_bin.as_posix()))
+            .await;
+        write_uv_marker(host, &self.install_dir, &uv).await?;
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+
+        let sync = self.sync_command(&uv.uv_bin);
+        self.run_step(host, ctx, 2, "同步 Python 依赖（uv sync）", sync)
+            .await?;
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    fn project_name(&self) -> String {
+        self.install_dir
+            .file_name()
+            .map(|n| format!("nonebot2-{n}"))
+            .unwrap_or_else(|| "nonebot2-project".to_string())
+    }
+
+    /// 脚手架内容（纯函数，便于测试）
+    pub fn render_pyproject(project_name: &str) -> String {
+        format!(
+            r#"[project]
+name = "{project_name}"
+version = "0.1.0"
+description = "NoneBot2 instance managed by NapCatQQ Desktop"
+requires-python = "{NONEBOT2_PYTHON_REQUIRES}"
+dependencies = [
+    "{PYPI_NONEBOT2}",
+    "{PYPI_ADAPTER_ONEBOT}",
+    "{PYPI_TOMLI}",
+]
+
+[tool.nonebot]
+adapters = [
+    {{ name = "OneBot V11", module_name = "nonebot.adapters.onebot.v11" }},
+]
+plugins = []
+plugin_dirs = ["plugins"]
+builtin_plugins = ["echo"]
+"#
+        )
+    }
+
+    /// 旧硬编码 V11、无版本戳的动态入口、或 `# ncd-managed-bot-py` 落后于当前模板，重装时更新
+    /// 只改桌面端自己写的入口。官方教程 / 真实项目的 `from nonebot.adapters.onebot.v11 import` 不能动。
+    pub fn bot_py_needs_rewrite(text: &str) -> bool {
+        const BOT_PY_REV: u32 = 2;
+        match managed_bot_py_rev(text) {
+            Some(rev) => rev < BOT_PY_REV,
+            None => looks_like_ncd_dynamic_bot_py(text),
+        }
+    }
+
+    pub fn render_bot_py() -> &'static str {
+        // load_from_toml 只装插件;适配器按 toml 注册;非 V11 失败只跳过,避免一个适配器拖死对接
+        r#"# ncd-managed-bot-py:2
+import importlib
+import sys
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+import nonebot
+
+_CRITICAL = frozenset({"nonebot.adapters.onebot.v11"})
+
+
+def _register_adapters(driver):
+    with open("pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+    for item in data.get("tool", {}).get("nonebot", {}).get("adapters", []):
+        module_name = item.get("module_name") if isinstance(item, dict) else None
+        if not module_name:
+            continue
+        try:
+            module = importlib.import_module(module_name)
+            adapter = getattr(module, "Adapter", None)
+            if adapter is None:
+                raise AttributeError("module has no Adapter")
+            driver.register_adapter(adapter)
+        except Exception as exc:
+            if module_name in _CRITICAL:
+                raise
+            print(f"[ncd] skip adapter {module_name}: {exc}", file=sys.stderr)
+
+
+nonebot.init()
+driver = nonebot.get_driver()
+_register_adapters(driver)
+nonebot.load_from_toml("pyproject.toml")
+
+if __name__ == "__main__":
+    nonebot.run()
+"#
+    }
+
+    /// 已有文件不覆盖：用户自己加的插件 / 配置不被重装抹掉
+    async fn ensure_project_scaffold(&self, host: &dyn Host) -> Result<(), ActionError> {
+        let files: [(HostPath, String); 4] = [
+            (
+                self.pyproject(),
+                Self::render_pyproject(&self.project_name()),
+            ),
+            (self.bot_py(), Self::render_bot_py().to_string()),
+            (self.env_file(), "ENVIRONMENT=prod\n".to_string()),
+            (
+                self.env_prod_file(),
+                format!("{ENV_DRIVER}={DRIVER_FASTAPI}\n{ENV_PORT}={}\n", self.port),
+            ),
+        ];
+        for (path, body) in files {
+            if host.exists(&path).await? {
+                if path.as_posix().ends_with(NONEBOT2_BOT_PY) {
+                    let current = host.read_file(&path).await?;
+                    let text = String::from_utf8_lossy(&current);
+                    if Self::bot_py_needs_rewrite(&text) {
+                        host.write_file(&path, body.as_bytes()).await?;
+                    }
+                }
+                continue;
+            }
+            host.write_file(&path, body.as_bytes()).await?;
+        }
+        let plugins = self.install_dir.join("plugins");
+        if !host.exists(&plugins).await? {
+            host.create_dir_all(&plugins).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_env_port(&self, host: &dyn Host) -> Result<(), ActionError> {
+        let path = self.env_prod_file();
+        let text = host
+            .read_file(&path)
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map_err(|e| ActionError::install_step("write-env", e.to_string()))?;
+        let mut env = EnvFile::parse_python(&text);
+        Self::apply_listen_env(&mut env, self.port);
+        host.write_file(&path, env.render().as_bytes()).await?;
+        Ok(())
+    }
+
+    /// 只补 PORT / HOST;已有 DRIVER(含正向适配器并上的 httpx)不覆盖
+    pub fn apply_listen_env(env: &mut EnvFile, port: u16) {
+        if env.get_ci(ENV_DRIVER).is_none_or(|v| v.trim().is_empty()) {
+            env.set_ci(ENV_DRIVER, DRIVER_FASTAPI);
+        }
+        env.set_ci(ENV_PORT, &port.to_string());
+        env.set_ci(ENV_HOST, "127.0.0.1");
+    }
+
+    /// 从 `uv.lock` 取某包版本：`[[package]]` 块里 `name = "<pkg>"` 之后的 `version = "…"`
+    pub fn lock_package_version(lock_text: &str, package: &str) -> Option<String> {
+        let mut in_target = false;
+        for raw in lock_text.lines() {
+            let line = raw.trim();
+            if line == "[[package]]" {
+                in_target = false;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("name") {
+                let value = toml_string_value(rest);
+                in_target = value.as_deref() == Some(package);
+                continue;
+            }
+            if in_target {
+                if let Some(rest) = line.strip_prefix("version") {
+                    if let Some(v) = toml_string_value(rest) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn read_installed_version(&self, host: &dyn Host) -> Result<Option<String>, ActionError> {
+        let lock = self.uv_lock();
+        if !host.exists(&lock).await? {
+            return Ok(None);
+        }
+        let bytes = host.read_file(&lock).await?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(Self::lock_package_version(&text, LOCK_PACKAGE_NONEBOT2))
+    }
+}
+
+/// `= "value"` → `value`（只处理 uv.lock 用到的基本字符串）
+fn toml_string_value(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[async_trait]
+impl Component for NoneBot2Component {
+    fn id(&self) -> ComponentId {
+        ComponentId::NoneBot2
+    }
+
+    fn supported_targets(&self) -> &'static [(Os, Locality)] {
+        SUPPORTED
+    }
+
+    fn requirements(&self, _os: Os, _locality: Locality) -> Vec<Requirement> {
+        crate::remote_windows_requirements(
+            vec![Requirement::component_version(
+                ComponentId::Uv,
+                NONEBOT2_UV_VERSION_RANGE,
+            )],
+            _os,
+            _locality,
+        )
+    }
+
+    async fn detect(&self, host: &dyn Host) -> Result<Option<DetectedVersion>, ActionError> {
+        Ok(self.detect_outcome(host).await?.into_installed())
+    }
+
+    async fn detect_outcome(&self, host: &dyn Host) -> Result<DetectOutcome, ActionError> {
+        if !host.exists(&self.pyproject()).await? {
+            return Ok(DetectOutcome::NotInstalled);
+        }
+        let toml = host
+            .read_file(&self.pyproject())
+            .await
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        if !super::probe::pyproject_looks_like_nonebot2(&toml) {
+            return Ok(DetectOutcome::NotInstalled);
+        }
+        let version = self.read_installed_version(host).await?;
+        let python = self.venv_python(host.os());
+        if !host.exists(&python).await? {
+            return Ok(DetectOutcome::Unusable(UnusableInstall {
+                source: self.install_dir.as_posix().to_string(),
+                version,
+                reason: "项目已创建但依赖未同步（缺 .venv），重新安装可修复".to_string(),
+            }));
+        }
+        // uv 会先建 .venv 再安装依赖；仅存在解释器不能证明同步成功。
+        let installed = host
+            .run_to_string(
+                HostCommand::new(python.as_posix())
+                    .args([
+                        "-I",
+                        "-c",
+                        "from importlib.metadata import version; print(version('nonebot2'))",
+                    ])
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await?;
+        if !installed.success() || installed.stdout.trim().is_empty() {
+            return Ok(DetectOutcome::Unusable(UnusableInstall {
+                source: self.install_dir.as_posix().to_string(),
+                version,
+                reason: "虚拟环境已创建但未安装 NoneBot2，重新安装可修复".to_string(),
+            }));
+        }
+        let version = installed.stdout.trim().to_string();
+        Ok(DetectOutcome::Installed(DetectedVersion {
+            version,
+            source: if host.exists(&self.uv_lock()).await.unwrap_or(false) {
+                self.uv_lock().as_posix().to_string()
+            } else {
+                self.pyproject().as_posix().to_string()
+            },
+        }))
+    }
+
+    async fn install(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        self.check_target(host)?;
+        self.provision(host, ctx).await
+    }
+
+    async fn update(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        self.check_target(host)?;
+        // 同一套流程：pyproject 已存在则不动，uv sync 按 lock 复现；要升级请删 uv.lock 后重装
+        self.provision(host, ctx).await
+    }
+
+    async fn uninstall(&self, host: &dyn Host, ctx: &mut ActionCtx) -> Result<(), ActionError> {
+        ctx.emit(ProgressKind::Started { total_steps: 1 }).await;
+        ctx.emit(ProgressKind::StepBegin {
+            step: 1,
+            message: format!("删除 {}", self.install_dir.as_posix()),
+        })
+        .await;
+        if host.exists(&self.install_dir).await? {
+            host.remove_dir_all(&self.install_dir).await?;
+        }
+        ctx.emit(ProgressKind::StepEnd { step: 1, ok: true }).await;
+        ctx.emit(ProgressKind::Finished { ok: true }).await;
+        Ok(())
+    }
+
+    async fn verify(&self, host: &dyn Host) -> Result<VerifyReport, ActionError> {
+        let mut report = VerifyReport::ok();
+        for (name, path) in [
+            (NONEBOT2_PYPROJECT, self.pyproject()),
+            (NONEBOT2_BOT_PY, self.bot_py()),
+            ("venv python", self.venv_python(host.os())),
+        ] {
+            let ok = host.exists(&path).await?;
+            report = report.with_check(name, ok, Some(path.as_posix().to_string()));
+        }
+        Ok(report.with_check(
+            "nonebot2 distribution",
+            self.detect(host).await?.is_some(),
+            None,
+        ))
+    }
+
+    fn launch_command(
+        &self,
+        host: &dyn Host,
+        args: &LaunchArgs,
+    ) -> Result<HostCommand, ActionError> {
+        Ok(self.launch_with(host.os(), args))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn empty_venv_does_not_pass_installation_gate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let host = ncd_host::local::LocalLinuxHost::new();
+        let comp = NoneBot2Component::new(
+            HostPath::from_posix(directory.path().to_string_lossy().into_owned()),
+            8080,
+        );
+        comp.ensure_project_scaffold(&host).await.unwrap();
+        let python = directory.path().join(".venv/bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            comp.detect_outcome(&host).await.unwrap(),
+            DetectOutcome::Unusable(_)
+        ));
+        assert!(!comp.verify(&host).await.unwrap().ok);
+    }
+
+    #[test]
+    fn adapter_source_reaches_sync_without_rewriting_named_sources() {
+        let spec = crate::adapter::AppComponentSpec {
+            install_dir: HostPath::from_posix("/apps/n1"),
+            port: 8080,
+            node_bin: None,
+            uv_bin: None,
+            git_bin: None,
+            redis_bin: None,
+            npm_registry: None,
+            pypi_index: Some(" https://pypi.example/simple ".into()),
+            install_version: None,
+            install_renderer: false,
+            adopt_existing: true,
+            instance_id: "n1".into(),
+            webui_username: None,
+            webui_password: None,
+        };
+        let comp = super::super::NoneBot2Adapter::component_for(&spec);
+        let cmd = comp.sync_command(&HostPath::from_posix("/tools/uv"));
+        assert_eq!(
+            cmd.args,
+            ["sync", "--default-index", "https://pypi.example/simple"]
+        );
+        assert_eq!(
+            cmd.environment
+                .get("UV_PROJECT_ENVIRONMENT")
+                .map(String::as_str),
+            Some(".venv")
+        );
+        assert!(comp.adopt_existing);
+    }
+
+    #[test]
+    fn empty_source_keeps_sync_on_uv_configuration() {
+        let comp = NoneBot2Component::new(HostPath::from_posix("/apps/n1"), 8080)
+            .with_pypi_index(Some("  ".into()));
+        let cmd = comp.sync_command(&HostPath::from_posix("uv"));
+        assert_eq!(cmd.args, ["sync"]);
+    }
+
+    #[test]
+    fn requirements_pin_uv_not_node() {
+        let comp = NoneBot2Component::new(HostPath::from_posix("/x"), 8080);
+        assert_eq!(
+            comp.requirements(Os::Linux, Locality::Remote),
+            vec![Requirement::component_version(ComponentId::Uv, ">=0.4")]
+        );
+        assert_eq!(comp.id(), ComponentId::NoneBot2);
+        assert!(
+            comp.supported_targets()
+                .contains(&(Os::Windows, Locality::Local))
+        );
+        assert!(
+            comp.supported_targets()
+                .contains(&(Os::Windows, Locality::Remote))
+        );
+    }
+
+    #[test]
+    fn instance_paths_follow_locked_layout() {
+        let comp =
+            NoneBot2Component::new(HostPath::from_posix("/home/u/ncd/apps/nonebot2/n1"), 8081);
+        assert_eq!(
+            comp.env_prod_file().as_posix(),
+            "/home/u/ncd/apps/nonebot2/n1/.env.prod"
+        );
+        assert_eq!(
+            comp.venv_python(Os::Linux).as_posix(),
+            "/home/u/ncd/apps/nonebot2/n1/.venv/bin/python"
+        );
+        let cmd = comp.launch_with(Os::Linux, &LaunchArgs::default());
+        assert_eq!(cmd.program, "/home/u/ncd/apps/nonebot2/n1/.venv/bin/python");
+        assert_eq!(cmd.args, vec!["-u".to_string(), "bot.py".to_string()]);
+    }
+
+    #[test]
+    fn pyproject_declares_onebot_adapter_and_fastapi_driver() {
+        let text = NoneBot2Component::render_pyproject("nonebot2-n1");
+        assert!(text.contains("name = \"nonebot2-n1\""));
+        assert!(text.contains("\"nonebot2[fastapi]\""));
+        assert!(text.contains("\"nonebot-adapter-onebot\""));
+        assert!(text.contains("module_name = \"nonebot.adapters.onebot.v11\""));
+        assert!(text.contains("tomli; python_version < '3.11'"));
+        assert!(
+            !text.contains("[build-system]"),
+            "无 build-system → uv 视为虚拟项目，不打包"
+        );
+        let bot = NoneBot2Component::render_bot_py();
+        assert!(bot.contains("# ncd-managed-bot-py:2"));
+        assert!(bot.contains("importlib.import_module"));
+        assert!(bot.contains("skip adapter"));
+        assert!(bot.contains("_CRITICAL"));
+        assert!(bot.contains("nonebot.adapters.onebot.v11"));
+        assert!(!bot.contains("from nonebot.adapters.onebot.v11 import"));
+    }
+
+    #[test]
+    fn lock_version_reads_only_target_package_block() {
+        let lock = r#"version = 1
+requires-python = ">=3.10"
+
+[[package]]
+name = "fastapi"
+version = "0.115.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "nonebot2"
+version = "2.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[[package]]
+name = "nonebot-adapter-onebot"
+version = "2.4.6"
+"#;
+        assert_eq!(
+            NoneBot2Component::lock_package_version(lock, "nonebot2"),
+            Some("2.4.2".to_string())
+        );
+        assert_eq!(
+            NoneBot2Component::lock_package_version(lock, "nonebot-adapter-onebot"),
+            Some("2.4.6".to_string())
+        );
+        assert_eq!(NoneBot2Component::lock_package_version(lock, "httpx"), None);
+        assert_eq!(
+            NoneBot2Component::lock_package_version("", "nonebot2"),
+            None
+        );
+    }
+
+    #[test]
+    fn listen_env_keeps_existing_driver() {
+        let mut env = EnvFile::parse_python("DRIVER=~fastapi+~httpx\nPORT=1\n");
+        NoneBot2Component::apply_listen_env(&mut env, 8081);
+        assert_eq!(env.get("DRIVER").as_deref(), Some("~fastapi+~httpx"));
+        assert_eq!(env.get("PORT").as_deref(), Some("8081"));
+        assert_eq!(env.get("HOST").as_deref(), Some("127.0.0.1"));
+        let mut empty = EnvFile::parse_python("");
+        NoneBot2Component::apply_listen_env(&mut empty, 9);
+        assert_eq!(empty.get("DRIVER").as_deref(), Some("~fastapi"));
+    }
+    #[test]
+    fn listen_env_preserves_lowercase_client_driver_and_updates_duplicate_ports() {
+        let mut env =
+            EnvFile::parse_python("driver=~fastapi+~httpx\nPORT=1\nport=2\nhost=0.0.0.0\n");
+        NoneBot2Component::apply_listen_env(&mut env, 8081);
+        assert_eq!(env.get_ci(ENV_DRIVER).as_deref(), Some("~fastapi+~httpx"));
+        assert_eq!(env.get_ci(ENV_PORT).as_deref(), Some("8081"));
+        assert_eq!(env.get_ci(ENV_HOST).as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            env.entries_ci()
+                .iter()
+                .filter(|entry| entry.key.eq_ignore_ascii_case(ENV_PORT))
+                .count(),
+            1
+        );
+    }
+}

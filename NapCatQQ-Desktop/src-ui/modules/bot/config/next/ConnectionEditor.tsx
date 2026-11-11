@@ -1,0 +1,601 @@
+// 单个连接的就地编辑器：inline 展开而不是弹 Dialog，改一条时仍能看到列表里其他连接。
+// 校验全走 core/domain/bot/connections.ts；失败 reason 就近显示在编辑器内，
+// 全局 InfoBar 只作 fallback（用户切走时还能看到）。
+
+import { useEffect, useState } from 'react';
+import {
+    Button,
+    TextField,
+    SecretField,
+    NumberField,
+    Switch,
+    Select,
+    Checkbox,
+} from '../../../../shared/ui';
+import {
+    type ConnectionKind,
+    type ConnectionConfig,
+    validateConnection,
+    allowsExternalAccess,
+} from '../../../../core/domain/bot/connections';
+import type { BackendType } from '../../../../core/ipc/generated/domain/BackendType';
+import type { HttpServerConfig } from '../../../../core/ipc/generated/domain/HttpServerConfig';
+import type { HttpSseServerConfig } from '../../../../core/ipc/generated/domain/HttpSseServerConfig';
+import type { HttpClientConfig } from '../../../../core/ipc/generated/domain/HttpClientConfig';
+import type { WebsocketServerConfig } from '../../../../core/ipc/generated/domain/WebsocketServerConfig';
+import type { WebsocketClientConfig } from '../../../../core/ipc/generated/domain/WebsocketClientConfig';
+import type { MessagePostFormat } from '../../../../core/ipc/generated/domain/MessagePostFormat';
+import type { WsRole } from '../../../../core/ipc/generated/domain/WsRole';
+import { pushInfoBar } from '../../../../hooks/ui/globalInfoBarStore';
+import { ExpandPresence } from '../../../../shared/ui/motion/ExpandPresence';
+import { ExternalAccessDialog } from './ExternalAccessDialog';
+
+const MSG_FORMAT_ITEMS = [
+    { value: 'array' as MessagePostFormat, label: 'Array（结构化数组）' },
+    { value: 'string' as MessagePostFormat, label: 'String（纯文本）' },
+];
+
+const WS_ROLE_ITEMS = [
+    { value: 'Universal' as WsRole, label: 'Universal（全双工，API + 事件）' },
+    { value: 'Api' as WsRole, label: 'API（仅 API 调用）' },
+    { value: 'Event' as WsRole, label: 'Event（仅事件投递）' },
+];
+
+interface ConnectionEditorProps {
+    kind: ConnectionKind;
+    initialData: ConnectionConfig;
+    /** 不含自己。重名校验用。 */
+    existingNames: string[];
+    backendType: BackendType;
+    dockerDeployment?: boolean;
+    onSave: (data: ConnectionConfig) => void;
+    onCancel: () => void;
+}
+
+export function ConnectionEditor({
+    kind,
+    initialData,
+    existingNames,
+    backendType,
+    dockerDeployment = false,
+    onSave,
+    onCancel,
+}: ConnectionEditorProps) {
+    const [data, setData] = useState<ConnectionConfig>(initialData);
+    const [error, setError] = useState<string | null>(null);
+    const [accessConfirmed, setAccessConfirmed] = useState(
+        initialData.enable && 'host' in initialData && allowsExternalAccess(initialData.host),
+    );
+    const [accessConfirmation, setAccessConfirmation] = useState<
+        { kind: 'toggle' } | { kind: 'save'; data: ConnectionConfig } | null
+    >(null);
+
+    // 切换不同行编辑时同步 reset。
+    useEffect(() => {
+        setData(initialData);
+        setError(null);
+        setAccessConfirmation(null);
+        setAccessConfirmed(
+            initialData.enable && 'host' in initialData && allowsExternalAccess(initialData.host),
+        );
+    }, [initialData]);
+
+    // 类型安全的局部 patch：保持 data 的具体类型不被 widen。
+    const patch = <K extends keyof ConnectionConfig>(field: K, value: ConnectionConfig[K]) => {
+        setData((prev) => ({ ...prev, [field]: value }) as ConnectionConfig);
+    };
+
+    const handleSave = () => {
+        // 名称 trim 后再校验：避免用户输入末尾空格导致重名误判。
+        const trimmedName = data.name.trim();
+        const finalData = { ...data, name: trimmedName } as ConnectionConfig;
+
+        // url 字段（HttpClient / WsClient）也要 trim
+        if ('url' in finalData) {
+            (finalData as HttpClientConfig | WebsocketClientConfig).url = (
+                finalData as HttpClientConfig | WebsocketClientConfig
+            ).url.trim();
+        }
+        if ('host' in finalData) finalData.host = finalData.host.trim();
+
+        const result = validateConnection(kind, finalData, existingNames);
+        if (!result.ok) {
+            setError(result.reason);
+            // 推送到全局 InfoBar
+            pushInfoBar({
+                tone: 'danger',
+                title: '连接配置有误',
+                content: result.reason,
+                autoDismissMs: 4000,
+            });
+            return;
+        }
+        if (
+            !dockerDeployment &&
+            finalData.enable &&
+            'host' in finalData &&
+            allowsExternalAccess(finalData.host) &&
+            !accessConfirmed
+        ) {
+            setAccessConfirmation({ kind: 'save', data: finalData });
+            return;
+        }
+        onSave(finalData);
+    };
+
+    const isSnowLuma = backendType === 'snowluma';
+
+    return (
+        <div className="flex min-w-0 flex-col gap-3">
+            {/* 公共字段 */}
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <TextField
+                    label="连接名称"
+                    required
+                    value={data.name}
+                    onValueChange={(v) => patch('name', v)}
+                    placeholder="例如：koishi-http"
+                    error={error?.includes('名称') ? error : undefined}
+                />
+                <Select
+                    label="消息上报格式"
+                    items={MSG_FORMAT_ITEMS}
+                    value={data.messagePostFormat}
+                    onValueChange={(v) => patch('messagePostFormat', v)}
+                />
+            </div>
+
+            {'host' in data &&
+                (dockerDeployment ? (
+                    <p className="text-xs leading-relaxed text-text-tertiary">
+                        Docker 内部监听与宿主机发布地址分别设置。空地址和回环地址会在容器内转为
+                        0.0.0.0； 是否允许主机外部访问，请在「容器」中调整。
+                    </p>
+                ) : (
+                    <div className="rounded-md border border-border-subtle bg-field/35 p-3">
+                        <Switch
+                            label="允许主机外部访问"
+                            hint="关闭时仅监听 127.0.0.1；开启后监听 0.0.0.0。也可在下方填写高级监听地址。"
+                            checked={allowsExternalAccess(data.host)}
+                            onCheckedChange={(open) => {
+                                if (open) setAccessConfirmation({ kind: 'toggle' });
+                                else {
+                                    setData((prev) =>
+                                        'host' in prev ? { ...prev, host: '127.0.0.1' } : prev,
+                                    );
+                                    setAccessConfirmed(false);
+                                }
+                            }}
+                        />
+                    </div>
+                ))}
+
+            <KindSpecificFields
+                kind={kind}
+                data={data}
+                patch={patch}
+                isSnowLuma={isSnowLuma}
+                error={error}
+            />
+
+            {/* token + debug 放尾部，频次低 */}
+            <SecretField
+                label="鉴权 Token"
+                value={data.token}
+                onValueChange={(v) => patch('token', v)}
+                placeholder="留空则不需鉴权"
+                hint="外部应用请求时携带在 Authorization Header / URL Query"
+                className="font-mono"
+            />
+            <Checkbox
+                label="开启调试输出"
+                checked={data.debug}
+                onCheckedChange={(v) => patch('debug', v)}
+            />
+
+            {/* Footer：启用开关靠左，操作按钮靠右 */}
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border-subtle pt-4">
+                <Switch
+                    checked={data.enable}
+                    onCheckedChange={(v) => patch('enable', v)}
+                    label="启用此连接"
+                />
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                    <Button variant="ghost" size="sm" onClick={onCancel}>
+                        取消
+                    </Button>
+                    <Button variant="primary" size="sm" onClick={handleSave}>
+                        保存连接
+                    </Button>
+                </div>
+            </div>
+            <ExternalAccessDialog
+                open={accessConfirmation !== null}
+                onOpenChange={(open) => !open && setAccessConfirmation(null)}
+                onConfirm={() => {
+                    setAccessConfirmed(true);
+                    if (accessConfirmation?.kind === 'toggle') {
+                        setData((prev) => ('host' in prev ? { ...prev, host: '0.0.0.0' } : prev));
+                    } else if (accessConfirmation?.kind === 'save') {
+                        onSave(accessConfirmation.data);
+                    }
+                    setAccessConfirmation(null);
+                }}
+            />
+        </div>
+    );
+}
+
+interface KindSpecificFieldsProps {
+    kind: ConnectionKind;
+    data: ConnectionConfig;
+    patch: <K extends keyof ConnectionConfig>(field: K, value: ConnectionConfig[K]) => void;
+    isSnowLuma: boolean;
+    error: string | null;
+}
+
+function KindSpecificFields({ kind, data, patch, isSnowLuma, error }: KindSpecificFieldsProps) {
+    switch (kind) {
+        case 'httpServer':
+            return (
+                <HttpServerFields
+                    data={data as HttpServerConfig}
+                    patch={patch}
+                    isSnowLuma={isSnowLuma}
+                    error={error}
+                />
+            );
+        case 'httpSseServer':
+            return (
+                <HttpSseServerFields
+                    data={data as HttpSseServerConfig}
+                    patch={patch}
+                    error={error}
+                />
+            );
+        case 'httpClient':
+            return (
+                <HttpClientFields
+                    data={data as HttpClientConfig}
+                    patch={patch}
+                    isSnowLuma={isSnowLuma}
+                    error={error}
+                />
+            );
+        case 'websocketServer':
+            return (
+                <WebsocketServerFields
+                    data={data as WebsocketServerConfig}
+                    patch={patch}
+                    error={error}
+                />
+            );
+        case 'websocketClient':
+            return (
+                <WebsocketClientFields
+                    data={data as WebsocketClientConfig}
+                    patch={patch}
+                    error={error}
+                />
+            );
+    }
+}
+
+// ================== 5 类差异字段子组件 ==================
+// 单独抽出来：1) Editor 主体短；2) 保留各 kind 的字段顺序差异（不强求对称）。
+
+type Patch = <K extends keyof ConnectionConfig>(field: K, value: ConnectionConfig[K]) => void;
+
+function HttpServerFields({
+    data,
+    patch,
+    isSnowLuma,
+    error,
+}: {
+    data: HttpServerConfig;
+    patch: Patch;
+    isSnowLuma: boolean;
+    error: string | null;
+}) {
+    return (
+        <>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <TextField
+                    label="监听 IP (Host)"
+                    required
+                    value={data.host}
+                    onValueChange={(v) => patch('host' as keyof ConnectionConfig, v as never)}
+                    placeholder="0.0.0.0"
+                    className="sm:col-span-2"
+                />
+                <NumberField
+                    label="端口"
+                    required
+                    value={data.port}
+                    onValueChange={(v) =>
+                        patch('port' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="3000"
+                    min={1}
+                    max={65535}
+                    error={error?.includes('端口') ? error : undefined}
+                />
+            </div>
+            <div>
+                <TextField
+                    label="监听路径"
+                    value={data.path}
+                    onValueChange={(v) => patch('path' as keyof ConnectionConfig, v as never)}
+                    placeholder="/"
+                />
+                <ExpandPresence visible={!isSnowLuma}>
+                    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pt-3">
+                        <Checkbox
+                            label="允许跨域请求 (CORS)"
+                            checked={data.enableCors}
+                            onCheckedChange={(v) =>
+                                patch('enableCors' as keyof ConnectionConfig, v as never)
+                            }
+                        />
+                        <Checkbox
+                            label="兼任 WebSocket 握手"
+                            checked={data.enableWebsocket}
+                            onCheckedChange={(v) =>
+                                patch('enableWebsocket' as keyof ConnectionConfig, v as never)
+                            }
+                        />
+                    </div>
+                </ExpandPresence>
+            </div>
+        </>
+    );
+}
+
+function HttpSseServerFields({
+    data,
+    patch,
+    error,
+}: {
+    data: HttpSseServerConfig;
+    patch: Patch;
+    error: string | null;
+}) {
+    return (
+        <>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <TextField
+                    label="监听 IP (Host)"
+                    required
+                    value={data.host}
+                    onValueChange={(v) => patch('host' as keyof ConnectionConfig, v as never)}
+                    placeholder="0.0.0.0"
+                    className="sm:col-span-2"
+                />
+                <NumberField
+                    label="端口"
+                    required
+                    value={data.port}
+                    onValueChange={(v) =>
+                        patch('port' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="3001"
+                    min={1}
+                    max={65535}
+                    error={error?.includes('端口') ? error : undefined}
+                />
+            </div>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                <Checkbox
+                    label="允许跨域请求"
+                    checked={data.enableCors}
+                    onCheckedChange={(v) =>
+                        patch('enableCors' as keyof ConnectionConfig, v as never)
+                    }
+                />
+                <Checkbox
+                    label="兼任 WebSocket 握手"
+                    checked={data.enableWebsocket}
+                    onCheckedChange={(v) =>
+                        patch('enableWebsocket' as keyof ConnectionConfig, v as never)
+                    }
+                />
+                <Checkbox
+                    label="上报 Bot 自身消息"
+                    checked={data.reportSelfMessage}
+                    onCheckedChange={(v) =>
+                        patch('reportSelfMessage' as keyof ConnectionConfig, v as never)
+                    }
+                />
+            </div>
+        </>
+    );
+}
+
+function HttpClientFields({
+    data,
+    patch,
+    isSnowLuma,
+    error,
+}: {
+    data: HttpClientConfig;
+    patch: Patch;
+    isSnowLuma: boolean;
+    error: string | null;
+}) {
+    return (
+        <>
+            <TextField
+                label="上报 Webhook URL"
+                required
+                value={data.url}
+                onValueChange={(v) => patch('url' as keyof ConnectionConfig, v as never)}
+                placeholder="http://127.0.0.1:8080/webhook"
+                hint="必须以 http:// 或 https:// 开头"
+                error={error?.includes('Webhook URL') || error?.includes('URL') ? error : undefined}
+            />
+            <div>
+                <Checkbox
+                    label="上报 Bot 自身发出的消息"
+                    checked={data.reportSelfMessage}
+                    onCheckedChange={(v) =>
+                        patch('reportSelfMessage' as keyof ConnectionConfig, v as never)
+                    }
+                />
+                <ExpandPresence visible={isSnowLuma}>
+                    <div className="pt-3">
+                        <NumberField
+                            label="请求超时 (ms)"
+                            value={data.timeoutMs ?? null}
+                            onValueChange={(v) =>
+                                patch(
+                                    'timeoutMs' as keyof ConnectionConfig,
+                                    (v ?? undefined) as never,
+                                )
+                            }
+                            placeholder="留空使用引擎默认值"
+                        />
+                    </div>
+                </ExpandPresence>
+            </div>
+        </>
+    );
+}
+
+function WebsocketServerFields({
+    data,
+    patch,
+    error,
+}: {
+    data: WebsocketServerConfig;
+    patch: Patch;
+    error: string | null;
+}) {
+    return (
+        <>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <TextField
+                    label="监听 IP (Host)"
+                    required
+                    value={data.host}
+                    onValueChange={(v) => patch('host' as keyof ConnectionConfig, v as never)}
+                    placeholder="0.0.0.0"
+                    className="sm:col-span-2"
+                />
+                <NumberField
+                    label="端口"
+                    required
+                    value={data.port}
+                    onValueChange={(v) =>
+                        patch('port' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="3001"
+                    min={1}
+                    max={65535}
+                    error={error?.includes('端口') ? error : undefined}
+                />
+            </div>
+            <TextField
+                label="监听路径"
+                value={data.path}
+                onValueChange={(v) => patch('path' as keyof ConnectionConfig, v as never)}
+                placeholder="/onebot/v11"
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <Select
+                    label="连接角色"
+                    items={WS_ROLE_ITEMS}
+                    value={data.role}
+                    onValueChange={(v) => patch('role' as keyof ConnectionConfig, v as never)}
+                />
+                <NumberField
+                    label="心跳间隔 (ms)"
+                    required
+                    value={data.heartInterval}
+                    onValueChange={(v) =>
+                        patch('heartInterval' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="30000"
+                    min={1000}
+                />
+            </div>
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+                <Checkbox
+                    label="上报 Bot 自身消息"
+                    checked={data.reportSelfMessage}
+                    onCheckedChange={(v) =>
+                        patch('reportSelfMessage' as keyof ConnectionConfig, v as never)
+                    }
+                />
+                <Checkbox
+                    label="强制事件推送"
+                    checked={data.enableForcePushEvent}
+                    onCheckedChange={(v) =>
+                        patch('enableForcePushEvent' as keyof ConnectionConfig, v as never)
+                    }
+                />
+            </div>
+        </>
+    );
+}
+
+function WebsocketClientFields({
+    data,
+    patch,
+    error,
+}: {
+    data: WebsocketClientConfig;
+    patch: Patch;
+    error: string | null;
+}) {
+    return (
+        <>
+            <TextField
+                label="服务端 WebSocket URL"
+                required
+                value={data.url}
+                onValueChange={(v) => patch('url' as keyof ConnectionConfig, v as never)}
+                placeholder="ws://127.0.0.1:8080/onebot/v11"
+                hint="必须以 ws:// 或 wss:// 开头"
+                error={
+                    error?.includes('WebSocket URL') || error?.includes('URL') ? error : undefined
+                }
+            />
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <Select
+                    label="连接角色"
+                    items={WS_ROLE_ITEMS}
+                    value={data.role}
+                    onValueChange={(v) => patch('role' as keyof ConnectionConfig, v as never)}
+                    className="sm:col-span-3"
+                />
+                <NumberField
+                    label="心跳间隔 (ms)"
+                    required
+                    value={data.heartInterval}
+                    onValueChange={(v) =>
+                        patch('heartInterval' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="30000"
+                    min={1000}
+                />
+                <NumberField
+                    label="重连间隔 (ms)"
+                    required
+                    value={data.reconnectInterval}
+                    onValueChange={(v) =>
+                        patch('reconnectInterval' as keyof ConnectionConfig, (v ?? 0) as never)
+                    }
+                    placeholder="5000"
+                    min={1000}
+                />
+            </div>
+            <Checkbox
+                label="上报 Bot 自身发出的消息"
+                checked={data.reportSelfMessage}
+                onCheckedChange={(v) =>
+                    patch('reportSelfMessage' as keyof ConnectionConfig, v as never)
+                }
+            />
+        </>
+    );
+}

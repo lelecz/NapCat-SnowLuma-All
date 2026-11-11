@@ -1,0 +1,58 @@
+[package]
+name = "ncd-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ncd-domain = { path = "../ncd-domain" }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt", "fs", "io-util", "process", "sync", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+tracing = "0.1"
+ts-rs = { version = "12", features = ["serde-compat"] }
+bytes = "1"
+base64 = "0.22"
+
+# 归档解压(M3.2)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+
+# SSH / SFTP 远端通道(M3.3)
+russh = "0.45"
+russh-sftp = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # CreateProcessW 的参数类型挂在 Security 下(内嵌终端用)
+    "Win32_Security",
+    # ConPTY 的 COORD / HPCON;函数本身运行时从 kernel32 取
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    # 文件栏列盘符(GetLogicalDrives / GetDriveTypeW)
+    "Win32_Storage_FileSystem",
+    # SHELLEXECUTEINFOW 引用 HKEY,ShellExecuteExW 挂在 Registry feature 下
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+
+[lints]
+workspace = true

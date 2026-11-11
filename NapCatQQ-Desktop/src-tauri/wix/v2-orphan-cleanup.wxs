@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  V2 (PyInstaller onedir) -> V3 (Tauri near-single-exe) MSI helpers.
+
+  V2 install tree:
+    Program Files\NapCatQQ Desktop\NapCatQQ-Desktop.exe
+    Program Files\NapCatQQ Desktop\_internal\**   (~200 files)
+    Program Files\NapCatQQ Desktop\guild1.db{,-shm,-wal}  (runtime SQLite)
+
+  MajorUpgrade removes files owned by the old product, but locked/untracked
+  leftovers can remain under the same INSTALLDIR. V3 file table does not
+  include those paths, so purge them explicitly.
+
+  Do NOT touch ProgramData / user config here.
+
+  Note: Tauri only candles fragments that are listed; a ComponentRef from the
+  main Feature keeps this fragment linked into the MSI (orphan Fragments can
+  be dropped by light).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Fragment>
+    <util:CloseApplication
+      Id="CloseNapCatQQDesktop"
+      Target="NapCatQQ-Desktop.exe"
+      Description="NapCatQQ Desktop is running and must be closed before setup can continue."
+      CloseMessage="yes"
+      ElevatedCloseMessage="yes"
+      RebootPrompt="no"
+      PromptToContinue="yes"
+      Timeout="10"
+      TerminateProcess="1" />
+
+    <!--
+      Purge only under [INSTALLDIR] with *absolute* child paths.
+      Do NOT use bare relative names alone as the sole safety net: if Directory=
+      ever resolved wrong, relative rmdir could hit the wrong cwd.
+      Guard: if INSTALLDIR is empty/missing, skip (if not exist "\..." is false
+      on empty expansion we still prefix with [INSTALLDIR] so paths stay scoped).
+      Elevated (Impersonate=no): Program Files is not writable for normal users.
+      Return=ignore: missing paths / locked files must not abort install.
+      Run twice: after RemoveExistingProducts and after InstallFiles.
+      Never touch ProgramData / DataRoot / user config.
+    -->
+    <CustomAction
+      Id="PurgeV2InstallOrphans"
+      Directory="INSTALLDIR"
+      ExeCommand="&quot;[SystemFolder]cmd.exe&quot; /c if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]_internal&quot; rmdir /s /q &quot;[INSTALLDIR]_internal&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]icons&quot; rmdir /s /q &quot;[INSTALLDIR]icons&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db-shm&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db-shm&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db-wal&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db-wal&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+    <CustomAction
+      Id="PurgeV2InstallOrphansLate"
+      Directory="INSTALLDIR"
+      ExeCommand="&quot;[SystemFolder]cmd.exe&quot; /c if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]_internal&quot; rmdir /s /q &quot;[INSTALLDIR]_internal&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]icons&quot; rmdir /s /q &quot;[INSTALLDIR]icons&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db-shm&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db-shm&quot; &amp; if not &quot;[INSTALLDIR]&quot;==&quot;&quot; if exist &quot;[INSTALLDIR]guild1.db-wal&quot; del /f /q /a &quot;[INSTALLDIR]guild1.db-wal&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="PurgeV2InstallOrphans" After="RemoveExistingProducts">
+        NOT REMOVE="ALL"
+      </Custom>
+      <Custom Action="PurgeV2InstallOrphansLate" After="InstallFiles">
+        NOT REMOVE="ALL"
+      </Custom>
+    </InstallExecuteSequence>
+
+    <!--
+      Product path registry (shared contract for resolve_data_root / uninstall CA):
+        HKLM\SOFTWARE\NapCatQQ-Desktop
+          InstallDir  = [INSTALLDIR]
+          DataRoot    = [CommonAppDataFolder]NapCatQQ Desktop
+            (machine default only. WiX 3 RegistryValue has no NeverOverwrite;
+             REINSTALLMODE=amus may rewrite this HKLM default. User migrate writes
+             HKCU DataRoot and resolve prefers HKCU over HKLM — see product_registry.rs.)
+      Also anchors this fragment into MainFeature via componentRefs.
+      Uninstall removes the key with the component (user data under DataRoot is
+      NOT deleted here).
+    -->
+    <DirectoryRef Id="INSTALLDIR">
+      <!--
+        Machine component: only HKLM. ICE57 fails if HKCU RemoveRegistryKey shares
+        a per-machine KeyPath component (RemoveRegistryValue alone is OK, but
+        RemoveRegistryKey is not).
+      -->
+      <Component Id="V2OrphanCleanup" Guid="D099BE7B-6258-4D8B-88E5-1C2D33456771" Win64="yes">
+        <RegistryKey Root="HKLM" Key="Software\NapCatQQ-Desktop">
+          <RegistryValue
+            Name="InstallDir"
+            Type="string"
+            Value="[INSTALLDIR]"
+            KeyPath="yes" />
+          <!--
+            Machine default only. Do not put NeverOverwrite here: WiX 3 candle
+            rejects that attribute (CNDL0004) and broke the v3.1.3 MSI build.
+            User-facing migrate authority is HKCU; see product_registry.rs.
+          -->
+          <RegistryValue
+            Name="DataRoot"
+            Type="string"
+            Value="[CommonAppDataFolder]NapCatQQ Desktop" />
+          <RegistryValue
+            Name="LegacyOrphanCleanup"
+            Type="integer"
+            Value="1" />
+        </RegistryKey>
+      </Component>
+      <!--
+        User component: HKCU-only cleanup.
+        - Autostart Run value (app-written; MSI never creates it)
+        - 3.0.0 broken product key: literal Software + product_name mustache with
+          one backslash so Handlebars leaves Software{{product_name}} unexpanded
+      -->
+      <Component Id="V2OrphanCleanupUser" Guid="6F2C8A91-4B3E-4D7A-9C1F-8E5A2B0D4F73" Win64="yes">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NapCatQQ Desktop"
+          Name="LegacyUserCleanup"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+        <RemoveRegistryValue
+          Id="RemoveAutostartRunValue"
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="NapCatQQ Desktop" />
+        <RemoveRegistryKey
+          Id="RemoveBrokenProductNameTemplateKeyInstall"
+          Root="HKCU"
+          Key="Software\{{product_name}}"
+          Action="removeOnInstall" />
+        <RemoveRegistryKey
+          Id="RemoveBrokenProductNameTemplateKeyUninstall"
+          Root="HKCU"
+          Key="Software\{{product_name}}"
+          Action="removeOnUninstall" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

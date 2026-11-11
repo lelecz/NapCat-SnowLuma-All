@@ -1,0 +1,88 @@
+// 任务队列展示用文案；不依赖 ComponentRow 反查。
+
+import type { ComponentId } from '../../ipc/types';
+
+const COMPONENT_DISPLAY_NAME: Record<ComponentId, string> = {
+    napcat: 'NapCat',
+    snowluma: 'SnowLuma',
+    qq: 'QQ',
+    vcredist: 'VC++ 运行库',
+    nodejs: 'Node.js',
+    novnc: 'noVNC',
+    ncd_watch: 'NCD Watch',
+    windows_agent: 'Windows 远程代理',
+    desktop_self: 'Desktop',
+    karin: 'Karin',
+    uv: 'uv',
+    nonebot2: 'NoneBot2',
+    astrbot: 'AstrBot',
+    maibot: 'MaiBot',
+    koishi: 'Koishi',
+    git: 'Git',
+    redis: 'Redis',
+    yunzai: 'TRSS-Yunzai',
+    neobot: 'NeoBot',
+};
+
+const STEP_KIND_LABEL: Record<string, string> = {
+    ensure_installed: '安装',
+    force_install: '安装',
+    update: '更新',
+    uninstall: '卸载',
+    verify: '校验',
+    ensure_dependencies: '补全系统依赖',
+    install: '安装',
+};
+
+export function componentDisplayName(componentId: ComponentId): string {
+    return COMPONENT_DISPLAY_NAME[componentId] ?? componentId;
+}
+
+export function componentActionTitle(
+    componentId: ComponentId,
+    stepKind: string | undefined,
+    message: string,
+): string {
+    const name = componentDisplayName(componentId);
+    const step = stepKind ? STEP_KIND_LABEL[stepKind] : undefined;
+    if (step) return `${name} · ${step}`;
+    const msg = message?.trim();
+    if (msg) return `${name} · ${msg}`;
+    return `${name} · 完成`;
+}
+
+export function systemPackageTitle(packageGroup: string | undefined, fallback: string): string {
+    const group = packageGroup?.trim();
+    if (group === 'qq_dependencies') return '系统依赖 · QQ';
+    if (group === 'archive_tool:unzip') return '系统工具 · unzip';
+    if (group === 'archive_tool:tar') return '系统工具 · tar';
+    return fallback?.trim() || '系统依赖';
+}
+
+export function dockerInstallTitle(hostLabel: string): string {
+    const label = hostLabel?.trim() || '远程主机';
+    return `Docker · ${label}`;
+}
+
+export function dockerDeployTitle(hostLabel: string, flavor?: string): string {
+    const label = hostLabel?.trim() || '远程主机';
+    const fw = flavor === 'napcat' ? 'NapCat' : flavor === 'snowluma' ? 'SnowLuma' : flavor?.trim();
+    if (fw) return `拉取镜像 · ${fw} · ${label}`;
+    return `拉取镜像 · ${label}`;
+}
+
+export function appPluginTitle(action: string, pluginName: string, fallback: string): string {
+    const trimmed = fallback?.trim();
+    if (trimmed) return trimmed;
+    const verb =
+        action === 'install'
+            ? '安装'
+            : action === 'update'
+              ? '更新'
+              : action === 'uninstall'
+                ? '卸载'
+                : action;
+    const name = pluginName?.trim();
+    if (name) return `${verb} ${name}`;
+    return verb;
+}

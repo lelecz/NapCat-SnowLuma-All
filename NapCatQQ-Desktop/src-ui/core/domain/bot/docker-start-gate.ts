@@ -1,0 +1,140 @@
+// Bot Docker 启动前门禁：镜像须在「组件」页预拉，启动时不现场 pull。
+
+import type { BotConfig } from '../../ipc/generated/domain/BotConfig';
+import type { DockerFlavor } from '../../ipc/generated/domain/DockerFlavor';
+import type { DockerStatus } from '../../ipc/types';
+import {
+    isRuntimeTargetConcreteRemote,
+    isRuntimeTargetLocal,
+    remoteHostIdFromRuntimeTarget,
+} from './runtime-target';
+import { localOs } from '../runtime/env';
+
+const FLAVOR_LABEL: Record<DockerFlavor, string> = {
+    napcat: 'NapCat',
+    snowluma: 'SnowLuma',
+};
+
+export function dockerFlavorForBackend(backend: BotConfig['bot']['backend_type']): DockerFlavor {
+    return backend === 'snowluma' ? 'snowluma' : 'napcat';
+}
+
+export function dockerHostIdForConfig(config: BotConfig): string | null {
+    if (config.bot.deploymentType !== 'docker') return null;
+    const t = config.bot.runtime_target;
+    if (isRuntimeTargetLocal(t)) return localOs() === 'linux' ? 'local' : null;
+    return remoteHostIdFromRuntimeTarget(t);
+}
+
+export function isDockerBotConfig(config: BotConfig): boolean {
+    return (
+        config.bot.deploymentType === 'docker' &&
+        (isRuntimeTargetConcreteRemote(config.bot.runtime_target) ||
+            (isRuntimeTargetLocal(config.bot.runtime_target) && localOs() === 'linux'))
+    );
+}
+
+function dockerImageGateReason(
+    args: {
+        config: BotConfig;
+        dockerStatus: DockerStatus | undefined;
+        imageReady: boolean | undefined;
+        dockerProbing?: boolean;
+    },
+    when: 'start' | 'save',
+): string | null {
+    const { config, dockerStatus, imageReady, dockerProbing } = args;
+    if (!isDockerBotConfig(config)) return null;
+
+    const engineName = config.docker?.engine === 'podman' ? 'Podman' : 'Docker';
+    const label = FLAVOR_LABEL[dockerFlavorForBackend(config.bot.backend_type)];
+    const later = when === 'save' ? '后再保存' : '后再启动';
+
+    if (dockerProbing && !dockerStatus) {
+        return when === 'save'
+            ? `正在检查 ${engineName} 状态，请稍后再保存`
+            : `正在检查 ${engineName} 状态，请稍后再启动`;
+    }
+
+    const dockerOk =
+        dockerStatus?.installed && dockerStatus.daemonRunning && dockerStatus.composeAvailable;
+
+    if (!dockerOk) {
+        return `此主机 ${engineName} 未就绪，请到「组件」页检查对应引擎`;
+    }
+
+    if (imageReady === false) {
+        return `${label} 镜像未拉取，请到「组件」页拉取镜像${later}`;
+    }
+
+    if (imageReady !== true) {
+        return `正在确认 ${label} 镜像，请稍${later}`;
+    }
+
+    return null;
+}
+
+/** 配置页 / 列表启动拦截用；返回 null 表示可启动。 */
+export function dockerStartBlockReason(args: {
+    config: BotConfig;
+    dockerStatus: DockerStatus | undefined;
+    imageReady: boolean | undefined;
+    dockerProbing?: boolean;
+}): string | null {
+    return dockerImageGateReason(args, 'start');
+}
+
+/** 保存 Bot 配置前拦截（远程 Docker 且镜像未就绪时不允许保存）。 */
+export function dockerSaveBlockReason(args: {
+    config: BotConfig;
+    dockerStatus: DockerStatus | undefined;
+    imageReady: boolean | undefined;
+    dockerProbing?: boolean;
+}): string | null {
+    return dockerImageGateReason(args, 'save');
+}
+
+/** 配置页 Docker 就绪条（与启动门禁文案一致）。 */
+export function dockerReadinessNotice(args: {
+    engine?: 'docker' | 'podman';
+    flavorLabel: string;
+    status: DockerStatus | undefined;
+    probing: boolean;
+    imageReady: boolean | undefined;
+}): { tone: 'ok' | 'warn' | 'neutral'; text: string } | null {
+    const { flavorLabel, status, probing, imageReady } = args;
+    const engineName = args.engine === 'podman' ? 'Podman' : 'Docker';
+
+    if (probing && !status) {
+        return { tone: 'neutral', text: `正在检查 ${engineName}…` };
+    }
+
+    const dockerOk = status?.installed && status.daemonRunning && status.composeAvailable;
+
+    if (!dockerOk) {
+        return {
+            tone: 'warn',
+            text: `此主机 ${engineName} 未就绪，请到「组件」页检查对应引擎`,
+        };
+    }
+
+    if (imageReady === false) {
+        return {
+            tone: 'warn',
+            text: `${flavorLabel} 镜像未拉取，请到「组件」页拉取镜像`,
+        };
+    }
+
+    if (imageReady === true) {
+        const ver = status.version?.trim();
+        return {
+            tone: 'ok',
+            text: `${ver ? `${engineName} ${ver} · ` : ''}${flavorLabel} 镜像已就绪，可启动`,
+        };
+    }
+
+    return {
+        tone: 'neutral',
+        text: `${engineName} 已就绪，正在确认 ${flavorLabel} 镜像…`,
+    };
+}

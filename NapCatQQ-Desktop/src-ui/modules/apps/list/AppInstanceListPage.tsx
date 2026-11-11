@@ -1,0 +1,569 @@
+// 应用端实例列表：卡式布局对齐 Bot / 组件页；点卡进详情，底栏做启停与对接。
+
+import React, { useMemo, useRef, useState } from 'react';
+import {
+    Blocks,
+    Boxes,
+    Download,
+    ExternalLink,
+    FolderOpen,
+    Import,
+    Link2,
+    ListChecks,
+    Play,
+    RefreshCw,
+    ScrollText,
+    Square,
+    SquareTerminal,
+    Trash2,
+    Unlink,
+} from 'lucide-react';
+import { useGSAP } from '@gsap/react';
+import { animateListChildrenEnter } from '../../../shared/ui/motion/listEnter';
+import { Badge, Button, PagePlaceholder, Spinner } from '../../../shared/ui';
+import {
+    ActionMotionIcon,
+    Counter,
+    EMPHASIS_MOTION,
+    ListItem,
+    RESOURCE_MOTION,
+    refreshMotion,
+} from '../../../shared/ui/motion';
+import { useMotion } from '../../../hooks/preferences/useMotion';
+import { useServerManager } from '../../../hooks/remote/useServerManager';
+import { useAppFrameworks, useAppInstances } from '../../../hooks/apps/useAppInstances';
+import { useAppFrameworkLatestVersions } from '../../../hooks/apps/useAppFrameworkVersions';
+import { hasAppUpdate } from '../../../core/domain/apps/appVersions';
+import { cn } from '../../../shared/utils/cn';
+import { AppLinkDialog } from '../AppLinkDialog';
+import { DeleteInstanceDialog } from '../DeleteInstanceDialog';
+import { ImportInstanceDialog, type ImportInstanceTarget } from '../ImportInstanceDialog';
+import { pushInfoBar } from '../../../hooks/ui/globalInfoBarStore';
+import { openTerminal } from '../../../hooks/terminal/terminalStore';
+import { useFeatureEnabled } from '../../../hooks/preferences/featureTogglesStore';
+import { hostIdDisplayLabel, isAppHostRemoved } from '../hostLabel';
+import { STATE_META, isInstalled } from '../../../core/domain/apps/instanceState';
+import { CardInstallProgress } from '../InstallProgress';
+import { FloatingActions } from './FloatingActions';
+import type { AppRoute } from '../../../core/domain/ui/route';
+import type { AppFrameworkManifest, AppInstance } from '../../../core/ipc/types';
+import gridStyles from './appCardGrid.module.css';
+
+export type DetailTabHint = 'config' | 'log';
+
+const EMPTY_MANIFESTS: AppFrameworkManifest[] = [];
+
+export interface AppInstanceListPageProps {
+    onNavigate?: (route: AppRoute) => void;
+    onOpenInstance: (instanceId: string, tab?: DetailTabHint) => void;
+}
+
+export const AppInstanceListPage: React.FC<AppInstanceListPageProps> = ({
+    onNavigate,
+    onOpenInstance,
+}) => {
+    const frameworks = useAppFrameworks();
+    const apps = useAppInstances();
+    const { servers, isSuccess: serversLoaded } = useServerManager();
+
+    const [linkInstanceId, setLinkInstanceId] = useState<string | null>(null);
+    const [deleteInstance, setDeleteInstance] = useState<AppInstance | null>(null);
+    const [importTarget, setImportTarget] = useState<ImportInstanceTarget | null>(null);
+
+    const manifests = frameworks.data ?? EMPTY_MANIFESTS;
+    const manifestById = useMemo(
+        () => new Map(manifests.map((m) => [m.id, m] as const)),
+        [manifests],
+    );
+
+    // 每张卡片上的「可更新」提示：按框架查上游最新正式版，同一框架只查一次
+    const latestVersions = useAppFrameworkLatestVersions(apps.instances);
+
+    const refreshing = frameworks.isFetching || apps.isLoading;
+
+    return (
+        <div className="flex min-h-0 flex-1 flex-col">
+            <header className="flex shrink-0 items-end justify-between pb-4 pt-2">
+                <div>
+                    <p className="text-2xs uppercase tracking-widest text-text-tertiary">apps</p>
+                    <h1 className="font-display text-xl font-semibold text-text">应用端</h1>
+                </div>
+                <div className="flex items-baseline gap-1 text-xs text-text-tertiary tabular-nums">
+                    <span>共</span>
+                    <Counter
+                        value={apps.instances.length}
+                        className="font-medium text-text-secondary"
+                    />
+                    <span>个实例</span>
+                </div>
+            </header>
+
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 pb-24 pt-1">
+                {apps.isLoading ? (
+                    <Loading text="加载实例列表…" />
+                ) : apps.error ? (
+                    <PagePlaceholder className="gap-2 py-10">
+                        <p className="text-sm text-text-secondary">读取实例失败</p>
+                        <Button size="sm" variant="secondary" onClick={() => void apps.refetch()}>
+                            <ActionMotionIcon icon={RefreshCw} size={13} />
+                            重试
+                        </Button>
+                    </PagePlaceholder>
+                ) : apps.instances.length === 0 ? (
+                    <PagePlaceholder className="gap-2 py-10">
+                        <ActionMotionIcon
+                            icon={Blocks}
+                            size={28}
+                            motion={RESOURCE_MOTION}
+                            className="text-text-tertiary"
+                        />
+                        <p className="text-sm text-text-secondary">还没有应用实例</p>
+                        <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+                            <Button size="sm" variant="primary" onClick={() => setImportTarget({})}>
+                                <ActionMotionIcon
+                                    icon={Import}
+                                    size={14}
+                                    motion={EMPHASIS_MOTION}
+                                />
+                                导入已有项目
+                            </Button>
+                            {onNavigate && (
+                                <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() => onNavigate('components')}
+                                >
+                                    <ActionMotionIcon icon={Boxes} size={14} />
+                                    前往组件管理
+                                </Button>
+                            )}
+                        </div>
+                    </PagePlaceholder>
+                ) : (
+                    <InstanceList
+                        instances={apps.instances}
+                        manifestById={manifestById}
+                        latestByFramework={latestVersions}
+                        servers={servers}
+                        serversLoaded={serversLoaded}
+                        pendingId={apps.pendingId}
+                        refreshingId={apps.refreshingId}
+                        onViewTasks={onNavigate ? () => onNavigate('tasks') : undefined}
+                        onInstall={apps.install}
+                        onStart={apps.start}
+                        onStop={apps.stop}
+                        onRefresh={apps.refresh}
+                        onLink={(i) => setLinkInstanceId(i.id)}
+                        onUnlink={(i) => apps.unlink(i.id)}
+                        onOpenWebUi={(i) => void apps.openWebUi(i.id)}
+                        onOpenDirectory={apps.openDirectory}
+                        onOpen={(i, tab) => onOpenInstance(i.id, tab)}
+                        onDelete={setDeleteInstance}
+                    />
+                )}
+            </div>
+
+            <AppLinkDialog
+                open={linkInstanceId !== null}
+                onOpenChange={(o) => {
+                    if (!o) setLinkInstanceId(null);
+                }}
+                instanceId={linkInstanceId}
+            />
+
+            <DeleteInstanceDialog
+                instance={deleteInstance}
+                hostRemoved={isAppHostRemoved(deleteInstance?.host_id, servers, serversLoaded)}
+                isRemoving={apps.isRemoving}
+                onClose={() => setDeleteInstance(null)}
+                onConfirm={async (removeFiles) => {
+                    if (!deleteInstance) return;
+                    await apps.remove({ id: deleteInstance.id, removeFiles });
+                    setDeleteInstance(null);
+                }}
+            />
+
+            {importTarget === null && deleteInstance === null && linkInstanceId === null && (
+                <FloatingActions
+                    showInstall={!!onNavigate}
+                    importDisabled={manifests.length === 0}
+                    busy={refreshing}
+                    onInstall={() => onNavigate?.('components')}
+                    onImport={() => setImportTarget({})}
+                    onRefresh={() => {
+                        void frameworks.refetch();
+                        void apps.refetch();
+                    }}
+                />
+            )}
+
+            <ImportInstanceDialog
+                target={importTarget}
+                frameworks={manifests}
+                servers={servers}
+                isImporting={apps.isImporting}
+                onClose={() => setImportTarget(null)}
+                onSubmit={async (draft) => {
+                    const imported = await apps.importInstance({
+                        framework_id: draft.frameworkId,
+                        host_id: draft.hostId,
+                        path: draft.path,
+                        display_name: draft.displayName,
+                    });
+                    setImportTarget(null);
+                    pushInfoBar({
+                        key: `app-instance-imported:${imported.id}`,
+                        tone: 'success',
+                        title: `已接管 ${imported.display_name}`,
+                        content:
+                            imported.state === 'running'
+                                ? '已由桌面端启动'
+                                : imported.state === 'not_installed'
+                                  ? '依赖未同步，先点安装'
+                                  : '可在列表里启动、对接',
+                        autoDismissMs: 6000,
+                    });
+                }}
+            />
+        </div>
+    );
+};
+
+const Loading: React.FC<{ text: string }> = ({ text }) => (
+    <PagePlaceholder className="gap-2 py-10">
+        <ActionMotionIcon icon={RefreshCw} size={16} motion="spin" />
+        <span className="text-sm text-text-tertiary">{text}</span>
+    </PagePlaceholder>
+);
+
+interface InstanceListProps {
+    instances: AppInstance[];
+    manifestById: Map<string, AppFrameworkManifest>;
+    /** framework_id -> 上游最新正式版；没有表示不支持按版本安装或还没查到 */
+    latestByFramework: Map<string, string>;
+    servers: ReturnType<typeof useServerManager>['servers'];
+    serversLoaded: boolean;
+    pendingId: string | null | undefined;
+    refreshingId: string | null | undefined;
+    onViewTasks?: () => void;
+    /** 列表上不给版本选择，一律装最新正式版 */
+    onInstall: (id: string, version?: string | null) => void;
+    onStart: (id: string) => void;
+    onStop: (id: string) => void;
+    onRefresh: (id: string) => void;
+    onLink: (i: AppInstance) => void;
+    onUnlink: (i: AppInstance) => void;
+    onOpenWebUi: (i: AppInstance) => void;
+    onOpenDirectory: (id: string) => void;
+    onOpen: (i: AppInstance, tab?: DetailTabHint) => void;
+    onDelete: (i: AppInstance) => void;
+}
+
+const InstanceList: React.FC<InstanceListProps> = (props) => {
+    const m = useMotion();
+    const rootRef = useRef<HTMLDivElement>(null);
+    useGSAP(
+        () => {
+            const root = rootRef.current;
+            if (!root) return;
+            animateListChildrenEnter(root, props.instances.length, m);
+        },
+        { scope: rootRef, dependencies: [props.instances.length, m.enabled, m.level] },
+    );
+
+    return (
+        <div ref={rootRef} className={gridStyles.appCardGrid}>
+            {props.instances.map((i) => (
+                <ListItem key={i.id} hoverable className="min-h-0 min-w-0">
+                    <InstanceCard instance={i} {...props} />
+                </ListItem>
+            ))}
+        </div>
+    );
+};
+
+const InstanceCard: React.FC<InstanceListProps & { instance: AppInstance }> = ({
+    latestByFramework,
+    instance: i,
+    manifestById,
+    servers,
+    serversLoaded,
+    pendingId,
+    refreshingId,
+    onViewTasks,
+    onInstall,
+    onStart,
+    onStop,
+    onRefresh,
+    onLink,
+    onUnlink,
+    onOpenWebUi,
+    onOpenDirectory,
+    onOpen,
+    onDelete,
+}) => {
+    const manifest = manifestById.get(i.framework_id);
+    const state = STATE_META[i.state];
+    const hostRemoved = isAppHostRemoved(i.host_id, servers, serversLoaded);
+    const installing = i.state === 'installing' && !hostRemoved;
+    const refreshing = refreshingId === i.id;
+    const busy = pendingId === i.id || installing;
+    const installed = isInstalled(i);
+    const canOpenDirectory =
+        (installed || i.origin === 'imported') &&
+        i.host_id === 'local' &&
+        i.placement === 'local_native';
+    const running = i.state === 'running';
+    const terminalEnabled = useFeatureEnabled('terminal');
+    const accent = i.last_error ? 'danger' : running || installing ? 'brand' : 'none';
+
+    // 比较走 PEP 440（appVersions），不能用组件页那套 SemVer
+    const latest = latestByFramework.get(i.framework_id) ?? null;
+    const updatable = hasAppUpdate(i.installed_version, latest);
+
+    const meta = [
+        manifest?.display_name ?? i.framework_id,
+        hostRemoved ? '主机已移除' : `${hostIdDisplayLabel(i.host_id, servers)} :${i.port}`,
+        i.installed_version ? `v${i.installed_version}` : null,
+        i.origin === 'imported' ? '导入' : null,
+    ]
+        .filter(Boolean)
+        .join(' · ');
+
+    return (
+        <article
+            role="button"
+            tabIndex={0}
+            onClick={() => onOpen(i)}
+            onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onOpen(i);
+                }
+            }}
+            className={cn(
+                'group relative isolate flex h-full min-h-[136px] w-full min-w-0 cursor-pointer flex-col overflow-hidden',
+                'rounded-md border border-border-subtle bg-surface shadow-card',
+                'transition-[box-shadow,border-color] duration-200 hover:border-border hover:shadow-popover',
+                'outline-none focus-visible:ring-2 focus-visible:ring-brand',
+                accent === 'brand' && 'ring-1 ring-inset ring-brand/25',
+                accent === 'danger' && 'ring-1 ring-inset ring-danger/25',
+            )}
+        >
+            {accent !== 'none' && (
+                <span
+                    aria-hidden
+                    className={cn(
+                        'absolute inset-y-0 left-0 w-0.5',
+                        accent === 'danger' ? 'bg-danger' : 'bg-brand',
+                    )}
+                />
+            )}
+
+            <div className="flex min-h-0 flex-1 flex-col justify-between px-4 pb-2.5 pt-3">
+                <div className="min-w-0">
+                    <h3
+                        className="truncate font-display text-base font-semibold leading-snug text-text"
+                        title={i.display_name}
+                    >
+                        {i.display_name}
+                    </h3>
+                    <p
+                        className="mt-0.5 truncate text-2xs text-text-tertiary"
+                        title={i.install_dir}
+                    >
+                        {meta}
+                        {updatable && (
+                            <span
+                                className="ml-1.5 text-warning"
+                                title={`上游最新正式版 ${latest}`}
+                            >
+                                最新 {latest}
+                            </span>
+                        )}
+                    </p>
+                </div>
+                <div className="min-h-[1.25rem] min-w-0 text-xs leading-snug text-text-secondary">
+                    {installing ? (
+                        <CardInstallProgress instance={i} />
+                    ) : i.link ? (
+                        <p className="truncate">对接 Bot {i.link.bot_id}</p>
+                    ) : !installed ? (
+                        <p className="truncate text-text-tertiary">安装后即可启动和对接</p>
+                    ) : null}
+                </div>
+            </div>
+
+            <footer
+                className="flex h-11 shrink-0 items-center gap-2 border-t border-border-subtle bg-inset/35 px-3.5"
+                onClick={(e) => e.stopPropagation()}
+            >
+                <Badge
+                    tone={state.tone}
+                    appearance="soft"
+                    dot={state.dot}
+                    className="max-w-[9.5rem] shrink-0 truncate"
+                >
+                    {state.label}
+                </Badge>
+                <div className="flex min-w-0 flex-1 items-center justify-end gap-1">
+                    {/* 安装中的进度在卡片正文里，刷新有自己的转圈；这里只给启停 / 解绑这类操作 */}
+                    {busy && !installing && !refreshing && <Spinner size="sm" className="mr-0.5" />}
+                    {installing && onViewTasks && (
+                        <FooterIcon label="查看安装进度" onClick={onViewTasks}>
+                            <ActionMotionIcon icon={ListChecks} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {!installed && !installing && (
+                        <Button
+                            size="sm"
+                            variant="primary"
+                            disabled={busy}
+                            onClick={() => onInstall(i.id)}
+                        >
+                            <ActionMotionIcon icon={Download} size={13} motion={EMPHASIS_MOTION} />
+                            安装
+                        </Button>
+                    )}
+                    {installed && !running && (
+                        <FooterIcon
+                            label="启动实例"
+                            disabled={busy}
+                            tone="brand"
+                            onClick={() => onStart(i.id)}
+                        >
+                            <ActionMotionIcon
+                                icon={Play}
+                                size={15}
+                                strokeWidth={2.2}
+                                motion={EMPHASIS_MOTION}
+                            />
+                        </FooterIcon>
+                    )}
+                    {running && (
+                        <FooterIcon
+                            label="停止实例"
+                            disabled={busy}
+                            tone="danger"
+                            onClick={() => onStop(i.id)}
+                        >
+                            <ActionMotionIcon icon={Square} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {installed && (
+                        <FooterIcon
+                            label={i.link ? '改绑到别的 Bot' : '对接 QQ：挑一个协议 Bot 建连接'}
+                            disabled={busy}
+                            onClick={() => onLink(i)}
+                        >
+                            <ActionMotionIcon icon={Link2} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {i.link && (
+                        <FooterIcon
+                            label="解除对接：两边配置都回退"
+                            disabled={busy}
+                            onClick={() => onUnlink(i)}
+                        >
+                            <ActionMotionIcon icon={Unlink} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {manifest?.has_webui && running && (
+                        <FooterIcon
+                            label="打开 WebUI：在浏览器里打开框架面板"
+                            onClick={() => onOpenWebUi(i)}
+                        >
+                            <ActionMotionIcon icon={ExternalLink} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {installed && (
+                        <FooterIcon label="查看日志" onClick={() => onOpen(i, 'log')}>
+                            <ActionMotionIcon icon={ScrollText} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {canOpenDirectory && (
+                        <FooterIcon label="打开目录" onClick={() => onOpenDirectory(i.id)}>
+                            <ActionMotionIcon icon={FolderOpen} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {installed && terminalEnabled && (
+                        <FooterIcon
+                            label="打开终端：在实例目录里，node / uv 已接好"
+                            onClick={() =>
+                                void openTerminal({ kind: 'app_instance', instance_id: i.id })
+                            }
+                        >
+                            <ActionMotionIcon icon={SquareTerminal} size={15} strokeWidth={2.2} />
+                        </FooterIcon>
+                    )}
+                    {/* 装的过程中探测和删除都没意义，装完或失败后再出现 */}
+                    {!installing && (
+                        <>
+                            <FooterIcon
+                                label="重新探测：重新读一遍安装状态"
+                                disabled={busy}
+                                onClick={() => onRefresh(i.id)}
+                            >
+                                <ActionMotionIcon
+                                    icon={RefreshCw}
+                                    size={15}
+                                    strokeWidth={2.2}
+                                    motion={refreshMotion(refreshing)}
+                                />
+                            </FooterIcon>
+                            <FooterIcon
+                                label={
+                                    hostRemoved
+                                        ? '移除实例记录'
+                                        : i.origin === 'imported'
+                                          ? '释放接管：只解除跟踪，不动目录'
+                                          : '删除实例：连同实例目录一起删'
+                                }
+                                disabled={busy}
+                                tone="danger"
+                                onClick={() => onDelete(i)}
+                            >
+                                <ActionMotionIcon icon={Trash2} size={15} strokeWidth={2.2} />
+                            </FooterIcon>
+                        </>
+                    )}
+                </div>
+            </footer>
+        </article>
+    );
+};
+
+const FooterIcon: React.FC<{
+    label: string;
+    onClick: () => void;
+    disabled?: boolean;
+    tone?: 'neutral' | 'brand' | 'danger';
+    children: React.ReactNode;
+}> = ({ label, onClick, disabled, tone = 'neutral', children }) => (
+    // 提示走产品**现成**的机制：title 属性 + 外壳的 GlobalTitleTooltip
+    // （与「终端」按钮、终端文件面板的 IconButton 同一套）。
+    // Radix 那套本页只有这里用，且实测用户看不到气泡。
+    <button
+        type="button"
+        aria-label={label}
+        title={label}
+        disabled={disabled}
+        onClick={(e) => {
+            e.stopPropagation();
+            onClick();
+        }}
+        className={cn(
+            'inline-flex h-8 w-8 items-center justify-center rounded-xs',
+            'transition-[color,background-color] duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand',
+            'disabled:cursor-not-allowed disabled:opacity-40',
+            tone === 'neutral' && 'text-text-secondary hover:bg-inset hover:text-text',
+            tone === 'brand' && 'text-brand hover:bg-brand-soft',
+            tone === 'danger' && 'text-danger hover:bg-danger-soft',
+        )}
+    >
+        {children}
+    </button>
+);
+
+export default AppInstanceListPage;

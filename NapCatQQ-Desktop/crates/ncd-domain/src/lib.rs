@@ -1,0 +1,176 @@
+//! Layer 1 数据契约: 跨边界类型定义
+//!
+//! 依赖白名单: serde / serde_json / thiserror / ts-rs.
+//! 禁止引入运行时依赖(tokio / reqwest 等).
+
+#[macro_use]
+mod macros;
+
+pub mod app_config;
+pub mod app_framework;
+pub mod bootstrap;
+pub mod bot_actor;
+pub mod bot_config;
+pub mod bot_migration;
+pub mod bot_runtime_metrics;
+pub mod bot_status;
+pub mod cache_cleanup;
+pub mod chat_archive;
+pub mod chat_desktop;
+pub mod chat_group_files;
+pub mod chat_screenshot;
+pub mod component;
+pub mod daemon_state;
+pub mod data_root_migrate;
+pub mod deployment_task;
+pub mod docker;
+pub mod domain_event;
+pub mod errors;
+pub mod ids;
+pub mod kinds;
+pub mod log_snapshot;
+pub mod mcp;
+pub mod migration;
+pub mod napcat_events;
+pub mod network_settings;
+pub mod node_environment;
+pub mod offline_alert;
+pub mod onebot_debug;
+pub mod progress;
+pub mod qq_dependency;
+pub mod release_snapshot;
+pub mod relogin;
+pub mod remote_inventory;
+pub mod remote_paths;
+pub mod runtime_scenario;
+pub mod snowluma_linux_package;
+pub mod snowluma_login;
+pub mod snowluma_start_mode;
+pub mod snowluma_ui;
+pub mod terminal;
+pub mod windows_bot;
+pub mod windows_remote;
+
+// 向后兼容: 下游 crate 仍可 use ncd_domain::{models::*, report::*}
+pub use migration as models;
+pub use migration as report;
+
+// 顶层 re-export(对齐旧 ncd-core API, 方便下游 crate 引用)
+
+pub use app_config::{
+    AfterCloseUiBehavior, AppSettings, AppSettingsDto, CloseAction, DesktopNotifySettings,
+    FeatureToggles, GithubApiMode, SnowLumaAppConfig, SystemResourceSnapshot, UiModeOnStartup,
+    WebUiPollerSettings, clamp_lightweight_delay_secs, default_login_interval,
+    default_perf_monitor_interval, default_snowluma_port,
+};
+pub use app_framework::{
+    APP_LINK_ADOPTED_FORWARD, APP_LINK_CONNECTION_PREFIX, AppConfigDocument, AppConfigError,
+    AppConfigErrorKind, AppConfigFormat, AppConfigIssue, AppConfigText, AppConfigWrite,
+    AppFrameworkId, AppFrameworkManifest, AppInstance, AppInstanceId, AppInstanceOrigin,
+    AppInstanceState, AppInstanceWebUi, AppLinkRecord, AppLinkTopology, AppPendingTerms,
+    AppPlacement, AppProjectProbe, AppTermsDoc, AppWebUiAccount, AppWebUiAuthKind,
+    CreateAppInstanceRequest, ImportAppInstanceRequest, LOCAL_HOST_ID, OneBotEndpointExport,
+    OneBotLinkEndpoint, OneBotLinkMode, OneBotLinkPlan, REMOTE_HOST_ID_PREFIX, WsUrlParts,
+    app_link_connection_name, classify_app_link, host_id_of_runtime_target,
+    is_app_link_connection_name, is_loopback_host, parse_ws_url, rewrite_ws_loopback_port,
+    runtime_target_matches_host, server_id_of_host,
+};
+pub use bootstrap::{
+    BootstrapSnapshot, BootstrapStatus, DataLayoutConsolidateSnapshot, LocalVersionSnapshot,
+    RepairAction,
+};
+pub use bot_actor::{BotActorError, BotActorSnapshot, BotActorState};
+pub use bot_config::{
+    AdvancedConfig, AutoRestartMode, AutoRestartSchedule, BackendType, BotBasicConfig, BotConfig,
+    BotConfigError, BypassConfig, ConnectConfig, DeploymentType, HttpClientConfig,
+    HttpServerConfig, HttpSseServerConfig, ImportedNetworkConfig, LogLevel, MessagePostFormat,
+    NetworkBaseFields, O3HookMode, StatusCommandConfig, TimeUnit, WebsocketClientConfig,
+    WebsocketServerConfig, WsRole, is_docker_config, is_remote_docker_config,
+    is_remote_native_napcat_config,
+};
+pub use bot_runtime_metrics::{
+    BOT_RUNTIME_METRICS_INTERVAL_MAX_MS, BOT_RUNTIME_METRICS_INTERVAL_MIN_MS,
+    BOT_RUNTIME_METRICS_RETENTION_MAX_DAYS, BOT_RUNTIME_METRICS_RETENTION_MIN_DAYS,
+    BotRuntimeMetrics, MemoryMetrics, MetricsHistoryPoint, MetricsNodeMapEntry, MetricsSource,
+    NetworkNodeKind, NetworkNodeMetrics, NodesRollup, ProbeHealth, ProbeStatsFile,
+    clamp_bot_runtime_metrics_interval_ms, clamp_bot_runtime_metrics_retention_days,
+    default_bot_runtime_metrics_interval_ms, default_bot_runtime_metrics_retention_days,
+    history_min_interval_ms,
+};
+pub use bot_status::{BotStatus, ProcessHandle};
+pub use chat_archive::{
+    CHAT_ARCHIVE_MAX_CONVERSATIONS, CHAT_ARCHIVE_MAX_MESSAGES, CHAT_ARCHIVE_VERSION, ChatArchive,
+    ChatArchiveConversation, ChatArchiveConversationKind, ChatArchiveMessage,
+    ChatArchiveSendStatus,
+};
+pub use component::{
+    ComponentId, DependencyNode, DependencyPlan, DependencyTarget, HostPackageGroup, LocalQqSource,
+    Requirement, RequirementPhase, RequirementStatus, RuntimeReadiness, VersionReq,
+};
+pub use daemon_state::{DaemonState, SnowLumaLoginState};
+pub use data_root_migrate::{
+    DataRootMigratePhase, DataRootMigratePreview, DataRootMigrateProgress, DataRootMigrateResult,
+    DataRootRetiredMarker, DataRootTreeEntry,
+};
+pub use deployment_task::{
+    AppPluginAction, AppStoreResource, DeploymentTaskKind, DeploymentTaskList,
+    DeploymentTaskResource, DeploymentTaskSnapshot, DeploymentTaskStatus,
+};
+pub use docker::{
+    BotDockerConfig, ContainerAction, ContainerInfo, ContainerState, DeployedContainer,
+    DockerDeploySpec, DockerFlavor, DockerImageReady, DockerInstallReport, DockerInstallStatus,
+    DockerPullLayerSnapshot, DockerPullSpec, DockerRestartPolicy, DockerSpecError, DockerStatus,
+    ImageInfo, ImageRemoveOptions, PortMapping,
+};
+pub use domain_event::{DOMAIN_EVENT_ENVELOPE_VERSION, DomainEvent, DomainEventKind};
+pub use errors::{AppError, ConfigError, MigrationError, PathError, SecretError};
+pub use ids::{BackendId, BotId};
+pub use kinds::{BackendKind, BotFlavor, RuntimeTarget, SchemaVersion, StopMode};
+pub use log_snapshot::LogSnapshot;
+pub use mcp::{McpServerSettings, McpServerStatus};
+pub use migration::{
+    BackupInfo, BotRuntimeSummary, MigrationOutcome, MigrationReport, MigrationSource,
+    MigrationStage, MigrationWarning,
+};
+pub use napcat_events::{NapCatLoginInvalidationReason, NapCatWebuiAuthIssue};
+pub use network_settings::{
+    DownloadMirror, DownloadSourceMode, NetworkProbeResult, NetworkSettings, ProxyMode,
+};
+pub use node_environment::{NodeEnvironmentCandidate, NodeProbeResult, NodeSourceKind};
+pub use offline_alert::{
+    EnsureOneBotMessengerHttpResult, OfflineAlert, OfflineAlertKind, OfflineAlertSource,
+    OfflineDeliveryChannelResult, OfflineDeliveryRecord, OfflineEmailSettings,
+    OfflineNotifyBehavior, OfflineOneBotSettings, OfflineWebhookChannel, OfflineWebhookSettings,
+    OneBotMessengerCandidate, OneBotMessengerScope, default_webhook_body_template, render_template,
+};
+pub use progress::{ProgressEvent, ProgressKind, ProgressLogLevel};
+pub use qq_dependency::{
+    DependencyCategory, DependencyInstallError, DetectionMethod, DistroFamily, DistroInfo,
+    FailedPackage, InstallDependenciesResult, PackageStatus, QqDependencyReport, SystemDependency,
+};
+pub use release_snapshot::{ReleaseInfo, ReleaseSnapshot};
+pub use remote_inventory::{
+    DiscoveredRemoteBot, DiscoveredRemoteBotSource, ImportableRemoteBot, REMOTE_INVENTORY_VERSION,
+    RemoteInventory, RemoteInventoryItem, RemoteInventoryKind, RemoteInventorySource,
+    RemotePathOverrides, RemoteSelectedPaths,
+};
+pub use remote_paths::{
+    RemoteLinuxDerivedPaths, SYSTEM_QQ_BIN, SYSTEM_SNOWLUMA_DIR, derive_remote_linux_paths,
+    desktop_default_install_paths, infer_snowluma_linux_package, is_bundled_snowluma_node,
+    is_portable_lite_node, is_qq_user_data_path, join_under, load_napcat_js, napcat_config_dir,
+    napcat_mjs, napcat_root_under_qq, needs_sudo_for_qq, normalize_posix, qq_app_dir, qq_bin,
+    qq_bin_candidates, qq_install_base_from_qq_bin, qq_package_json, require_napcat_root,
+    require_qq_install_base, require_snowluma_dir, snowluma_install_candidates,
+    snowluma_workspace_from_dir,
+};
+pub use runtime_scenario::RuntimeScenario;
+pub use snowluma_linux_package::{SnowLumaLinuxPackage, SnowLumaPackage};
+pub use snowluma_login::{SnowLumaQrLoginSnapshot, SnowLumaQrLoginState};
+pub use snowluma_start_mode::SnowLumaStartMode;
+pub use snowluma_ui::{SnowlumaUiBotDto, SnowlumaUiSnapshotDto};
+pub use terminal::{
+    LocalShellKind, LocalShellOption, ServerStats, TERMINAL_EVENT_VERSION, TerminalDirListing,
+    TerminalEvent, TerminalEventEnvelope, TerminalFeatures, TerminalFileEntry, TerminalHostOs,
+    TerminalOpenRequest, TerminalSessionId, TerminalSessionInfo, TerminalSnippet, TerminalStatus,
+    TerminalTarget, TerminalTextFile,
+};

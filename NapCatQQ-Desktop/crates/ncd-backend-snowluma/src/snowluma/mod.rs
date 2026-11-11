@@ -1,0 +1,75 @@
+//! SnowLuma backend runtime 子模块根
+//!
+//! 模块声明 + 已落地类型 / trait / 函数的 re-export 清单
+
+pub mod daemon;
+pub mod debug_client;
+pub mod error;
+pub mod linux_proc_probe;
+pub mod log_noise;
+pub mod log_sanitize;
+pub mod proc_tree;
+pub mod qq_login_probe;
+pub mod runtime_backend;
+pub mod session;
+pub mod status_poller;
+pub mod webui_client;
+#[cfg(windows)]
+mod windows_qr_capture;
+#[cfg(windows)]
+mod windows_qr_login;
+
+// ---- error.rs ----
+pub use error::{SnowLumaDaemonError, SnowLumaWebUiError};
+
+// ---- webui_client.rs ----
+//
+// 跨边界类型(ts-rs 已导出):HookProcessInfo / HookProcessStatus /
+// OneBotInstanceInfo / AuthState
+// trait + 默认实装:SnowLumaWebUiClient / ReqwestSnowLumaWebUiClient
+pub use webui_client::{
+    AgreementDoc, AgreementsPayload, AuthState, HookProcessInfo, HookProcessStatus,
+    OneBotInstanceInfo, ReqwestSnowLumaWebUiClient, ReqwestSnowLumaWebUiClientFactory,
+    SnowLumaWebUiClient,
+};
+
+// ---- debug_client.rs ----
+//
+// 调试台专用的 /api/debug/* 客户端,独立于 SnowLumaWebUiClient trait
+pub use debug_client::{
+    SlStreamFrame, SnowLumaDebugClient, SnowLumaDebugError, SnowLumaUpload, parse_stream_frame,
+};
+
+// ---- daemon.rs ----
+pub use daemon::{DaemonState, SnowLumaDaemon, SnowLumaWebUiClientFactory};
+
+// ---- status_poller.rs ----
+pub use status_poller::{ProcessTreeProbe, SnowLumaLoginState};
+
+// ---- launch_plan.rs(已迁移到 ncd-domain::snowluma_start_mode) ----
+pub use ncd_domain::snowluma_start_mode::SnowLumaStartMode;
+
+// ---- session.rs ----
+pub use session::{
+    SnowLumaSession, find_available_webui_port, load_or_create_session, load_snowluma_app_config,
+    parse_bound_webui_port_from_logs, render_daemon_globals,
+};
+
+// ---- log_sanitize.rs ----
+pub use log_noise::{
+    SnowLumaLogNoiseFilter, filter_snowluma_console_lines, prepare_snowluma_bot_history_lines,
+};
+pub use log_sanitize::sanitize_log_line;
+
+// ---- proc_tree.rs ----
+//
+// MockProcessTreeProbe 为单元测试 helper,但被声明为 pub 以便 ncd-runtime
+// 之外的下游 crate(譬如 ncd-tauri 集成测试)复用
+pub use linux_proc_probe::LinuxSinglePidProbe;
+pub use proc_tree::{MockProcessTreeProbe, SysinfoProcessTreeProbe};
+
+// ---- runtime_backend.rs ----
+pub use runtime_backend::SnowLumaRuntimeBackend;
+
+// ---- status_poller.rs(追加导出) ----
+pub use status_poller::{PollerDeps, SnowLumaStatusPoller};

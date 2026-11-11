@@ -1,0 +1,646 @@
+// SnowLuma 登录轮询、账号绑定与当前状态快照发布。
+
+use std::collections::BTreeSet;
+
+// SnowLumaLoginState 已下沉到 ncd-domain，此处 re-export 保持向后兼容
+pub use ncd_domain::daemon_state::SnowLumaLoginState;
+
+// 进程树枚举抽象 -- async trait + Mock 边界
+
+/// 给定起始 PID,返回该进程及其所有后代 PID 的集合(含自身)
+/// 设计目的:把 sysinfo / Windows 进程枚举从 SnowLumaStatusPoller 内剥离
+/// 让 poller 单测可以注入 MockProcessTreeProbe,避免真实系统调用
+/// 实现合约(SysinfoProcessTreeProbe 落地时复核):
+/// - 失败(PID 不存在 / 权限不足)必须返回 BTreeSet::from([initial_pid])
+/// 不得 panic
+/// - 非 Windows 平台亦须返回 BTreeSet::from([initial_pid]),保持类型签名一致
+#[async_trait::async_trait]
+pub trait ProcessTreeProbe: Send + Sync {
+    async fn collect_descendants(&self, initial_pid: u32) -> BTreeSet<u32>;
+}
+
+// 实装主循环 + UIN 锁定 + 状态合成
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
+use tokio_util::sync::CancellationToken;
+
+use crate::snowluma::webui_client::{
+    HookProcessInfo, HookProcessStatus, OneBotInstanceInfo, QqPortLoginInfo, SnowLumaWebUiClient,
+};
+use ncd_domain::domain_event::DomainEvent;
+use ncd_domain::ids::BotId;
+use ncd_traits::events::{BroadcastEventBus, EventBus};
+
+/// 启动延迟:让 daemon 完成首启注入再开始 poll,避免抢在 daemon Ready 之前
+/// 打到没就绪的 WebUI
+const START_DELAY: Duration = Duration::from_millis(500);
+
+/// 主循环 tick 周期
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+// Broadcast 无 backlog，定期重发当前快照可修复订阅迟到或事件丢失。
+const STATE_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 连续 HTTP 失败门限：达到时把 UI 登录态降为未知，但绝不据此断言 QQ 掉线。
+/// 请求默认可能等待 5 秒，取 2 可避免旧绿色状态残留十几秒。
+const MAX_CONSECUTIVE_FAILURES: u32 = 2;
+
+/// 曾在线后全信号消失的连续 tick 门限:达到才发 Disconnected。
+/// 远端 hook 信号 (process.uin / status) 可能短暂抖动空值,qq-list 也可能
+/// 闪断;不防抖会把短暂抖动误报成掉线。2s tick × 3 = 6s 窗口,足够滤掉
+/// 单次抖动,又比用户感知"卡住"快
+const NO_SIGNAL_THRESHOLD: u32 = 3;
+
+/// per-Bot 主循环依赖(注入边界,便于单测换 mock)
+pub struct PollerDeps {
+    pub event_bus: Arc<BroadcastEventBus>,
+    pub http: Arc<dyn SnowLumaWebUiClient>,
+    pub proc_tree: Arc<dyn ProcessTreeProbe>,
+    pub expected_uin: Option<String>,
+}
+
+/// per-Bot 状态轮询组件句柄
+/// spawn 启动后台 task 驱动主循环;dispose 取消其 CancellationToken
+/// 主循环当轮 select 结束后退出Drop 兜底——任何路径忘掉显式 dispose
+/// 也不会泄漏 task
+pub struct SnowLumaStatusPoller {
+    bot_id: BotId,
+    cancel: CancellationToken,
+}
+
+impl SnowLumaStatusPoller {
+    /// 启动后台 task
+    pub fn spawn(bot_id: BotId, initial_qq_pid: u32, deps: PollerDeps) -> Self {
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let bot_id_for_task = bot_id.clone();
+        tokio::spawn(async move {
+            run_poller(bot_id_for_task, initial_qq_pid, deps, cancel_for_task).await;
+        });
+        Self { bot_id, cancel }
+    }
+
+    /// 请求主循环退出；多次调用幂等。取消观察者不等于 QQ 掉线，真实终态由
+    /// Bot 生命周期事件清理，不能在这里伪造 Disconnected。
+    pub fn dispose(&self) {
+        self.cancel.cancel();
+    }
+
+    /// 当前 Poller 关联的 BotId
+    pub fn bot_id(&self) -> &BotId {
+        &self.bot_id
+    }
+}
+
+impl Drop for SnowLumaStatusPoller {
+    fn drop(&mut self) {
+        // 兜底:忘记显式 dispose 时仍取消后台 task
+        self.cancel.cancel();
+    }
+}
+
+/// 主循环私有可变状态
+#[derive(Debug, Default)]
+struct PollerState {
+    initial_qq_pid: u32,
+    uin: Option<String>,
+    locked_pid: Option<u32>,
+    last_state: Option<SnowLumaLoginState>,
+    last_state_published_at: Option<Instant>,
+    last_pid_set: BTreeSet<u32>,
+    consecutive_failures: u32,
+    /// 失败通知需限频；恢复后即使登录态没变也要补发可信快照。
+    probe_unavailable_published: bool,
+    last_probe_unavailable_published_at: Option<Instant>,
+    /// 曾在线后连续"全信号消失"的 tick 数,达 NO_SIGNAL_THRESHOLD 才发 Disconnected
+    consecutive_no_signal: u32,
+}
+
+impl PollerState {
+    fn new(initial_qq_pid: u32) -> Self {
+        Self {
+            initial_qq_pid,
+            ..Default::default()
+        }
+    }
+}
+
+// 主循环 run_poller
+
+async fn run_poller(
+    bot_id: BotId,
+    initial_qq_pid: u32,
+    deps: PollerDeps,
+    cancel: CancellationToken,
+) {
+    let mut state = PollerState::new(initial_qq_pid);
+
+    // 启动延迟:避免抢在 daemon Ready 之前发请求期间允许 cancel 直接退出
+    tokio::select! {
+    biased;
+    _ = cancel.cancelled() => {
+    return;
+    }
+    _ = sleep(START_DELAY) => {}
+    }
+
+    // ticker:第一轮在 START_DELAY 之后立刻触发,与 legacy QTimer 对齐
+    let mut ticker = interval_at(Instant::now(), POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        // 重接管后旧请求不能迟到清空新 poller 已发布的登录快照。
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = tick_once(&bot_id, &deps, &mut state) => {}
+        }
+    }
+}
+
+fn publish_probe_unavailable_if_needed(bot_id: &BotId, deps: &PollerDeps, state: &mut PollerState) {
+    let now = Instant::now();
+    let replay_due = state
+        .last_probe_unavailable_published_at
+        .is_some_and(|published_at| now.duration_since(published_at) >= STATE_REPLAY_INTERVAL);
+    if state.probe_unavailable_published && !replay_due {
+        return;
+    }
+    state.probe_unavailable_published = true;
+    state.last_probe_unavailable_published_at = Some(now);
+    deps.event_bus
+        .publish(DomainEvent::snowluma_login_probe_unavailable(
+            bot_id.clone(),
+        ));
+}
+
+fn publish_login_state_if_needed(
+    bot_id: &BotId,
+    deps: &PollerDeps,
+    state: &mut PollerState,
+    new_state: SnowLumaLoginState,
+) {
+    let now = Instant::now();
+    let replay_due = state
+        .last_state_published_at
+        .is_some_and(|published_at| now.duration_since(published_at) >= STATE_REPLAY_INTERVAL);
+    // 探测不可用期间 UI/runtime 已主动清成 unknown；即使状态值与上次相同，
+    // 恢复后也必须重发一次可信快照。
+    if state.last_state == Some(new_state) && !state.probe_unavailable_published && !replay_due {
+        return;
+    }
+    if replay_due && let Some(uin) = state.uin.as_ref() {
+        deps.event_bus.publish(DomainEvent::snowluma_uin_detected(
+            bot_id.clone(),
+            uin.clone(),
+        ));
+    }
+    deps.event_bus
+        .publish(DomainEvent::snowluma_login_state_changed(
+            bot_id.clone(),
+            new_state,
+        ));
+    state.last_state = Some(new_state);
+    state.last_state_published_at = Some(now);
+    state.probe_unavailable_published = false;
+}
+
+/// 单轮 tick:并发拉 /api/processes + /api/qq-list → UIN 锁定 → 状态合成 →
+/// PID 集合变化通知
+async fn tick_once(bot_id: &BotId, deps: &PollerDeps, state: &mut PollerState) {
+    let (proc_res, qq_res) =
+        tokio::join!(deps.http.list_processes(), deps.http.list_qq_instances());
+
+    let (processes, qq_instances) = match (proc_res, qq_res) {
+        (Ok(p), Ok(q)) => (p, q),
+        _ => {
+            // 任一失败只说明 WebUI/隧道探测不可用，不说明 QQ 掉线。
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                publish_probe_unavailable_if_needed(bot_id, deps, state);
+            }
+            return;
+        }
+    };
+
+    // 全部成功:恢复失败计数
+    state.consecutive_failures = 0;
+
+    let mut probe_login_evidence: Option<ProbeLoginEvidence> = None;
+    let candidates = if state.uin.is_none() {
+        let descendants = deps
+            .proc_tree
+            .collect_descendants(state.initial_qq_pid)
+            .await;
+        Some(reconcile_candidates(descendants, &processes))
+    } else {
+        None
+    };
+
+    // === UIN 锁定(仅 uin == None 时尝试)===
+    if state.uin.is_none() {
+        let candidates = candidates.as_ref().expect("candidates collected");
+        if let Some(locked) = try_lock_uin(
+            &processes,
+            &qq_instances,
+            candidates,
+            deps.expected_uin.as_deref(),
+        ) {
+            state.locked_pid = find_candidate_pid_for_uin(&processes, candidates, &locked);
+            if state.locked_pid.is_none() {
+                state.locked_pid = find_pid_for_uin(&processes, &locked);
+            }
+            deps.event_bus.publish(DomainEvent::snowluma_uin_detected(
+                bot_id.clone(),
+                locked.clone(),
+            ));
+            tracing::info!(
+                target: "ncd_runtime::snowluma_status_poller",
+                bot_id = %bot_id,
+                uin = %locked,
+                locked_pid = ?state.locked_pid,
+                expected_uin = ?deps.expected_uin,
+                "SnowLuma UIN locked"
+            );
+            state.uin = Some(locked);
+        } else if let Some(evidence) = probe_candidate_login_info(
+            &deps.http,
+            &processes,
+            candidates,
+            deps.expected_uin.as_deref(),
+        )
+        .await
+        {
+            deps.event_bus.publish(DomainEvent::snowluma_uin_detected(
+                bot_id.clone(),
+                evidence.uin.clone(),
+            ));
+            state.locked_pid = Some(evidence.pid);
+            state.uin = Some(evidence.uin.clone());
+            tracing::info!(
+                target: "ncd_runtime::snowluma_status_poller",
+                bot_id = %bot_id,
+                uin = %evidence.uin,
+                locked_pid = evidence.pid,
+                expected_uin = ?deps.expected_uin,
+                "SnowLuma UIN locked from probe-login"
+            );
+            probe_login_evidence = Some(evidence);
+        }
+    }
+
+    // 扫码前 process.uin 通常仍是 "0"，但候选 PID 的 hook status 已经可信。
+    // 原实现直接 return，导致 WaitingForQrScan 永远要等到扫码后才能出现。
+    let Some(locked_uin) = state.uin.clone() else {
+        let candidates = candidates.as_ref().expect("candidates collected");
+        let matched: Vec<&HookProcessInfo> = processes
+            .iter()
+            .filter(|process| {
+                candidates.contains(&process.pid)
+                    && (!is_real_uin(&process.uin)
+                        || uin_matches_expected(&process.uin, deps.expected_uin.as_deref()))
+            })
+            .collect();
+        // 候选进程登录了别的账号时不能把 Online 借给当前 Bot。
+        let new_state = synthesize_state(&matched, false)
+            .map(|value| {
+                if value == SnowLumaLoginState::LoggedIn {
+                    SnowLumaLoginState::Starting
+                } else {
+                    value
+                }
+            })
+            .or_else(|| {
+                processes
+                    .iter()
+                    .any(|process| {
+                        candidates.contains(&process.pid)
+                            && is_real_uin(&process.uin)
+                            && !uin_matches_expected(&process.uin, deps.expected_uin.as_deref())
+                    })
+                    .then_some(SnowLumaLoginState::WaitingForQrScan)
+            });
+        if let Some(new_state) = new_state {
+            publish_login_state_if_needed(bot_id, deps, state, new_state);
+        }
+        return;
+    };
+
+    // UIN 已锁但 locked_pid 仍空(hook 未 login,process.uin 没刷出真实值)
+    // → 先 find_pid_for_uin 碰运气,仍空就 probe 候选 pid 补上。没有
+    // locked_pid 后续 matched / probe 兜底都拿不到 pid,掉线时无法报 Disconnected
+    let mut probe_has_uin = probe_login_evidence
+        .as_ref()
+        .is_some_and(|e| e.uin == locked_uin);
+    if state.locked_pid.is_none() {
+        state.locked_pid = find_pid_for_uin(&processes, &locked_uin);
+    }
+    if state.locked_pid.is_none() && !probe_has_uin {
+        if let Some(evidence) = probe_candidate_login_info(
+            &deps.http,
+            &processes,
+            &BTreeSet::new(),
+            Some(locked_uin.as_str()),
+        )
+        .await
+        {
+            state.locked_pid = Some(evidence.pid);
+            // probe_candidate_login_info 要求 info.logged_in,evidence 隐含在线证据
+            probe_has_uin = true;
+        }
+    }
+
+    // === 状态合成 ===
+    let locked_pid = state.locked_pid;
+    let matched: Vec<&HookProcessInfo> = processes
+        .iter()
+        .filter(|p| process_matches_locked(p, &locked_uin, locked_pid))
+        .collect();
+    let qq_has_uin = qq_instances.iter().any(|i| i.uin == locked_uin);
+    // 信号缺失时 probe 确认:locked_pid 优先,仍 None 时遍历候选 pid fallback
+    if !probe_has_uin
+        && !qq_has_uin
+        && !matched
+            .iter()
+            .any(|p| p.status == HookProcessStatus::Online)
+    {
+        let probe_pids: Vec<u32> = match locked_pid {
+            Some(pid) => vec![pid],
+            None => {
+                let descendants = deps
+                    .proc_tree
+                    .collect_descendants(state.initial_qq_pid)
+                    .await;
+                let candidates = reconcile_candidates(descendants, &processes);
+                processes
+                    .iter()
+                    .filter(|p| candidates.contains(&p.pid))
+                    .map(|p| p.pid)
+                    .collect()
+            }
+        };
+        for pid in probe_pids {
+            if let Ok(Some(info)) = deps.http.probe_process_login_info(pid).await {
+                if probe_info_matches_uin(&info, &locked_uin) {
+                    probe_has_uin = true;
+                    break;
+                }
+            }
+        }
+    }
+    let synthesized = synthesize_state(&matched, qq_has_uin || probe_has_uin);
+
+    // 曾在线 + 全信号消失(matched 空 + qq-list 无 + probe 无)→ 候选 Disconnected。
+    // 远端 hook 信号可能短暂抖动空值,连续 NO_SIGNAL_THRESHOLD 轮才采纳,滤掉单次抖动
+    let all_signal_lost = matched.is_empty() && !qq_has_uin && !probe_has_uin;
+    let was_online = state.last_state == Some(SnowLumaLoginState::LoggedIn);
+    let new_state = if all_signal_lost && was_online {
+        state.consecutive_no_signal = state.consecutive_no_signal.saturating_add(1);
+        if state.consecutive_no_signal >= NO_SIGNAL_THRESHOLD {
+            Some(SnowLumaLoginState::Disconnected)
+        } else {
+            None
+        }
+    } else {
+        state.consecutive_no_signal = 0;
+        synthesized
+    };
+
+    if let Some(new_state) = new_state {
+        if state.last_state != Some(new_state) {
+            tracing::info!(
+                target: "ncd_runtime::snowluma_status_poller",
+                bot_id = %bot_id,
+                uin = %locked_uin,
+                locked_pid = ?locked_pid,
+                state = ?new_state,
+                "SnowLuma login state changed"
+            );
+        }
+        publish_login_state_if_needed(bot_id, deps, state, new_state);
+    }
+
+    // === PID 集合变化通知 ===
+    let mut pid_set: BTreeSet<u32> = matched.iter().map(|p| p.pid).collect();
+    if pid_set != state.last_pid_set {
+        let pids: Vec<u32> = pid_set.iter().copied().collect();
+        deps.event_bus
+            .publish(DomainEvent::snowluma_pid_set_changed(bot_id.clone(), pids));
+        std::mem::swap(&mut state.last_pid_set, &mut pid_set);
+    }
+}
+
+// 纯函数:UIN 锁定 + 状态合成 + 真实性校验
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeLoginEvidence {
+    pid: u32,
+    uin: String,
+}
+
+/// is_real_uin:非空 + 非 "0" + 全 ASCII 数字 + 长度 ≥ 5
+fn is_real_uin(s: &str) -> bool {
+    !s.is_empty() && s != "0" && s.len() >= 5 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 候选集自适配:proc_tree 后代与 WebUI 实际枚举的进程无交集时,
+/// 视为"启动 PID 与真实 QQ PID 脱钩"场景(远端 native 冷启的 nohup wrapper PID
+/// 与 SnowLuma 看到的 QQ.exe 不是同一个)。此时回退到 WebUI 上的全部进程,
+/// 让 UIN 锁定与 pre-scan 不再因候选集为空而静默卡住。
+///
+/// 本机 Windows 后代枚举正常时,后代与 /api/processes 有交集,走原路径不变,
+/// 多 Bot 场景仍由后续 try_lock_uin 策略做账号隔离,不受影响。
+fn reconcile_candidates(
+    descendants: BTreeSet<u32>,
+    processes: &[HookProcessInfo],
+) -> BTreeSet<u32> {
+    let has_intersection = processes.iter().any(|p| descendants.contains(&p.pid));
+    if has_intersection {
+        return descendants;
+    }
+    // 无交集:用 WebUI 事实替代过时的启动 PID 候选集
+    processes.iter().map(|p| p.pid).collect()
+}
+
+fn uin_matches_expected(uin: &str, expected_uin: Option<&str>) -> bool {
+    expected_uin.is_none_or(|expected| expected == uin)
+}
+
+fn probe_info_matches_uin(info: &QqPortLoginInfo, uin: &str) -> bool {
+    info.logged_in && info.uin == uin && is_real_uin(&info.uin)
+}
+
+fn process_matches_locked(
+    process: &HookProcessInfo,
+    locked_uin: &str,
+    locked_pid: Option<u32>,
+) -> bool {
+    process.uin == locked_uin || (!is_real_uin(&process.uin) && locked_pid == Some(process.pid))
+}
+
+fn find_pid_for_uin(processes: &[HookProcessInfo], uin: &str) -> Option<u32> {
+    processes.iter().find(|p| p.uin == uin).map(|p| p.pid)
+}
+
+fn find_candidate_pid_for_uin(
+    processes: &[HookProcessInfo],
+    candidates: &BTreeSet<u32>,
+    uin: &str,
+) -> Option<u32> {
+    processes
+        .iter()
+        .find(|p| candidates.contains(&p.pid) && p.uin == uin)
+        .map(|p| p.pid)
+}
+
+async fn probe_candidate_login_info(
+    http: &Arc<dyn SnowLumaWebUiClient>,
+    processes: &[HookProcessInfo],
+    candidates: &BTreeSet<u32>,
+    expected_uin: Option<&str>,
+) -> Option<ProbeLoginEvidence> {
+    let mut pids: Vec<u32> = processes
+        .iter()
+        .filter(|p| expected_uin.is_some() || candidates.contains(&p.pid))
+        .map(|p| p.pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+
+    for pid in pids {
+        let Ok(Some(info)) = http.probe_process_login_info(pid).await else {
+            continue;
+        };
+        if info.logged_in && is_real_uin(&info.uin) && uin_matches_expected(&info.uin, expected_uin)
+        {
+            return Some(ProbeLoginEvidence { pid, uin: info.uin });
+        }
+    }
+    None
+}
+
+/// 严格 UIN 锁定策略:
+/// - 策略 A:任一 process.pid ∈ candidate set 且 is_real_uin(process.uin)
+///   → 锁该 uin
+/// - 策略 B(expected):配置里有明确 QQ 号时,允许跨 PID 从 process.uin 或
+///   qq-list 精确锁定它。远端 Linux QQ 启动脚本可能返回 wrapper PID,
+///   而 SnowLuma WebUI 枚举的是最终 QQ 进程 PID。
+/// - 策略 C(fallback,仅当 processes 完全空时):qq_instances 恰好 1 条 +
+///   is_real_uin(qq_instances[0].uin) → 锁该 uin
+/// - 策略 D(fallback):已看到 candidate 进程,但 processes 里还没有任何真实
+///   UIN,同时 qq_instances 恰好 1 条真实 UIN → 锁该 uin。扫码登录后
+///   OneBot 会话可能先出现在 qq-list,process.uin/status 下一轮才刷新。
+/// - 否则:返回 None,等下一轮重试
+///   多 instance(≥ 2)显式拒绝,避免 cross-Bot 误匹配(legacy 复现过)
+fn try_lock_uin(
+    processes: &[HookProcessInfo],
+    qq_instances: &[OneBotInstanceInfo],
+    candidates: &BTreeSet<u32>,
+    expected_uin: Option<&str>,
+) -> Option<String> {
+    // 策略 A
+    for p in processes {
+        if candidates.contains(&p.pid)
+            && is_real_uin(&p.uin)
+            && uin_matches_expected(&p.uin, expected_uin)
+        {
+            return Some(p.uin.clone());
+        }
+    }
+
+    // 策略 B:配置里已有 QQ 号时,用 WebUI 事实精确绑定,不被启动 PID 卡死。
+    if let Some(expected) = expected_uin.filter(|v| is_real_uin(v)) {
+        if processes
+            .iter()
+            .any(|p| p.uin == expected && is_real_uin(&p.uin))
+        {
+            return Some(expected.to_string());
+        }
+        if qq_instances.iter().any(|i| i.uin == expected) {
+            return Some(expected.to_string());
+        }
+    }
+
+    // 策略 C:仅当 processes 完全空 + qq_instances 恰好 1 条
+    if processes.is_empty()
+        && qq_instances.len() == 1
+        && is_real_uin(&qq_instances[0].uin)
+        && uin_matches_expected(&qq_instances[0].uin, expected_uin)
+    {
+        return Some(qq_instances[0].uin.clone());
+    }
+    // 策略 D:候选 QQ 进程已被 WebUI 枚举到,但 hook loginState 还没把
+    // process.uin 刷成真实账号。只有 processes 里完全没有真实 UIN 时才
+    // 信任唯一 qq-list,避免多账号场景把别的 Bot 误锁过来。
+    let has_candidate_process = processes.iter().any(|p| candidates.contains(&p.pid));
+    let has_any_real_process_uin = processes.iter().any(|p| is_real_uin(&p.uin));
+    if has_candidate_process
+        && !has_any_real_process_uin
+        && qq_instances.len() == 1
+        && is_real_uin(&qq_instances[0].uin)
+        && uin_matches_expected(&qq_instances[0].uin, expected_uin)
+    {
+        return Some(qq_instances[0].uin.clone());
+    }
+    None
+}
+
+/// 状态合成:
+/// 1. 任一 matched.status == Online → LoggedIn
+/// 2. qq_instances 含已锁 uin → LoggedIn
+///    OneBotManager 只在 Bridge session close 时移除实例；它比 hook pipe 的
+///    短暂 Disconnected/Error 更能代表账号仍在线。
+/// 3. 否则任一 matched.status == Loaded → WaitingForQrScan
+/// 4. 否则任一 matched.status ∈ {Available, Loading, Connecting} → Starting
+/// 5. 否则任一 matched.status == Disconnected → Disconnected
+/// 6. 否则 → None,本轮不发布
+///
+/// Error 是上游注入/动作的带消息异常，不携带 `wasLoggedIn` 语义，不能当掉线。
+fn synthesize_state(matched: &[&HookProcessInfo], qq_has_uin: bool) -> Option<SnowLumaLoginState> {
+    if matched
+        .iter()
+        .any(|p| p.status == HookProcessStatus::Online)
+    {
+        return Some(SnowLumaLoginState::LoggedIn);
+    }
+    if qq_has_uin {
+        return Some(SnowLumaLoginState::LoggedIn);
+    }
+    if matched
+        .iter()
+        .any(|p| p.status == HookProcessStatus::Loaded)
+    {
+        return Some(SnowLumaLoginState::WaitingForQrScan);
+    }
+    if matched.iter().any(|p| {
+        matches!(
+            p.status,
+            HookProcessStatus::Available
+                | HookProcessStatus::Loading
+                | HookProcessStatus::Connecting
+        )
+    }) {
+        return Some(SnowLumaLoginState::Starting);
+    }
+    if matched
+        .iter()
+        .any(|p| p.status == HookProcessStatus::Disconnected)
+    {
+        return Some(SnowLumaLoginState::Disconnected);
+    }
+    None
+}
+
+// 单元测试 + 属性测试
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

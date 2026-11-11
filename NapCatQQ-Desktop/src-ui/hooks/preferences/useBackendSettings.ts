@@ -1,0 +1,78 @@
+// 后端持久化设置读写 hook。
+//
+// 设置页统一草稿（settings-draft）在保存时：先 set_app_settings，再写入 localStorage 偏好。
+// 读走 useQuery；保存成功后 setQueryData 更新后端缓存。
+
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { settingsService } from '../../core/services/settings.service';
+import {
+    applyClientPrefsFromDraft,
+    backendSlice,
+    type SettingsDraft,
+} from '../../modules/settings/settings-draft';
+import { pushInfoBar } from '../ui/globalInfoBarStore';
+import { pushErrorBar } from '../ui/pushErrorBar';
+import { reloadBotRuntimeMetricsCatalogSettings } from '../bot/botRuntimeMetricsCatalog';
+import { networkSettingsEqual } from '../../core/domain/settings/network';
+
+const backendSettingsKey = ['appSettings'] as const;
+
+interface Callbacks {
+    onSaved?: () => void;
+}
+
+export function useBackendSettings(cb: Callbacks = {}) {
+    const queryClient = useQueryClient();
+
+    const query = useQuery({
+        queryKey: backendSettingsKey,
+        queryFn: () => settingsService.get(),
+    });
+
+    const saveMutation = useMutation({
+        mutationFn: async (draft: SettingsDraft) => {
+            const savedBackend = backendSlice(draft);
+            await settingsService.set(savedBackend);
+            // 等待主题切换动画完成（如果有），再推 InfoBar，避免动画期间弹出
+            await applyClientPrefsFromDraft(draft);
+            return savedBackend;
+        },
+        onSuccess: async (savedBackend) => {
+            const previous = queryClient.getQueryData<typeof savedBackend>(backendSettingsKey);
+            queryClient.setQueryData(backendSettingsKey, savedBackend);
+            if (
+                previous?.githubApiMode !== savedBackend.githubApiMode ||
+                previous?.githubPat.trim() !== savedBackend.githubPat.trim() ||
+                previous?.proxyPassword !== savedBackend.proxyPassword ||
+                !previous ||
+                !networkSettingsEqual(previous.network, savedBackend.network)
+            ) {
+                // 首次查询尚无数据时，invalidateQueries 不会替换正在执行的旧请求。
+                await queryClient.cancelQueries({ queryKey: ['releaseSnapshot'] });
+                void queryClient.invalidateQueries({ queryKey: ['releaseSnapshot'] });
+            }
+            void reloadBotRuntimeMetricsCatalogSettings();
+            pushInfoBar({
+                key: 'app-settings-save',
+                tone: 'success',
+                title: '设置已保存',
+            });
+            cb.onSaved?.();
+        },
+        onError: (err: Error) => {
+            pushErrorBar({
+                key: 'app-settings-save',
+                title: '设置保存失败',
+                raw: err.message || String(err),
+            });
+        },
+    });
+
+    return {
+        settings: query.data ?? null,
+        isLoading: query.isLoading,
+        error: query.error,
+        save: saveMutation.mutate,
+        isSaving: saveMutation.isPending,
+    };
+}

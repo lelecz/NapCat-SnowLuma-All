@@ -1,0 +1,83 @@
+### 开发环境 ###
+docs/dev/
+
+### Git worktrees（本机隔离 checkout，不入库）###
+.worktrees/
+
+
+### AI / 助手本地产物（不进版本库，可本机重装 skills）###
+.agents/
+.claude/
+.codex/
+.codesearch.db/
+work/
+docs/superpowers/
+docs/dev/
+CLAUDE.md
+
+# 已确认的历史临时报告 / 工作计划（保留本地，不再跟踪）
+/docs/2026-10-03_chat-usability-report.md
+/src-ui/docs/BATCH_FIX_PLAN.md
+
+# Copilot / agent 个性化（本机自管，不入库）
+.github/copilot-instructions.md
+.github/instructions/
+.github/hooks/
+scripts/hooks/
+
+### 编辑器（可选共享：若需团队统一 VS Code 设置再单独 un-ignore）###
+.vscode/
+.cursor/
+
+### 参考克隆与旧实现（体积大，仅本地对照；权威旧版路径: .references/NapCatQQ-Desktop-main）###
+.references/
+legacy-python/
+
+### Rust / Tauri ###
+target/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/resources/remote-agent/*.exe
+**/*.rs.bk
+*.rlib
+# build.rs 生成的编译期常量（模板 proxy_constants.template.rs 入库）
+crates/ncd-network/src/proxy_constants.rs
+
+### Python 脚本（scripts/ 下的代码生成器跑一次就会留缓存）###
+__pycache__/
+*.py[cod]
+
+### Node / 前端 ###
+node_modules/
+.pnpm-store/
+dist/
+build/
+.vite/
+.next/
+coverage/
+
+### 日志和临时文件 ###
+# 仅忽略运行时 / 根级日志目录，避免误伤 src-ui/modules/bot/log/ 等源码目录。
+/log/
+/logs/
+**/runtime/log/
+**/runtime/logs/
+*.log
+tmp/
+*.tmp
+*.temp
+.cache/
+.DS_Store
+Thumbs.db
+ehthumbs*.db
+[Dd]esktop.ini
+*~
+
+### 本地配置和敏感文件 ###
+.env
+.env.*
+!.env.example
+*.local
+/config/
+/runtime/config/snowluma-session.json
+ssh/

@@ -1,0 +1,273 @@
+//! QQ 系统依赖安装器
+//!
+//! 处理提权,重试,进度上报等逻辑
+
+use ncd_domain::{FailedPackage, InstallDependenciesResult};
+use ncd_host::remote::SudoAccess;
+use ncd_host::{Host, HostError, LinuxPackageManager};
+
+use crate::context::ActionCtx;
+use crate::error::ActionError;
+
+/// QQ 依赖安装器
+pub struct QqDependencyInstaller;
+
+impl QqDependencyInstaller {
+    /// 自动安装缺失依赖
+    ///
+    /// 会检查 sudo 权限;sudo_password 对齐 Docker 安装流程——前端弹窗收集到的密码
+    /// 直接传入,先注入 Host 再继续安装,None 时 probe 到 PasswordRequired 就返回
+    /// elevation_required 标志让上层弹窗
+    pub async fn install(
+        &self,
+        host: &dyn Host,
+        missing: Vec<String>,
+        sudo_password: Option<&str>,
+        ctx: &mut ActionCtx,
+    ) -> Result<InstallDependenciesResult, ActionError> {
+        if missing.is_empty() {
+            ctx.info("QQ 系统依赖已满足").await;
+            return Ok(InstallDependenciesResult {
+                success: true,
+                installed: vec![],
+                failed: vec![],
+                elevation_required: false,
+            });
+        }
+
+        // 包名来自前端，下面要拿 root 跑；不像包名的一律拒绝，不做清洗后继续
+        if let Some(bad) = missing
+            .iter()
+            .find(|p| !LinuxPackageManager::is_valid_package_name(p))
+        {
+            return Err(ActionError::InstallStepFailed {
+                step: "install_qq_dependencies".into(),
+                reason: format!("非法包名: {bad}"),
+            });
+        }
+
+        // 探测提权能力(SudoAccess),上层按结果决定注入密码还是弹窗
+        let sudo_access = self.check_sudo_access(host).await?;
+        ctx.info(format!("sudo 权限探测: {sudo_access:?}")).await;
+
+        // host 已注入的提权密码也算可用:deploy path(ensure_dependencies)不再传
+        // sudo_password,但 ServerManager 在建连时已从 keyring 注入了密码到 host,
+        // 这份密码足够让 elevated apt 命令走 sudo -S,只看参数会漏掉这条路径
+        let host_has_password = host.has_elevation_password().await;
+
+        tracing::info!(
+            "[QqDependencyInstaller] sudo_access={:?}, sudo_password={}, host_has_password={}",
+            sudo_access,
+            if sudo_password.is_some() {
+                "<provided>"
+            } else {
+                "<none>"
+            },
+            host_has_password
+        );
+
+        // 需要密码时:显式参数优先注入;host 已有密码直接复用;都没有才返回标志让上层弹窗
+        if matches!(sudo_access, SudoAccess::PasswordRequired) {
+            match sudo_password {
+                Some(pw) => {
+                    tracing::info!("[QqDependencyInstaller] injecting sudo password to host");
+                    host.set_elevation_password(Some(pw.to_string())).await;
+                    ctx.info("已注入 sudo 密码，准备安装系统依赖").await;
+                }
+                None if host_has_password => {
+                    tracing::info!(
+                        "[QqDependencyInstaller] using host-injected sudo password (keyring cache)"
+                    );
+                    ctx.info("使用已保存的 sudo 密码安装系统依赖").await;
+                }
+                None => {
+                    ctx.warn("安装 QQ 系统依赖需要 sudo 密码").await;
+                    return Ok(InstallDependenciesResult {
+                        success: false,
+                        installed: vec![],
+                        failed: vec![],
+                        elevation_required: true,
+                    });
+                }
+            }
+        }
+
+        // 探测一次包管理器类型,后续每个包安装复用,避免重复 command -v
+        let pkg_mgr = self.detect_package_manager(host).await?;
+        ctx.info(format!("系统包管理器: {pkg_mgr:?}")).await;
+
+        // 刷新包索引
+        ctx.info("刷新系统包索引").await;
+        if let Err(e) = self.refresh_package_index(host, pkg_mgr).await {
+            tracing::warn!("refresh package index failed: {e}");
+            ctx.warn(format!("刷新系统包索引失败，继续尝试安装: {e}"))
+                .await;
+        } else {
+            ctx.info("系统包索引已刷新").await;
+        }
+
+        let mut installed = Vec::new();
+        let mut failed = Vec::new();
+
+        // 逐个安装,单个失败记入 failed 不中断其余包
+        for (idx, pkg) in missing.iter().enumerate() {
+            ctx.info(format!(
+                "安装 QQ 系统依赖 {}/{}: {pkg}",
+                idx + 1,
+                missing.len()
+            ))
+            .await;
+            ctx.emit(crate::context::ProgressKind::StepProgress {
+                step: 0,
+                percent: ((idx * 100) / missing.len()) as u8,
+                message: format!("安装 {pkg}"),
+                speed_bps: None,
+                downloaded_bytes: None,
+                total_bytes: None,
+                download_stage: None,
+                docker_layers: None,
+            })
+            .await;
+
+            match self
+                .install_package_with_retry(host, pkg, pkg_mgr, ctx)
+                .await
+            {
+                Ok(_) => {
+                    ctx.info(format!("已安装 QQ 系统依赖: {pkg}")).await;
+                    installed.push(pkg.clone());
+                }
+                Err(e) => {
+                    ctx.warn(format!("QQ 系统依赖安装失败: {pkg}: {e}")).await;
+                    failed.push(FailedPackage {
+                        name: pkg.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        ctx.info(format!(
+            "QQ 系统依赖安装完成: 成功 {} 个，失败 {} 个",
+            installed.len(),
+            failed.len()
+        ))
+        .await;
+
+        Ok(InstallDependenciesResult {
+            success: failed.is_empty(),
+            installed,
+            failed,
+            elevation_required: false,
+        })
+    }
+
+    /// 检查 sudo 访问(使用 ncd_host 的 probe_sudo)
+    async fn check_sudo_access(&self, host: &dyn Host) -> Result<SudoAccess, ActionError> {
+        Ok(ncd_host::remote::probe_sudo(host).await)
+    }
+
+    /// 依赖清单只按 deb / rpm 两族维护(detector 的包名解析同此),其它包管理器报不支持
+    async fn detect_package_manager(
+        &self,
+        host: &dyn Host,
+    ) -> Result<LinuxPackageManager, ActionError> {
+        match LinuxPackageManager::detect(host).await {
+            Some(pm @ (LinuxPackageManager::Apt | LinuxPackageManager::Dnf)) => Ok(pm),
+            Some(other) => Err(ActionError::install_step(
+                "detect_package_manager",
+                format!("QQ 依赖清单只覆盖 apt / dnf,当前主机是 {other}"),
+            )),
+            None => Err(ActionError::install_step(
+                "detect_package_manager",
+                "neither apt-get nor dnf found on host",
+            )),
+        }
+    }
+
+    /// 刷新包索引;dnf 装包自带刷新,无事可做
+    async fn refresh_package_index(
+        &self,
+        host: &dyn Host,
+        pkg_mgr: LinuxPackageManager,
+    ) -> Result<(), HostError> {
+        if let Some(cmd) = pkg_mgr.refresh_command() {
+            host.run_to_string(cmd.elevated()).await?;
+        }
+        Ok(())
+    }
+
+    /// 安装单个包(带网络重试,指数退避 5s → 10s → 20s)
+    async fn install_package_with_retry(
+        &self,
+        host: &dyn Host,
+        package: &str,
+        pkg_mgr: LinuxPackageManager,
+        ctx: &mut ActionCtx,
+    ) -> Result<(), HostError> {
+        const MAX_RETRIES: u32 = 3;
+        let mut last_err = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.install_package(host, package, pkg_mgr).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let is_network = is_network_error(&e);
+                    last_err = Some(e);
+
+                    // 只对网络错误重试,其他错误立即返回
+                    if !is_network || attempt == MAX_RETRIES - 1 {
+                        break;
+                    }
+
+                    let wait_secs = 5u64 * 2u64.pow(attempt);
+                    ctx.warn(format!(
+                        "{package} 安装失败（网络），{wait_secs}s 后重试 ({}/{MAX_RETRIES})",
+                        attempt + 2
+                    ))
+                    .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| HostError::CommandFailed {
+            program: "install".to_string(),
+            exit_code: None,
+            stderr: "unknown install error".to_string(),
+        }))
+    }
+
+    /// 安装单个包
+    async fn install_package(
+        &self,
+        host: &dyn Host,
+        package: &str,
+        pkg_mgr: LinuxPackageManager,
+    ) -> Result<(), HostError> {
+        let output = host
+            .run_to_string(pkg_mgr.install_command(&[package]).elevated())
+            .await?;
+        if !output.success() {
+            return Err(HostError::CommandFailed {
+                program: pkg_mgr.binary().to_string(),
+                exit_code: output.exit_code,
+                stderr: output.stderr,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// 判断错误是否为网络相关(用于决定是否重试)
+fn is_network_error(err: &HostError) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("could not resolve")
+        || msg.contains("connection")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("temporary failure")
+        || msg.contains("network")
+        || msg.contains("unable to fetch")
+        || msg.contains("failed to fetch")
+}

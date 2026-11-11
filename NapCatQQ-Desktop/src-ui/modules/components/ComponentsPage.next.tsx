@@ -1,0 +1,453 @@
+// 组件页：先选主机，再看这台机器能装啥。
+// 编排分散在同目录的模块局部 hook：useComponentHosts（主机选择）、
+// useQqDependencyProbes（QQ 依赖探测）、useComponentActions（组件操作）、
+// useDockerSudoOps（Docker 安装 + sudo 弹框）、useAppInstanceDialogs（应用端实例对话框）。
+
+import React, {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    useSyncExternalStore,
+} from 'react';
+import { Box, Loader2, Monitor, RefreshCw, Server } from 'lucide-react';
+import { useQueryClient } from '@tanstack/react-query';
+import { Button } from '../../shared/ui';
+import { MotionIcon, refreshMotion } from '../../shared/ui/motion';
+import { useComponents } from '../../hooks/components/useComponents';
+import { useComponentAction } from '../../hooks/components/useComponentAction';
+import { useComponentActionErrors } from '../../hooks/components/useComponentActionErrors';
+import { useComponentPageAlerts } from '../../hooks/components/useComponentPageAlerts';
+import {
+    consumeDockerDeployment,
+    getPendingDockerDeployment,
+    usePendingDockerDeployment,
+} from '../../hooks/components/componentsNavigation';
+import { useBotSnapshots } from '../../hooks/bot/useBotSnapshots';
+import { useBotConfigsMap } from '../../hooks/bot/useBotConfigsMap';
+import { useQqDependencyOps } from '../../hooks/components/useQqDependencyOps';
+import { useReleases } from '../../hooks/diagnostics/useReleases';
+import { useDockerHosts } from '../../hooks/docker/useDockerHosts';
+import { useDockerInstallProgress } from '../../hooks/docker/useDockerInstallProgress';
+import { useAppFrameworks, useAppInstances } from '../../hooks/apps/useAppInstances';
+import { useFeatureEnabled } from '../../hooks/preferences/featureTogglesStore';
+import { useMotion } from '../../hooks/preferences/useMotion';
+import { useServerManager } from '../../hooks/remote/useServerManager';
+import { pushInfoBar } from '../../hooks/ui/globalInfoBarStore';
+import { HostSwitcher } from './HostSwitcher';
+import { HostComponentsView } from './HostComponentsView';
+import { ReleaseNotesDialog } from './ReleaseNotesDialog';
+
+import { SudoPasswordDialog } from '../docker/SudoPasswordDialog';
+import { CreateInstanceDialog, ImportInstanceDialog } from '../apps';
+import { machineSummary, type ComponentRow } from '../../core/domain/components/types';
+import { qqSudoActionLabel } from '../../core/domain/components/qqProbe';
+import {
+    getComponentsHostBridge,
+    subscribeComponentsHostBridge,
+} from '../../hooks/desktop/componentsHostBridge';
+import type { ComponentId } from '../../core/ipc/types';
+import {
+    releaseNotesLabel,
+    resolveLatestRelease,
+    resolveLatestVersion,
+} from '../../core/domain/components/releaseLookup';
+import { cn } from '../../shared/utils/cn';
+import { PagePlaceholder } from '../../shared/ui/PagePlaceholder';
+import scrollStyles from './componentsPageScroll.module.css';
+import { useComponentHosts } from './useComponentHosts';
+import { useQqDependencyProbes } from './useQqDependencyProbes';
+import { useComponentActions } from './useComponentActions';
+import { useDockerSudoOps } from './useDockerSudoOps';
+import { useAppInstanceDialogs } from './useAppInstanceDialogs';
+
+export const ComponentsPageNext: React.FC = () => {
+    const queryClient = useQueryClient();
+    const { view, hosts, isLoading, error, refetch } = useComponents();
+    const action = useComponentAction();
+    const { detectQqDependencies } = useQqDependencyOps();
+    const {
+        snapshot: releases,
+        refetch: refetchReleases,
+        isFetching: releasesFetching,
+    } = useReleases();
+    const { data: botSnapshots = [] } = useBotSnapshots();
+    const botConfigs = useBotConfigsMap(botSnapshots);
+
+    const hostIds = useMemo(() => hosts.map((h) => h.host_id), [hosts]);
+    const dockerHosts = useDockerHosts(hostIds);
+
+    // 应用端：框架清单 + 实例（按实例安装；应用端页也能导入已有项目）
+    const appFrameworks = useAppFrameworks();
+    const apps = useAppInstances();
+    // 设置里关了应用端就不列应用端组
+    const appsEnabled = useFeatureEnabled('apps');
+    const { servers, isLoading: isServersLoading } = useServerManager();
+    const dockerDeploymentRequest = usePendingDockerDeployment();
+    const dockerSectionRef = useRef<HTMLElement>(null);
+    const motion = useMotion();
+
+    // 组件主导矩阵 → 主机主导，再剔掉这台机器一个组件都装不了的空机器。
+    const allRows = useMemo<ComponentRow[]>(
+        () => [...view.framework, ...view.runtimeDep, ...view.selfApp],
+        [view],
+    );
+    const hostBridge = useSyncExternalStore(
+        subscribeComponentsHostBridge,
+        getComponentsHostBridge,
+        getComponentsHostBridge,
+    );
+    const { machines, activeHostId, setActiveHostId, activeMachine } = useComponentHosts(
+        allRows,
+        hosts,
+        hostBridge,
+    );
+
+    useEffect(() => {
+        const request = dockerDeploymentRequest;
+        if (!request || isLoading || isServersLoading || hostBridge.hostSelectionLocked) return;
+        const unavailable = (content: string) => {
+            pushInfoBar({
+                key: `docker-deployment-navigation:${request.requestId}`,
+                tone: 'warning',
+                title: '无法打开 Docker 部署',
+                content,
+            });
+            consumeDockerDeployment(request.requestId);
+        };
+        const target = machines.find((machine) => machine.host.host_id === request.hostId);
+        if (!target) {
+            unavailable('目标主机已移除或组件清单不可用，请刷新后重新选择主机。');
+            return;
+        }
+        if (target.host.os !== 'linux') {
+            unavailable('Docker 部署需要 Linux 主机，请重新选择主机。');
+            return;
+        }
+        if (activeHostId !== request.hostId) {
+            setActiveHostId(request.hostId);
+            return;
+        }
+        const frame = requestAnimationFrame(() => {
+            if (getPendingDockerDeployment()?.requestId !== request.requestId) return;
+            const section = dockerSectionRef.current;
+            if (!section) {
+                unavailable('该主机的 Docker 部署区暂不可用，请刷新组件清单后重试。');
+                return;
+            }
+            section.scrollIntoView({
+                behavior: motion.enabled ? 'smooth' : 'auto',
+                block: 'start',
+            });
+            section.focus({ preventScroll: true });
+            consumeDockerDeployment(request.requestId);
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [
+        dockerDeploymentRequest,
+        isLoading,
+        isServersLoading,
+        machines,
+        activeHostId,
+        setActiveHostId,
+        motion.enabled,
+        hostBridge.hostSelectionLocked,
+    ]);
+
+    const { probeQqDependencies, reportByHost } = useQqDependencyProbes(
+        machines,
+        activeMachine,
+        detectQqDependencies,
+    );
+    const activeQqDependencyReport = activeMachine
+        ? (reportByHost[activeMachine.host.host_id]?.report ?? null)
+        : null;
+
+    // 清单 / 探测 / 组件操作终态 → 全局 InfoBar（顶层 InfoBarStack 渲染）。
+    useComponentPageAlerts(allRows, error, activeHostId);
+    useComponentActionErrors(allRows);
+
+    const dockerInstallProgress = useDockerInstallProgress(activeMachine?.host.host_id ?? '');
+
+    const hostNameOf = useCallback(
+        (hostId: string) =>
+            machines.find((m) => m.host.host_id === hostId)?.host.display_name ?? hostId,
+        [machines],
+    );
+
+    // 版本号：组件更新按钮用（含 QQ 宿主探测）。
+    const latestVersionFor = useCallback(
+        (id: ComponentId) => resolveLatestVersion(releases, activeMachine?.host.os, id),
+        [releases, activeMachine?.host.os],
+    );
+
+    // 更新日志：只给有 GitHub release body 的组件（NC / SL / NCD / ncd-watch）。
+    // QQ 走 pcConfig 版本探测，没有可用 changelog，不展示「日志」。
+    const latestReleaseFor = useCallback(
+        (id: ComponentId) => resolveLatestRelease(releases, id),
+        [releases],
+    );
+
+    const [releaseNotesTarget, setReleaseNotesTarget] = useState<ComponentId | null>(null);
+
+    const handleShowReleaseNotes = useCallback((componentId: ComponentId) => {
+        setReleaseNotesTarget(componentId);
+    }, []);
+
+    const dialogs = useAppInstanceDialogs({ hostNameOf, apps });
+
+    const { handleAction, lifecycleBlockedReasonForHost } = useComponentActions({
+        hostNameOf,
+        refetch,
+        queryClient,
+        action,
+        botSnapshots,
+        botConfigs,
+        probeQqDependencies,
+    });
+
+    const {
+        sudoPrompt,
+        closeSudoPrompt,
+        handleInstallDocker,
+        handleDockerDeployError,
+        startQqDepsRepair,
+        handleSudoConfirm,
+    } = useDockerSudoOps({
+        hostNameOf,
+        installDocker: dockerHosts.install,
+        startAction: action.startAction,
+        onTaskTerminal: action.onTaskTerminal,
+        refetch,
+        probeQqDependencies,
+    });
+
+    const refetchApps = apps.refetch;
+    const refetchDocker = dockerHosts.refetch;
+    const handleRefresh = useCallback(() => {
+        refetch();
+        refetchDocker();
+        void refetchApps();
+        // 远端版本必须 force，否则 1h 磁盘缓存会挡住中转/GitHub 重拉
+        refetchReleases();
+        if (activeMachine) {
+            void probeQqDependencies(activeMachine.host.host_id, true);
+        }
+    }, [refetch, refetchDocker, refetchApps, refetchReleases, activeMachine, probeQqDependencies]);
+
+    const handleRetryDetect = useCallback(
+        (hostId: string) => {
+            refetch();
+            refetchReleases();
+            void probeQqDependencies(hostId, true);
+        },
+        [refetch, refetchReleases, probeQqDependencies],
+    );
+
+    const allEmpty = machines.length === 0;
+    const singleMachineSummary =
+        machines.length === 1 && activeMachine ? machineSummary(activeMachine) : null;
+
+    return (
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+            <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 pb-3 pt-1">
+                <div className="flex min-w-0 max-w-full flex-wrap items-center gap-3">
+                    <h1 className="font-display text-xl font-semibold text-text">组件管理</h1>
+                    {machines.length === 1 && activeMachine && singleMachineSummary ? (
+                        <div className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-sm border border-border-subtle bg-inset/60 px-2.5 py-1 text-2xs text-text-secondary">
+                            <span
+                                aria-hidden
+                                className={cn(
+                                    'h-1.5 w-1.5 shrink-0 rounded-full',
+                                    activeMachine.host.locality === 'remote'
+                                        ? 'bg-success shadow-glow-success'
+                                        : 'bg-brand',
+                                )}
+                            />
+                            {activeMachine.host.locality === 'remote' ? (
+                                <Server size={12} className="shrink-0 text-text-tertiary" />
+                            ) : (
+                                <Monitor size={12} className="shrink-0 text-brand" />
+                            )}
+                            <span
+                                className="min-w-0 truncate font-medium text-text"
+                                title={activeMachine.host.display_name}
+                            >
+                                {activeMachine.host.display_name}
+                            </span>
+                            <span className="shrink-0 font-mono text-[10px] uppercase text-text-tertiary">
+                                {activeMachine.host.os}
+                            </span>
+                            <span className="shrink-0 rounded-xs bg-brand/12 px-1.5 py-0.5 font-mono text-[10px] leading-none text-brand tabular-nums">
+                                已装 {singleMachineSummary.installed}/{singleMachineSummary.total}
+                            </span>
+                        </div>
+                    ) : null}
+                </div>
+                <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={handleRefresh}
+                    disabled={isLoading || releasesFetching}
+                >
+                    <MotionIcon
+                        icon={RefreshCw}
+                        motion={refreshMotion(isLoading || releasesFetching)}
+                        playEnter={false}
+                        size={14}
+                    />
+                    刷新
+                </Button>
+            </header>
+
+            {machines.length > 1 && activeHostId ? (
+                <div className="min-w-0 shrink-0 pb-1">
+                    <HostSwitcher
+                        machines={machines}
+                        activeHostId={activeHostId}
+                        onSelect={setActiveHostId}
+                    />
+                </div>
+            ) : null}
+
+            <div
+                className={cn(
+                    'mt-2 min-h-0 min-w-0 flex-1 pb-6',
+                    scrollStyles.componentsPageScroll,
+                )}
+            >
+                {isLoading && allEmpty ? (
+                    <SectionLoading />
+                ) : allEmpty ? (
+                    <PagePlaceholder className="gap-2">
+                        <MotionIcon
+                            icon={Box}
+                            motion="none"
+                            playEnter={false}
+                            size={28}
+                            className="text-text-tertiary"
+                        />
+                        <p className="text-sm text-text-secondary">没有可管理的组件</p>
+                        <p className="text-xs text-text-tertiary">请检查远端连接或刷新组件清单</p>
+                    </PagePlaceholder>
+                ) : activeMachine ? (
+                    <HostComponentsView
+                        machine={activeMachine}
+                        dockerSectionRef={dockerSectionRef}
+                        appFrameworks={appsEnabled ? (appFrameworks.data ?? []) : []}
+                        appInstances={apps.instances}
+                        onCreateAppInstance={dialogs.handleCreateAppInstance}
+                        onImportAppInstance={dialogs.handleImportAppInstance}
+                        latestVersionFor={latestVersionFor}
+                        latestReleaseFor={latestReleaseFor}
+                        getProgress={action.getProgressFor}
+                        onAction={handleAction}
+                        onRetryDetect={handleRetryDetect}
+                        onShowReleaseNotes={handleShowReleaseNotes}
+                        lifecycleBlockedReason={lifecycleBlockedReasonForHost(
+                            activeMachine.host.host_id,
+                        )}
+                        qqDependencyReport={activeQqDependencyReport}
+                        dockerStatus={dockerHosts.statusByHost[activeMachine.host.host_id]}
+                        dockerProbeError={dockerHosts.errorByHost[activeMachine.host.host_id]}
+                        isDockerProbing={
+                            dockerHosts.probingByHost[activeMachine.host.host_id] ?? false
+                        }
+                        isInstallingDocker={
+                            dockerHosts.installingByHost[activeMachine.host.host_id] ?? false
+                        }
+                        dockerInstallHint={
+                            dockerHosts.installHintByHost[activeMachine.host.host_id]
+                        }
+                        dockerInstallProgress={dockerInstallProgress}
+                        onInstallDocker={(hostId) => {
+                            void handleInstallDocker(hostId);
+                        }}
+                        onOpenDockerDownload={dockerHosts.openDownloadPage}
+                        onEnsureQqDependencies={(hostId) => {
+                            void startQqDepsRepair(hostId);
+                        }}
+                        isPullingImage={dockerHosts.isPullingFrameworkImage}
+                        onPullImage={dockerHosts.pullFrameworkImage}
+                        onPullImageError={handleDockerDeployError}
+                        imageReadyByFlavor={
+                            dockerHosts.imageReadyByHost[activeMachine.host.host_id] ?? {}
+                        }
+                        imageErrorByFlavor={
+                            dockerHosts.imageErrorByHost[activeMachine.host.host_id] ?? {}
+                        }
+                        containers={dockerHosts.containersByHost[activeMachine.host.host_id] ?? []}
+                    />
+                ) : null}
+            </div>
+
+            <ReleaseNotesDialog
+                open={releaseNotesTarget != null}
+                onOpenChange={(open) => {
+                    if (!open) setReleaseNotesTarget(null);
+                }}
+                componentLabel={releaseNotesLabel(releaseNotesTarget)}
+                release={releaseNotesTarget ? latestReleaseFor(releaseNotesTarget) : null}
+            />
+
+
+            <ImportInstanceDialog
+                target={dialogs.importAppTarget}
+                frameworks={appFrameworks.data ?? []}
+                servers={servers}
+                isImporting={apps.isImporting}
+                onClose={dialogs.closeImportDialog}
+                onSubmit={dialogs.submitImport}
+            />
+
+            <CreateInstanceDialog
+                request={dialogs.createAppRequest}
+                servers={servers}
+                isCreating={apps.isCreating}
+                onClose={dialogs.closeCreateDialog}
+                onSubmit={dialogs.submitCreate}
+            />
+
+            {sudoPrompt && (
+                <SudoPasswordDialog
+                    key={
+                        sudoPrompt.purpose === 'qq_action'
+                            ? sudoPrompt.taskId
+                            : `docker:${sudoPrompt.hostId}`
+                    }
+                    hostName={sudoPrompt.hostName}
+                    allowRemember={sudoPrompt.hostId !== 'local'}
+                    reason={sudoPrompt.reason}
+                    actionLabel={
+                        sudoPrompt.purpose === 'qq_action'
+                            ? qqSudoActionLabel(sudoPrompt.kind, sudoPrompt.componentId)
+                            : '继续准备环境'
+                    }
+                    isSubmitting={
+                        sudoPrompt.purpose === 'docker'
+                            ? (dockerHosts.installingByHost[sudoPrompt.hostId] ?? false)
+                            : false
+                    }
+                    onConfirm={handleSudoConfirm}
+                    onClose={closeSudoPrompt}
+                />
+            )}
+        </div>
+    );
+};
+
+const SectionLoading: React.FC = () => (
+    <PagePlaceholder className="gap-2 py-12">
+        <MotionIcon
+            icon={Loader2}
+            motion="spin"
+            playEnter={false}
+            size={16}
+            className="text-text-tertiary"
+        />
+        <span className="text-sm text-text-tertiary">加载中…</span>
+    </PagePlaceholder>
+);
+
+export default ComponentsPageNext;

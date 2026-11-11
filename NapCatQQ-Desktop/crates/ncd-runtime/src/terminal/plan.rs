@@ -1,0 +1,732 @@
+//! 终端开到哪：目标 → 哪台主机、跑什么、进哪个目录、带什么环境
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ncd_domain::{
+    AppInstanceId, LocalShellKind, LocalShellOption, RuntimeTarget, TerminalFeatures,
+    TerminalHostOs, TerminalOpenRequest, TerminalSnippet, TerminalTarget, server_id_of_host,
+};
+use ncd_host::{Host, HostCommand, HostPath, PathStyle, PtyProgram, shell_single_quote};
+use tokio::sync::Mutex;
+
+use crate::app_framework::{AppManager, BotConfigPort};
+use crate::data_paths::DataPaths;
+use crate::host_resolver::HostResolver;
+use crate::server_manager::{ServerManager, ServerProfile};
+
+use super::TerminalError;
+use super::integration::{
+    bash_env_section, bash_rc, git_bash_rc, local_bash_rc, remote_bash_exec_line,
+};
+use super::shells::{detect_local_shells, fresh_local_path, launch_for, pick_shell};
+
+mod bot;
+
+/// 一次开终端的完整方案
+pub struct TerminalLaunchPlan {
+    pub host: Arc<dyn Host>,
+    pub host_id: String,
+    pub host_label: String,
+    pub host_os: TerminalHostOs,
+    pub title: String,
+    pub program: PtyProgram,
+    /// 本机是进程的起始目录；远端 Program 会拼成 cd
+    pub cwd: Option<HostPath>,
+    /// 本机是进程环境；远端 Program 拼成行内变量（Script 自己带）
+    pub env: BTreeMap<String, String>,
+    /// 给前端看的起始目录（文件栏一开始列哪）
+    pub cwd_display: Option<String>,
+    pub shell: Option<LocalShellKind>,
+    pub features: TerminalFeatures,
+    pub snippets: Vec<TerminalSnippet>,
+    /// 开头打的几行说明（灰字）
+    pub banner: Vec<String>,
+}
+
+/// 会话管理层需要的外部能力：规划、sudo 密码、本机 shell 列表
+#[async_trait]
+pub trait TerminalPlanner: Send + Sync {
+    async fn plan(
+        &self,
+        request: &TerminalOpenRequest,
+    ) -> Result<TerminalLaunchPlan, TerminalError>;
+    /// 这台主机存的提权密码；只在用户点了「填入密码」时取，直接写进终端
+    fn sudo_password(&self, host_id: &str) -> Option<String>;
+    fn local_shells(&self) -> Vec<LocalShellOption>;
+}
+
+/// 远端登录 shell 的情况，按主机记一次
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteShellInfo {
+    /// 登录 shell 能读 POSIX 语法（bash / zsh / dash 等）；fish、csh 这类不能
+    posix: bool,
+    login_is_bash: bool,
+    has_bash: bool,
+    home: String,
+}
+
+const REMOTE_SHELL_PROBE: &str =
+    r#"printf '%s\n%s\n' "${SHELL:-}" "$HOME"; command -v bash || true"#;
+
+fn parse_remote_shell_probe(stdout: &str) -> RemoteShellInfo {
+    let mut lines = stdout.lines().map(str::trim);
+    let shell = lines.next().unwrap_or_default();
+    let home = lines.next().unwrap_or_default();
+    let bash = lines.next().unwrap_or_default();
+    let name = shell.rsplit('/').next().unwrap_or_default();
+    let posix = matches!(
+        name,
+        "" | "bash" | "sh" | "dash" | "zsh" | "ksh" | "mksh" | "ash" | "busybox"
+    );
+    RemoteShellInfo {
+        posix,
+        login_is_bash: name == "bash",
+        has_bash: !bash.is_empty(),
+        home: if home.is_empty() {
+            "~".to_string()
+        } else {
+            home.to_string()
+        },
+    }
+}
+
+fn linux_snippets() -> Vec<TerminalSnippet> {
+    vec![
+        TerminalSnippet::new("磁盘", "df -h"),
+        TerminalSnippet::new("内存", "free -h"),
+        TerminalSnippet::new("进程", "top"),
+        TerminalSnippet::new("监听端口", "ss -lntp"),
+    ]
+}
+
+/// 进容器：先看要不要 sudo，再按名字找在跑的那个（SnowLuma 有旧版留下的 ncbot 名字）
+fn docker_exec_script(names: &[String], engine: ncd_domain::docker::ContainerEngine) -> String {
+    let list: Vec<String> = names.iter().map(|n| shell_single_quote(n)).collect();
+    let shown = names.join(" / ");
+    let setup = match engine {
+        ncd_domain::docker::ContainerEngine::Docker => {
+            r#"if docker info >/dev/null 2>&1; then D=docker; else D="sudo docker"; fi"#
+        }
+        ncd_domain::docker::ContainerEngine::Podman => {
+            "D=podman\nif ! podman info; then echo '当前用户的 Podman 运行环境未就绪'; exit 1; fi"
+        }
+    };
+    format!(
+        r#"{setup}
+C=
+for n in {list}; do
+  if $D inspect --format '{{{{.State.Running}}}}' "$n" 2>/dev/null | grep -q true; then C=$n; break; fi
+done
+if [ -z "$C" ]; then echo "没找到在运行的容器（{shown}），先在桌面端把这个 Bot 启动起来"; exit 1; fi
+exec $D exec -it "$C" sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'
+"#,
+        list = list.join(" "),
+    )
+}
+
+/// 目录说明行
+fn dir_line(label: &str, dir: &str) -> String {
+    format!("{label} · {dir}")
+}
+
+/// 标签名后面接主机名。实例名常常已经带了主机（新建时默认给的就是「麦麦 · 本机」这种），
+/// 带了就不再接一遍
+pub(super) fn with_host_label(name: &str, host_label: &str) -> String {
+    if name.contains(host_label) {
+        name.to_string()
+    } else {
+        format!("{name} · {host_label}")
+    }
+}
+
+/// 远端的起始位置
+enum RemoteStart {
+    Home,
+    /// 进第一个存在的目录，带上环境
+    Dir(Vec<String>),
+    /// 进容器（带 sudo 判断和按名字找）
+    Container(Vec<String>, ncd_domain::docker::ContainerEngine),
+}
+
+pub struct DesktopTerminalPlanner {
+    hosts: Arc<dyn HostResolver>,
+    servers: Arc<ServerManager>,
+    bots: Arc<dyn BotConfigPort>,
+    apps: Arc<AppManager>,
+    paths: DataPaths,
+    remote_shells: Mutex<HashMap<String, RemoteShellInfo>>,
+}
+
+impl DesktopTerminalPlanner {
+    pub fn new(
+        hosts: Arc<dyn HostResolver>,
+        servers: Arc<ServerManager>,
+        bots: Arc<dyn BotConfigPort>,
+        apps: Arc<AppManager>,
+        data_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            hosts,
+            servers,
+            bots,
+            apps,
+            paths: DataPaths::new(data_root),
+            remote_shells: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn resolve(&self, target: &RuntimeTarget) -> Result<Arc<dyn Host>, TerminalError> {
+        self.hosts
+            .resolve(target)
+            .await
+            .map_err(|e| TerminalError::Plan(format!("连不上主机：{e}")))
+    }
+
+    async fn profile(&self, server_id: &str) -> Option<ServerProfile> {
+        self.servers
+            .list_servers()
+            .await
+            .into_iter()
+            .find(|p| p.id == server_id)
+    }
+
+    fn server_label(profile: Option<&ServerProfile>, server_id: &str) -> String {
+        profile
+            .map(|p| {
+                if p.name.trim().is_empty() {
+                    p.host.clone()
+                } else {
+                    p.name.clone()
+                }
+            })
+            .unwrap_or_else(|| server_id.to_string())
+    }
+
+    async fn remote_shell(
+        &self,
+        host_id: &str,
+        host: &dyn Host,
+    ) -> Result<RemoteShellInfo, TerminalError> {
+        if let Some(info) = self.remote_shells.lock().await.get(host_id) {
+            return Ok(info.clone());
+        }
+        let out = host
+            .run_to_string(HostCommand::new("sh").arg("-c").arg(REMOTE_SHELL_PROBE))
+            .await
+            .map_err(|e| TerminalError::Plan(format!("探测远端 shell 失败：{e}")))?;
+        let info = parse_remote_shell_probe(&out.stdout);
+        self.remote_shells
+            .lock()
+            .await
+            .insert(host_id.to_string(), info.clone());
+        Ok(info)
+    }
+
+    /// Bash 的 rc 放数据根的缓存目录；写不了就退回普通登录 shell。
+    fn bash_rc_path(&self, git_bash: bool) -> Option<String> {
+        let dir = self.paths.cache_dir().join("terminal");
+        let file = dir.join("ncd-bashrc.sh");
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(
+            &file,
+            if git_bash {
+                git_bash_rc()
+            } else {
+                local_bash_rc()
+            },
+        )
+        .ok()?;
+        Some(if git_bash {
+            HostPath::from_windows(&file.to_string_lossy())
+                .as_posix()
+                .to_string()
+        } else {
+            file.to_string_lossy().into_owned()
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn local_plan(
+        &self,
+        host: Arc<dyn Host>,
+        request: &TerminalOpenRequest,
+        title: Option<String>,
+        cwd: Option<PathBuf>,
+        path_prefix: Vec<String>,
+        env: Vec<(String, String)>,
+        banner: Vec<String>,
+        snippets: Vec<TerminalSnippet>,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        let shells = detect_local_shells();
+        let shell = pick_shell(&shells, request.shell)
+            .ok_or_else(|| TerminalError::Plan("这台电脑上没找到能用的 shell".into()))?;
+        let rc = matches!(shell.kind, LocalShellKind::GitBash | LocalShellKind::Bash)
+            .then(|| self.bash_rc_path(shell.kind == LocalShellKind::GitBash))
+            .flatten();
+        let launch = launch_for(&shell, rc.as_deref());
+
+        let mut env_map = BTreeMap::new();
+        let windows = host.os() == ncd_host::Os::Windows;
+        let separator = if windows { ";" } else { ":" };
+        let base_path = fresh_local_path();
+        let path = if path_prefix.is_empty() {
+            base_path
+        } else {
+            format!("{}{separator}{base_path}", path_prefix.join(separator))
+        };
+        env_map.insert("PATH".to_string(), path);
+        env_map.extend(env);
+        env_map.extend(launch.env.clone());
+
+        let cwd = cwd.or_else(dirs::home_dir);
+        let cwd_display = cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+        Ok(TerminalLaunchPlan {
+            host,
+            host_id: ncd_domain::LOCAL_HOST_ID.to_string(),
+            host_label: "本机".to_string(),
+            host_os: if windows {
+                TerminalHostOs::Windows
+            } else {
+                TerminalHostOs::Linux
+            },
+            title: title.unwrap_or_else(|| format!("本机 · {}", shell.label)),
+            program: PtyProgram::Program {
+                program: launch.program,
+                args: launch.args,
+            },
+            cwd: cwd.map(|p| {
+                if windows {
+                    HostPath::from_windows(&p.to_string_lossy())
+                } else {
+                    HostPath::from_posix(p.to_string_lossy().into_owned())
+                }
+            }),
+            env: env_map,
+            cwd_display,
+            shell: Some(shell.kind),
+            features: TerminalFeatures {
+                files: true,
+                stats: false,
+                sudo_fill: false,
+                shell_integration: launch.integration,
+                external: true,
+            },
+            snippets,
+            banner,
+        })
+    }
+
+    /// `title_prefix`：标签名前半截，后面自动接主机名；None 时标签名就是主机名
+    #[allow(clippy::too_many_arguments)]
+    async fn remote_plan(
+        &self,
+        host: Arc<dyn Host>,
+        server_id: &str,
+        title_prefix: Option<String>,
+        start: RemoteStart,
+        path_prefix: Vec<String>,
+        env: Vec<(String, String)>,
+        mut banner: Vec<String>,
+        snippets: Vec<TerminalSnippet>,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        if host.os() == ncd_host::Os::Windows {
+            return self
+                .remote_windows_plan(
+                    host,
+                    server_id,
+                    title_prefix,
+                    start,
+                    path_prefix,
+                    env,
+                    banner,
+                    snippets,
+                )
+                .await;
+        }
+        let host_id = remote_host_id(server_id);
+        let info = self.remote_shell(&host_id, host.as_ref()).await?;
+        let profile = self.profile(server_id).await;
+        let host_label = Self::server_label(profile.as_ref(), server_id);
+        let title = match title_prefix {
+            Some(prefix) => with_host_label(&prefix, &host_label),
+            None => host_label.clone(),
+        };
+        let sudo_fill = self.servers.sudo_password(server_id).is_some();
+
+        let mut files = true;
+        let (program, integration, cwd_display) = match &start {
+            RemoteStart::Home if info.login_is_bash => {
+                let rc = bash_rc(&bash_env_section(&path_prefix, &env, &[]));
+                (
+                    PtyProgram::Script(remote_bash_exec_line(&rc, None)),
+                    true,
+                    info.home.clone(),
+                )
+            }
+            RemoteStart::Home => (PtyProgram::LoginShell, false, info.home.clone()),
+            RemoteStart::Dir(dirs) if !info.posix => {
+                banner.push(format!(
+                    "登录 shell 不是 bash 这一类，没法自动进目录、接环境；目录在 {}",
+                    dirs.first().map(String::as_str).unwrap_or("~")
+                ));
+                (PtyProgram::LoginShell, false, info.home.clone())
+            }
+            RemoteStart::Dir(dirs) => {
+                let first = dirs.first().cloned().unwrap_or_else(|| info.home.clone());
+                if info.has_bash {
+                    let rc = bash_rc(&bash_env_section(&path_prefix, &env, dirs));
+                    (
+                        PtyProgram::Script(remote_bash_exec_line(&rc, Some(&first))),
+                        true,
+                        first,
+                    )
+                } else {
+                    let section = bash_env_section(&path_prefix, &env, dirs);
+                    let script = format!("{section}exec \"${{SHELL:-/bin/sh}}\" -l\n");
+                    (PtyProgram::Script(script), false, first)
+                }
+            }
+            RemoteStart::Container(names, engine) => {
+                files = false;
+                if info.posix {
+                    (
+                        PtyProgram::Script(docker_exec_script(names, *engine)),
+                        false,
+                        info.home.clone(),
+                    )
+                } else {
+                    banner.push(format!(
+                        "登录 shell 不是 bash 这一类，没法自动进容器；手动 {} exec -it {} sh",
+                        engine.program(),
+                        names.first().map(String::as_str).unwrap_or_default()
+                    ));
+                    (PtyProgram::LoginShell, false, info.home.clone())
+                }
+            }
+        };
+        Ok(TerminalLaunchPlan {
+            host,
+            host_id,
+            host_label,
+            host_os: TerminalHostOs::Linux,
+            title,
+            program,
+            cwd: None,
+            env: BTreeMap::new(),
+            cwd_display: Some(cwd_display),
+            shell: None,
+            features: TerminalFeatures {
+                files,
+                stats: true,
+                sudo_fill,
+                shell_integration: integration,
+                external: false,
+            },
+            snippets,
+            banner,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn remote_windows_plan(
+        &self,
+        host: Arc<dyn Host>,
+        server_id: &str,
+        title_prefix: Option<String>,
+        start: RemoteStart,
+        path_prefix: Vec<String>,
+        env: Vec<(String, String)>,
+        banner: Vec<String>,
+        _snippets: Vec<TerminalSnippet>,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        let info = host
+            .remote_windows_info()
+            .await
+            .map_err(|e| TerminalError::Plan(e.to_string()))?;
+        let host_id = remote_host_id(server_id);
+        let profile = self.profile(server_id).await;
+        let host_label = Self::server_label(profile.as_ref(), server_id);
+        let title = title_prefix
+            .map(|prefix| with_host_label(&prefix, &host_label))
+            .unwrap_or_else(|| host_label.clone());
+        let cwd = match start {
+            RemoteStart::Home => HostPath::from_windows(&info.home_dir),
+            RemoteStart::Dir(dirs) => {
+                let mut found = None;
+                for dir in dirs {
+                    let path = HostPath::from_posix(&dir);
+                    if host
+                        .exists(&path)
+                        .await
+                        .map_err(|e| TerminalError::Host(e.to_string()))?
+                    {
+                        found = Some(path);
+                        break;
+                    }
+                }
+                found.unwrap_or_else(|| HostPath::from_windows(&info.home_dir))
+            }
+            RemoteStart::Container(_, _) => {
+                return Err(TerminalError::Unsupported(
+                    "Windows 主机的 Linux 容器终端需要单独的容器执行目标".into(),
+                ));
+            }
+        };
+        let prefix: Vec<String> = path_prefix
+            .iter()
+            .map(|p| HostPath::from_posix(p).render_for(ncd_host::Os::Windows))
+            .collect();
+        let path = ncd_appframework::node_tooling::target_path_env(host.as_ref(), &prefix)
+            .await
+            .map_err(|e| TerminalError::Host(e.to_string()))?;
+        let mut environment: BTreeMap<String, String> = env.into_iter().collect();
+        environment.insert("PATH".into(), path);
+        let args = super::integration::powershell_args();
+        Ok(TerminalLaunchPlan {
+            host,
+            host_id,
+            host_label,
+            host_os: TerminalHostOs::Windows,
+            title,
+            program: PtyProgram::Program {
+                program: "powershell.exe".into(),
+                args,
+            },
+            cwd: Some(cwd.clone()),
+            env: environment,
+            cwd_display: Some(cwd.render_for(ncd_host::Os::Windows)),
+            shell: None,
+            features: TerminalFeatures {
+                files: true,
+                stats: true,
+                sudo_fill: false,
+                shell_integration: true,
+                external: false,
+            },
+            snippets: vec![
+                TerminalSnippet::new("当前用户", "whoami"),
+                TerminalSnippet::new("进程", "Get-Process"),
+                TerminalSnippet::new("监听端口", "Get-NetTCPConnection -State Listen"),
+            ],
+            banner,
+        })
+    }
+}
+
+fn remote_host_id(server_id: &str) -> String {
+    format!("{}{server_id}", ncd_domain::REMOTE_HOST_ID_PREFIX)
+}
+
+/// POSIX 路径的上一级；`node` 这种裸名字没有
+fn posix_parent(path: &str) -> Option<String> {
+    let (dir, _) = path.rsplit_once('/')?;
+    (!dir.is_empty()).then(|| dir.to_string())
+}
+
+fn local_dir_prefix(dirs: &[&Path], exe: &str) -> Vec<String> {
+    dirs.iter()
+        .filter(|d| d.join(exe).is_file())
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect()
+}
+
+impl DesktopTerminalPlanner {
+    async fn plan_local_home(
+        &self,
+        request: &TerminalOpenRequest,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        let host = self.resolve(&RuntimeTarget::Local).await?;
+        self.local_plan(
+            host,
+            request,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    async fn plan_server(&self, server_id: &str) -> Result<TerminalLaunchPlan, TerminalError> {
+        let host = self
+            .resolve(&RuntimeTarget::Server(server_id.to_string()))
+            .await?;
+        self.remote_plan(
+            host,
+            server_id,
+            None,
+            RemoteStart::Home,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            linux_snippets(),
+        )
+        .await
+    }
+
+    async fn plan_app(
+        &self,
+        request: &TerminalOpenRequest,
+        instance_id: &str,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        let ctx = self
+            .apps
+            .terminal_context(&AppInstanceId::new(instance_id))
+            .await
+            .map_err(|e| TerminalError::Plan(e.to_string()))?;
+        let instance = &ctx.instance;
+        let dir = HostPath::from_posix(&instance.install_dir);
+        let profile = &ctx.profile;
+        match server_id_of_host(&instance.host_id) {
+            None => {
+                let style = PathStyle::for_os(ctx.host.os());
+                let local_dir = dir.render(style);
+                let mut banner = vec![dir_line(&ctx.framework_name, &local_dir)];
+                banner.extend(profile.hint.clone());
+                let prefix = profile
+                    .path_prefix
+                    .iter()
+                    .map(|p| p.render(style))
+                    .collect();
+                self.local_plan(
+                    Arc::clone(&ctx.host),
+                    request,
+                    Some(with_host_label(&instance.display_name, "本机")),
+                    Some(PathBuf::from(local_dir)),
+                    prefix,
+                    profile.env.clone(),
+                    banner,
+                    profile.snippets.clone(),
+                )
+            }
+            Some(server_id) => {
+                let mut banner = vec![dir_line(&ctx.framework_name, dir.as_posix())];
+                banner.extend(profile.hint.clone());
+                let prefix = profile
+                    .path_prefix
+                    .iter()
+                    .map(|p| p.as_posix().to_string())
+                    .collect();
+                self.remote_plan(
+                    Arc::clone(&ctx.host),
+                    server_id,
+                    Some(instance.display_name.clone()),
+                    RemoteStart::Dir(vec![dir.as_posix().to_string()]),
+                    prefix,
+                    profile.env.clone(),
+                    banner,
+                    profile.snippets.clone(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TerminalPlanner for DesktopTerminalPlanner {
+    async fn plan(
+        &self,
+        request: &TerminalOpenRequest,
+    ) -> Result<TerminalLaunchPlan, TerminalError> {
+        match &request.target {
+            TerminalTarget::Local => self.plan_local_home(request).await,
+            TerminalTarget::Server { server_id } => self.plan_server(server_id).await,
+            TerminalTarget::Bot { bot_id, host_dir } => {
+                self.plan_bot(request, bot_id, *host_dir).await
+            }
+            TerminalTarget::AppInstance { instance_id } => {
+                self.plan_app(request, instance_id).await
+            }
+        }
+    }
+
+    fn sudo_password(&self, host_id: &str) -> Option<String> {
+        server_id_of_host(host_id).and_then(|id| self.servers.sudo_password(id))
+    }
+
+    fn local_shells(&self) -> Vec<LocalShellOption> {
+        detect_local_shells()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_recognises_shell_kinds() {
+        let bash = parse_remote_shell_probe("/bin/bash\n/home/u\n/usr/bin/bash\n");
+        assert_eq!(
+            bash,
+            RemoteShellInfo {
+                posix: true,
+                login_is_bash: true,
+                has_bash: true,
+                home: "/home/u".into()
+            }
+        );
+        let fish = parse_remote_shell_probe("/usr/bin/fish\n/root\n/bin/bash\n");
+        assert!(!fish.posix);
+        assert!(fish.has_bash);
+        let alpine = parse_remote_shell_probe("/bin/ash\n/home/a\n");
+        assert!(alpine.posix);
+        assert!(!alpine.has_bash);
+        assert!(!alpine.login_is_bash);
+        let empty = parse_remote_shell_probe("");
+        assert_eq!(empty.home, "~");
+        assert!(empty.posix);
+    }
+
+    #[test]
+    fn docker_script_tries_each_name_and_escapes_templates() {
+        let script = docker_exec_script(
+            &["ncbot-1".into(), "slbot-1".into()],
+            ncd_domain::docker::ContainerEngine::Docker,
+        );
+        assert!(script.contains("for n in 'ncbot-1' 'slbot-1'; do"));
+        assert!(script.contains("--format '{{.State.Running}}'"));
+        assert!(script.contains("（ncbot-1 / slbot-1）"));
+        assert!(script.contains("exec $D exec -it \"$C\" sh -c"));
+    }
+
+    #[test]
+    fn podman_container_terminal_never_falls_back_to_docker_or_root_storage() {
+        let script = docker_exec_script(
+            &["ncbot-1".into()],
+            ncd_domain::docker::ContainerEngine::Podman,
+        );
+        assert!(script.contains("D=podman"));
+        assert!(script.contains("if ! podman info"));
+        assert!(!script.contains("docker"));
+        assert!(!script.contains("sudo"));
+    }
+
+    #[test]
+    fn title_skips_host_already_in_name() {
+        assert_eq!(with_host_label("麦麦 · 本机", "本机"), "麦麦 · 本机");
+        assert_eq!(
+            with_host_label("Karin · production", "production"),
+            "Karin · production"
+        );
+        assert_eq!(
+            with_host_label("AstrBot a1b2", "vps1"),
+            "AstrBot a1b2 · vps1"
+        );
+        assert_eq!(with_host_label("10001", "本机"), "10001 · 本机");
+    }
+
+    #[test]
+    fn posix_parent_of_node_bin() {
+        assert_eq!(
+            posix_parent("/home/u/snowluma-remote/workspace/node/bin/node"),
+            Some("/home/u/snowluma-remote/workspace/node/bin".into())
+        );
+        assert_eq!(posix_parent("node"), None);
+        assert_eq!(posix_parent("/node"), None);
+    }
+}

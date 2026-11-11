@@ -1,0 +1,571 @@
+// 远端页只管主机档案；组件部署走组件页。
+
+import React, { useRef, useState } from 'react';
+import {
+    Server,
+    RefreshCw,
+    Plus,
+    Eye,
+    EyeOff,
+    ShieldCheck,
+    ShieldAlert,
+    Import,
+} from 'lucide-react';
+import { useGSAP } from '@gsap/react';
+import { animateListChildrenEnter } from '../../shared/ui/motion/listEnter';
+import { Button, SecretField, Tooltip, TooltipTrigger, TooltipContent } from '../../shared/ui';
+import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogDescription,
+    DialogFooter,
+} from '../../shared/ui';
+import { ListItem, ActionMotionIcon, RESOURCE_MOTION, refreshMotion } from '../../shared/ui/motion';
+import { useMotion } from '../../hooks/preferences/useMotion';
+import { useServerManager } from '../../hooks/remote/useServerManager';
+import { pushInfoBar } from '../../hooks/ui/globalInfoBarStore';
+import { pushErrorBar } from '../../hooks/ui/pushErrorBar';
+import { errorText } from '../../core/domain/errors';
+import { ServerCard, serverCardGridClass } from './ServerCard';
+import { AddServerDialog } from './AddServerDialog';
+import { ImportSshConfigDialog } from './ImportSshConfigDialog';
+import { RemoteInventoryDialog } from './RemoteInventoryDialog';
+import type { RemotePathOverrides } from '../../core/ipc/generated/domain/RemotePathOverrides';
+import type { ServerProfile } from '../../core/ipc/generated/domain/ServerProfile';
+import type { HostKeyPrompt } from '../../core/ipc/generated/domain/HostKeyPrompt';
+import { CopyCodeBlock } from '../../shared/ui/CopyCodeBlock';
+import { PagePlaceholder } from '../../shared/ui/PagePlaceholder';
+
+function hostKeyVerifyCommand(prompt: HostKeyPrompt, windows = false): string {
+    const kind = prompt.keyKind.toLowerCase();
+    const file = kind.includes('ed25519')
+        ? '/etc/ssh/ssh_host_ed25519_key.pub'
+        : kind.includes('rsa')
+          ? '/etc/ssh/ssh_host_rsa_key.pub'
+          : '/etc/ssh/ssh_host_ecdsa_key.pub';
+    return windows
+        ? `ssh-keygen.exe -lf "$env:ProgramData\\ssh\\${file.split('/').pop()}"`
+        : `ssh-keygen -lf ${file}`;
+}
+
+export const RemoteHostPanelNext: React.FC = () => {
+    const {
+        servers,
+        isLoading,
+        refetch,
+        addServerAsync,
+        isAdding,
+        updateServer,
+        isUpdating,
+        deleteServer,
+        testConnectionAsync,
+        isTesting,
+        setupKeyAuth,
+        isSettingUpKey,
+        confirmHostKey,
+        refreshInventory,
+        isRefreshingInventory,
+        inventoryError,
+        updateServerAsync,
+    } = useServerManager();
+
+    // 表单弹窗：editingProfile=null 走新增，非空走编辑同一弹窗。
+    const [formOpen, setFormOpen] = useState(false);
+    const [importOpen, setImportOpen] = useState(false);
+    const [editingProfile, setEditingProfile] = useState<ServerProfile | null>(null);
+    const [testingId, setTestingId] = useState<string | null>(null);
+    const [revealIp, setRevealIp] = useState(false);
+    const [inventoryServer, setInventoryServer] = useState<ServerProfile | null>(null);
+
+    const openAdd = () => {
+        setEditingProfile(null);
+        setFormOpen(true);
+    };
+    const openEdit = (profile: ServerProfile) => {
+        setEditingProfile(profile);
+        setFormOpen(true);
+    };
+
+    // host key 首次确认弹窗:测试连接 / 配免密首连未知主机时弹出指纹,确认后写
+    // known_hosts 再重试原动作。retry 关联触发本次确认的动作(测试或配免密)。
+    const [hostKeyConfirm, setHostKeyConfirm] = useState<{
+        id: string;
+        prompt: HostKeyPrompt;
+        retry: () => void;
+    } | null>(null);
+
+    const handleTest = async (id: string, password?: string) => {
+        setTestingId(id);
+        try {
+            const report = await testConnectionAsync({ id, password });
+            // 测试结果通过 InfoBar 通知
+            if (report.success) {
+                pushInfoBar({
+                    tone: 'success',
+                    title: '连接成功',
+                    autoDismissMs: 3000,
+                });
+            } else if (report.hostKeyMismatch) {
+                // host key 不匹配的危险提示已由 hook 发出
+            } else if (report.hostKeyPrompt && !report.hostKeyMismatch) {
+                setHostKeyConfirm({
+                    id,
+                    prompt: report.hostKeyPrompt,
+                    retry: () => void handleTest(id, password),
+                });
+            } else {
+                // 连接失败已由 hook 发出红条
+            }
+        } catch {
+            // IPC 异常已由 hook onError 出红条
+        } finally {
+            setTestingId(null);
+        }
+    };
+
+    // 配置免密：先用密码测一次连接(验证密码 + 触发 host key TOFU 确认),通过后
+    // 才把公钥写进远端 authorized_keys。绝不在未校验 host key 的通道上写 key。
+    const runKeySetup = async (id: string, password: string) => {
+        let report;
+        try {
+            report = await testConnectionAsync({ id, password });
+        } catch {
+            return; // 连接 IPC 异常,hook 已出红条。
+        }
+        if (report.hostKeyMismatch) return; // 疑似中间人,hook 已出危险条,中止配免密。
+        if (report.hostKeyPrompt) {
+            setHostKeyConfirm({
+                id,
+                prompt: report.hostKeyPrompt,
+                retry: () => void runKeySetup(id, password),
+            });
+            return;
+        }
+        if (!report.success) return; // 密码 / 网络问题,hook 已出红条。
+
+        try {
+            const updated = await setupKeyAuth({ id, password });
+            pushInfoBar({
+                tone: 'success',
+                title: '免密登录已配置',
+                content: `${updated.name || updated.host} 之后用密钥连接，不再需要密码`,
+                autoDismissMs: 5000,
+            });
+        } catch (err) {
+            pushErrorBar({
+                title: '配置免密登录失败',
+                raw: errorText(err),
+            });
+        }
+    };
+
+    // 用户在指纹确认框点"信任并继续":写 known_hosts 后跑原动作的重试。
+    const onTrustHostKey = async () => {
+        const ctx = hostKeyConfirm;
+        if (!ctx) return;
+        setHostKeyConfirm(null);
+        try {
+            await confirmHostKey({
+                id: ctx.id,
+                keyKind: ctx.prompt.keyKind,
+                keyB64: ctx.prompt.keyB64,
+            });
+        } catch (err) {
+            pushErrorBar({
+                title: '信任主机指纹失败',
+                raw: errorText(err),
+            });
+            return;
+        }
+        ctx.retry();
+    };
+
+    // 已添加服务器卡片上点"配置免密"时，弹这个小框输入当前密码。
+    const [keyAuthTarget, setKeyAuthTarget] = useState<ServerProfile | null>(null);
+
+    return (
+        <div className="@container/remote-host flex min-h-0 min-w-0 flex-1 flex-col">
+            <header className="flex shrink-0 flex-wrap items-end justify-between gap-3 pb-4 pt-2">
+                <div>
+                    <p className="text-2xs uppercase tracking-widest text-text-tertiary">servers</p>
+                    <h1 className="font-display text-xl font-semibold text-text">远端主机</h1>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <button
+                                type="button"
+                                onClick={() => setRevealIp((v) => !v)}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-sm text-text-secondary transition-colors hover:bg-inset hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+                                aria-label={revealIp ? '隐藏 IP 信息' : '显示 IP 信息'}
+                            >
+                                <ActionMotionIcon icon={revealIp ? Eye : EyeOff} size={14} />
+                            </button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            {revealIp ? '隐藏 IP 信息' : '显示 IP 信息'}
+                        </TooltipContent>
+                    </Tooltip>
+                    <Button size="sm" variant="secondary" onClick={() => setImportOpen(true)}>
+                        <ActionMotionIcon icon={Import} size={14} />从 SSH 配置导入
+                    </Button>
+                    <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => refetch()}
+                        disabled={isLoading}
+                    >
+                        <ActionMotionIcon
+                            icon={RefreshCw}
+                            size={14}
+                            motion={refreshMotion(isLoading)}
+                        />
+                        刷新
+                    </Button>
+                </div>
+            </header>
+
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 pb-24 pt-1">
+                {isLoading && servers.length === 0 ? (
+                    <LoadingState />
+                ) : servers.length === 0 ? (
+                    <EmptyState onCreate={openAdd} onImport={() => setImportOpen(true)} />
+                ) : (
+                    <ServerGrid
+                        servers={servers}
+                        isTesting={isTesting}
+                        testingId={testingId}
+                        revealIp={revealIp}
+                        handleTest={handleTest}
+                        openEdit={openEdit}
+                        setKeyAuthTarget={setKeyAuthTarget}
+                        deleteServer={deleteServer}
+                        onInventory={setInventoryServer}
+                    />
+                )}
+            </div>
+
+            <FloatingAddButton onClick={openAdd} />
+
+            <ImportSshConfigDialog open={importOpen} onOpenChange={setImportOpen} />
+
+            <AddServerDialog
+                open={formOpen}
+                onOpenChange={setFormOpen}
+                isSubmitting={editingProfile ? isUpdating : isAdding}
+                initialProfile={editingProfile}
+                onSubmit={(profile, password, autoKey) => {
+                    if (editingProfile) {
+                        updateServer({ profile, password });
+                        setFormOpen(false);
+                        return;
+                    }
+                    setFormOpen(false);
+                    // 新增：先 add 拿到带 id 的档案；勾了自动免密就接着配。
+                    void addServerAsync({ profile, password })
+                        .then((created) => {
+                            if (autoKey && password) {
+                                void runKeySetup(created.id, password);
+                            }
+                        })
+                        .catch((err) => {
+                            pushErrorBar({
+                                title: '添加服务器失败',
+                                raw: errorText(err),
+                            });
+                        });
+                }}
+            />
+
+            <KeyAuthPasswordDialog
+                target={keyAuthTarget}
+                isSubmitting={isSettingUpKey}
+                onClose={() => setKeyAuthTarget(null)}
+                onConfirm={(password) => {
+                    const target = keyAuthTarget;
+                    setKeyAuthTarget(null);
+                    if (target) void runKeySetup(target.id, password);
+                }}
+            />
+
+            <HostKeyConfirmDialog
+                ctx={hostKeyConfirm}
+                onClose={() => setHostKeyConfirm(null)}
+                onTrust={() => void onTrustHostKey()}
+            />
+
+            <RemoteInventoryDialog
+                open={!!inventoryServer}
+                server={
+                    inventoryServer
+                        ? (servers.find((s) => s.id === inventoryServer.id) ?? inventoryServer)
+                        : null
+                }
+                isRefreshing={isRefreshingInventory}
+                isSaving={isUpdating}
+                error={inventoryError}
+                onOpenChange={(next) => {
+                    if (!next) setInventoryServer(null);
+                }}
+                onRefresh={() => {
+                    if (inventoryServer) void refreshInventory(inventoryServer.id);
+                }}
+                onSaveOverrides={(overrides: RemotePathOverrides) => {
+                    const current =
+                        servers.find((s) => s.id === inventoryServer?.id) ?? inventoryServer;
+                    if (!current) return;
+                    void updateServerAsync({
+                        profile: { ...current, pathOverrides: overrides },
+                    }).then(() => refreshInventory(current.id));
+                }}
+            />
+        </div>
+    );
+};
+
+// ─── 子件 ──────────────────────────────────────────────────────────────
+
+/// 服务器卡片网格 + stagger 进出场动画。卡片删除时走 ListItem 的 exit。
+function ServerGrid({
+    servers,
+    isTesting,
+    testingId,
+    revealIp,
+    handleTest,
+    openEdit,
+    setKeyAuthTarget,
+    deleteServer,
+    onInventory,
+}: {
+    servers: ServerProfile[];
+    isTesting: boolean;
+    testingId: string | null;
+    revealIp: boolean;
+    handleTest: (id: string, pw?: string) => void;
+    openEdit: (s: ServerProfile) => void;
+    setKeyAuthTarget: (s: ServerProfile | null) => void;
+    deleteServer: (id: string) => void;
+    onInventory: (s: ServerProfile) => void;
+}) {
+    const m = useMotion();
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    useGSAP(
+        () => {
+            const root = containerRef.current;
+            if (!root) return;
+            animateListChildrenEnter(root, servers.length, m);
+        },
+        { scope: containerRef, dependencies: [servers.length, m.enabled, m.level] },
+    );
+
+    return (
+        <div ref={containerRef} className={serverCardGridClass}>
+            {servers.map((server) => (
+                <ListItem key={server.id} hoverable>
+                    <ServerCard
+                        server={server}
+                        isTesting={isTesting && testingId === server.id}
+                        revealIp={revealIp}
+                        onTest={(pw) => handleTest(server.id, pw)}
+                        onEdit={() => openEdit(server)}
+                        onSetupKey={
+                            server.authMethod === 'password'
+                                ? () => setKeyAuthTarget(server)
+                                : undefined
+                        }
+                        onDelete={() => deleteServer(server.id)}
+                        onInventory={() => onInventory(server)}
+                    />
+                </ListItem>
+            ))}
+        </div>
+    );
+}
+
+function LoadingState() {
+    return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 py-20 text-text-tertiary">
+            <ActionMotionIcon icon={RefreshCw} size={20} motion="spin" />
+            <p className="text-sm">正在加载服务器档案…</p>
+        </div>
+    );
+}
+
+function EmptyState({ onCreate, onImport }: { onCreate: () => void; onImport: () => void }) {
+    return (
+        <PagePlaceholder className="gap-4">
+            <ActionMotionIcon
+                icon={Server}
+                size={32}
+                strokeWidth={1.6}
+                motion={RESOURCE_MOTION}
+                className="text-text-tertiary"
+            />
+            <div>
+                <p className="font-display text-md font-semibold text-text">还没有远端服务器</p>
+                <p className="mt-1 text-xs text-text-secondary">
+                    添加 SSH 服务器后，可在组件页把 NapCat 部署到远端。
+                </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+                <Button size="sm" variant="primary" onClick={onCreate}>
+                    添加服务器
+                </Button>
+                <Button size="sm" variant="secondary" onClick={onImport}>
+                    从 SSH 配置导入
+                </Button>
+            </div>
+        </PagePlaceholder>
+    );
+}
+
+function FloatingAddButton({ onClick }: { onClick: () => void }) {
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            className="float-above-terminal pointer-events-auto fixed bottom-8 right-8 z-30 inline-flex h-11 w-11 items-center justify-center rounded-full bg-brand text-white shadow-popover transition-all duration-150 hover:scale-105 hover:bg-brand-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+            aria-label="添加服务器"
+        >
+            <ActionMotionIcon icon={Plus} size={20} strokeWidth={2.4} />
+        </button>
+    );
+}
+
+// 已添加服务器配置免密时弹的密码输入框。只问当前 SSH 密码，确认后把公钥推到
+// 远端。关闭时保留最后一份目标，留给 Dialog 播完退场。
+function KeyAuthPasswordDialog({
+    target,
+    isSubmitting,
+    onClose,
+    onConfirm,
+}: {
+    target: ServerProfile | null;
+    isSubmitting: boolean;
+    onClose: () => void;
+    onConfirm: (password: string) => void;
+}) {
+    const [password, setPassword] = useState('');
+    React.useEffect(() => {
+        if (target) setPassword('');
+    }, [target]);
+
+    const retainedTarget = useRef(target);
+    if (target) retainedTarget.current = target;
+    const displayedTarget = target ?? retainedTarget.current;
+    if (!displayedTarget) return null;
+
+    return (
+        <Dialog open={!!target} onOpenChange={(o) => !o && onClose()}>
+            <DialogContent size="sm" dismissOnOutsideClick={false}>
+                <DialogHeader>
+                    <DialogTitle>配置免密登录</DialogTitle>
+                    <DialogDescription>
+                        输入 {displayedTarget.name || displayedTarget.host} 的当前 SSH
+                        密码。会用它连一次，把本机 密钥写进远端，之后免密码连接。
+                    </DialogDescription>
+                </DialogHeader>
+                <form
+                    onSubmit={(e) => {
+                        e.preventDefault();
+                        if (password) onConfirm(password);
+                    }}
+                    className="flex flex-col gap-3"
+                >
+                    <SecretField
+                        label="当前 SSH 密码"
+                        autoFocus
+                        value={password}
+                        onValueChange={setPassword}
+                        placeholder="SSH 密码"
+                        hint="仅用于本次写入远端 authorized_keys，不会在此处修改档案密码。"
+                    />
+                    <DialogFooter>
+                        <Button size="sm" variant="ghost" type="button" onClick={onClose}>
+                            取消
+                        </Button>
+                        <Button
+                            size="sm"
+                            variant="primary"
+                            type="submit"
+                            disabled={!password || isSubmitting}
+                        >
+                            {isSubmitting ? '配置中…' : '配置免密'}
+                        </Button>
+                    </DialogFooter>
+                </form>
+            </DialogContent>
+        </Dialog>
+    );
+}
+
+// 首次连接远端时弹出 host key 指纹让用户核对。这是 TOFU 信任边界:用户应把这里
+// 的 SHA256 指纹与服务器侧 `ssh-keygen -lf /etc/ssh/ssh_host_*.pub` 的输出核对一致
+// 再信任。确认后才写 known_hosts 并继续原动作(测试连接 / 配免密)。
+function HostKeyConfirmDialog({
+    ctx,
+    onClose,
+    onTrust,
+}: {
+    ctx: { id: string; prompt: HostKeyPrompt; retry: () => void } | null;
+    onClose: () => void;
+    onTrust: () => void;
+}) {
+    const retainedContext = useRef(ctx);
+    if (ctx) retainedContext.current = ctx;
+    const displayedContext = ctx ?? retainedContext.current;
+    if (!displayedContext) return null;
+    const { prompt } = displayedContext;
+    return (
+        <Dialog open={!!ctx} onOpenChange={(o) => !o && onClose()}>
+            <DialogContent size="sm" dismissOnOutsideClick={false}>
+                <DialogHeader>
+                    <DialogTitle>
+                        <span className="inline-flex items-center gap-2">
+                            <ShieldCheck size={16} className="text-brand" />
+                            确认主机指纹
+                        </span>
+                    </DialogTitle>
+                    <DialogDescription>
+                        首次连接 {prompt.host}:{prompt.port}。核对下方指纹与服务器真实 host key
+                        一致后再信任，避免中间人攻击窃取登录凭据。
+                    </DialogDescription>
+                </DialogHeader>
+                <div className="flex flex-col gap-2">
+                    <div className="rounded-sm bg-inset px-3 py-2">
+                        <p className="text-2xs uppercase tracking-wider text-text-tertiary">
+                            {prompt.keyKind}
+                        </p>
+                        <p className="mt-0.5 break-all font-mono text-xs text-text">
+                            {prompt.fingerprint}
+                        </p>
+                    </div>
+                    <p className="text-2xs text-text-tertiary">
+                        在服务器上执行下方命令，将输出中的 SHA256 与上方指纹比对一致后再信任。
+                    </p>
+                    <span className="text-2xs text-text-tertiary">Linux</span>
+                    <CopyCodeBlock command={hostKeyVerifyCommand(prompt)} />
+                    <span className="text-2xs text-text-tertiary">Windows PowerShell</span>
+                    <CopyCodeBlock command={hostKeyVerifyCommand(prompt, true)} />
+                    <p className="flex items-start gap-1.5 text-2xs leading-snug text-text-tertiary">
+                        <ShieldAlert size={13} className="mt-px shrink-0 text-warning" />
+                        <span>信任后写入 known_hosts；若日后指纹变更会阻断并提示疑似中间人。</span>
+                    </p>
+                </div>
+                <DialogFooter>
+                    <Button size="sm" variant="ghost" type="button" onClick={onClose}>
+                        取消
+                    </Button>
+                    <Button size="sm" variant="primary" type="button" onClick={onTrust}>
+                        信任并继续
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
+    );
+}
+
+export type { ServerProfile };

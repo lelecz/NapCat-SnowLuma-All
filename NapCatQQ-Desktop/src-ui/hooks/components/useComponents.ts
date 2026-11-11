@@ -1,0 +1,343 @@
+// Components 页面主 hook。
+//
+// 职责：
+//   1. 拉一次 list_components（react-query 缓存）
+//   2. 对每个 (component, host) 组合 detect_component，merge 成 ComponentRow[]
+//   3. 暴露 refetch / lastError 给 UI
+//
+// 主机来源策略：
+//   - Tauri 模式：当前后端没有 list_remote_hosts command，远端注册表 v1
+//     未实装；先只暴露本机 host。等后端把远端注册表接进来后扩成
+//     [local, ...listRemoteHosts()] 即可。
+//   - 浏览器预览：用 mockHosts 全集（local + 2 remote），便于演示多主机 UI。
+//
+// 错误分层：
+//   - catalogQuery 失败 = 整页爆，由 useComponentPageAlerts 推全局 InfoBar
+//   - 单个 detectQuery 失败 = 该行 unknown，由 useComponentPageAlerts 推 InfoBar（当前主机）
+//
+// frontend-layering：本 hook 唯一允许调 service 的位置。
+
+import { useQuery, useQueries, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
+import { useEffect, useMemo, useState } from 'react';
+import { isTauri, localOs } from '../../core/domain/runtime/env';
+import { componentService } from '../../core/services/component.service';
+import { isComponentHiddenByFeatures } from '../../core/domain/settings/features';
+import { useFeatures } from '../preferences/featureTogglesStore';
+import { serverService } from '../../core/services/server.service';
+import {
+    deriveStatus,
+    splitByCategory,
+    type ComponentRow,
+    type ComponentsView,
+    type HostInfo,
+} from '../../core/domain/components/types';
+import { errorText } from '../../core/domain/errors';
+import { mockHosts } from '../../core/domain/components/mockHosts';
+import type { ComponentId, ComponentInfo, ComponentDetectResult } from '../../core/ipc/types';
+import type { ServerProfile } from '../../core/ipc/generated/domain/ServerProfile';
+import { isHostReachableFromCache } from '../remote/useIsHostReachable';
+import { RUNTIME_READINESS_QUERY_KEY } from './useRuntimeReadiness';
+import { refreshComponentQueries } from './refreshComponentQueries';
+import { pushErrorBar } from '../ui/pushErrorBar';
+
+export function openComponentDirectory(componentId: ComponentId): void {
+    void componentService.openDirectory(componentId, 'local').catch((error) => {
+        pushErrorBar({
+            key: `open-component-directory:${componentId}`,
+            title: '无法打开目录',
+            raw: errorText(error),
+        });
+    });
+}
+
+type DetectQuery = UseQueryResult<ComponentDetectResult, Error>;
+
+/// Tauri 模式下从 ServerManager 拉服务器档案，组合本机 + 远端 host 列表。
+/// 浏览器预览用 mockHosts。
+function useKnownHosts(enabled = true): { hosts: HostInfo[]; servers: ServerProfile[] } {
+    const serversQuery = useQuery({
+        queryKey: ['servers'],
+        queryFn: () => serverService.list(),
+        enabled: isTauri && enabled,
+    });
+
+    const hosts = useMemo<HostInfo[]>(() => {
+        if (!isTauri) {
+            return mockHosts;
+        }
+        const local: HostInfo = {
+            host_id: 'local',
+            display_name: '本机',
+            os: localOs(),
+            locality: 'local',
+            // 本机无 transport 问题，显式标 connected 便于上层统一判断
+            state: 'connected',
+        };
+        const remotes: HostInfo[] = (serversQuery.data ?? []).map((p: ServerProfile) => ({
+            host_id: `remote:${p.id}`,
+            display_name: p.name || p.host,
+            os: p.platform === 'windows' ? 'windows' : 'linux',
+            locality: 'remote',
+            state: p.state,
+            health: p.health
+                ? {
+                      consecutiveFailures: p.health.consecutiveFailures,
+                      lastFailureReason: p.health.lastFailureReason ?? null,
+                      lastFailureAt: p.health.lastFailureAt ?? null,
+                  }
+                : undefined,
+        }));
+        return [local, ...remotes];
+    }, [serversQuery.data]);
+
+    return { hosts, servers: serversQuery.data ?? [] };
+}
+
+export interface UseComponentsResult {
+    view: ComponentsView;
+    /// 当前已知主机列表（本机 + 已连远端），给 Docker 卡片 / 部署形态复用。
+    hosts: HostInfo[];
+    isLoading: boolean;
+    /** 仅 catalog 加载失败才有值；detect 单点失败下沉到 row.status。 */
+    error: Error | null;
+    /// 触发整页重新拉一次。
+    refetch: () => void;
+}
+
+// 取数层：服务器列表 + 自动连接 + catalog + 逐主机 detect。
+//
+// 抽成独立 hook 让"组件页视图构建"和"启动期后台预热"共享同一套 query。
+// react-query 按 query key 去重 + 共享缓存，所以预热 hook 先把数据拉热，
+// 进页面的 useComponents 直接命中缓存秒开，不用再等一轮 SSH 探测。
+interface ComponentsData {
+    hosts: HostInfo[];
+    components: ComponentInfo[];
+    detectQueries: DetectQuery[];
+    catalogError: unknown;
+    catalogLoading: boolean;
+    refetch: () => void;
+}
+
+// 自动连接去重 + 失败冷却（避免 SSH 不可达时每秒重试刷日志）。
+const autoConnectInFlight = new Set<string>();
+const AUTO_CONNECT_COOLDOWN_MS = 90_000;
+const autoConnectCooldownUntil = new Map<string, number>();
+
+function autoConnectBlocked(serverId: string): boolean {
+    const until = autoConnectCooldownUntil.get(serverId) ?? 0;
+    return Date.now() < until;
+}
+
+interface ComponentsDataOptions {
+    // false 时整个取数层挂起（servers/catalog/detect 全不发请求）。
+    // DEV 预热跳过开关用它，避免条件调用 hooks 违反 rules-of-hooks。
+    enabled?: boolean;
+    // false 时只拉 servers/catalog，不发 detect / 不自动连远端。
+    // 启动预热先暖轻量缓存，idle 后再开探测，避免与首屏抢 IPC。
+    detectEnabled?: boolean;
+}
+
+function useComponentsData(options: ComponentsDataOptions = {}): ComponentsData {
+    const enabled = options.enabled ?? true;
+    const detectEnabled = options.detectEnabled ?? true;
+    const { hosts, servers } = useKnownHosts(enabled);
+    const queryClient = useQueryClient();
+
+    // 主机可达性：servers 列表已由 useKnownHosts 的同一 ['servers'] 查询拉到。
+    // 禁止在 for (hosts) 里调用 useIsHostReachable——远端档案从 0→N 时 hooks
+    // 数量会变，生产环境直接 React #311 白屏（splash 结束后闪一下崩掉）。
+    const hostReachability = useMemo(() => {
+        const map: Record<string, boolean> = {};
+        for (const h of hosts) {
+            map[h.host_id] = isHostReachableFromCache(h.host_id, servers);
+        }
+        return map;
+    }, [hosts, servers]);
+
+    // 自动连接：对所有 ServerState=disconnected/failed 的远端 host 触发一次
+    // test_server_connection（密码用 keyring 缓存）。后端 detect 命令内部也有
+    // resolve_host_with_autoconnect 兜底，本 effect 是双重保险。
+    //
+    // 去重用模块级 Set 而非实例 ref：预热 hook 和组件页可能同时挂载，两个实例
+    // 共享去重表才不会对同一台远端各发一次 testConnection（又退化成并发握手）。
+    useEffect(() => {
+        if (!isTauri || !detectEnabled) return;
+        for (const profile of servers) {
+            if (profile.state === 'connected' || profile.state === 'connecting') continue;
+            // 已失败的主机不自动重试，避免公钥/密码错误时刷 SSH 日志；用户去远端页手动测。
+            if (profile.state === 'failed') continue;
+            if (autoConnectBlocked(profile.id)) continue;
+            if (autoConnectInFlight.has(profile.id)) continue;
+            autoConnectInFlight.add(profile.id);
+            serverService
+                .testConnection(profile.id)
+                .then((report) => {
+                    if (report.success) {
+                        autoConnectCooldownUntil.delete(profile.id);
+                        queryClient.invalidateQueries({ queryKey: ['componentDetect'] });
+                        queryClient.invalidateQueries({ queryKey: [RUNTIME_READINESS_QUERY_KEY] });
+                        queryClient.invalidateQueries({ queryKey: ['servers'] });
+                    } else {
+                        autoConnectCooldownUntil.set(
+                            profile.id,
+                            Date.now() + AUTO_CONNECT_COOLDOWN_MS,
+                        );
+                    }
+                })
+                .catch(() => {
+                    autoConnectCooldownUntil.set(profile.id, Date.now() + AUTO_CONNECT_COOLDOWN_MS);
+                })
+                .finally(() => {
+                    autoConnectInFlight.delete(profile.id);
+                });
+        }
+    }, [servers, queryClient, detectEnabled]);
+
+    const catalogQuery = useQuery({
+        queryKey: ['componentCatalog'],
+        queryFn: componentService.listComponents,
+        staleTime: 5 * 60 * 1000,
+        enabled,
+    });
+
+    // 设置里关掉的组件（协议端、ncd-watch）不列也不探测，每台主机少几次远端命令
+    const features = useFeatures();
+    const components = useMemo(
+        () => (catalogQuery.data ?? []).filter((c) => !isComponentHiddenByFeatures(features, c.id)),
+        [catalogQuery.data, features],
+    );
+
+    // 对每个 (component, host) 发一个 detect。
+    // useQueries 让 react-query 自己管理缓存 + 并发；keys 稳定。
+    //
+    // 对远端主机，transport 不可达（state === 'failed'）时不发探测请求。
+    // enabled 由 hostReachability 控制。本机和可达远端正常探测。
+    const detectQueries = useQueries({
+        queries: components.flatMap((c) =>
+            hosts.map((h) => ({
+                queryKey: ['componentDetect', c.id, h.host_id],
+                queryFn: () => componentService.detectComponent(c.id, h.host_id),
+                enabled: detectEnabled && (hostReachability[h.host_id] ?? true),
+                staleTime: 30 * 1000,
+            })),
+        ),
+    });
+
+    return {
+        hosts,
+        components,
+        detectQueries,
+        catalogError: catalogQuery.error,
+        catalogLoading: catalogQuery.isLoading,
+        refetch: () => {
+            void refreshComponentQueries(queryClient);
+        },
+    };
+}
+
+// 启动期后台预热：App 根常驻。先拉 servers + catalog；idle（或短延迟）后再
+// 自动连远端与逐主机 detect，避免与 splash/首屏抢 IPC。永不卸载，保持缓存；
+// 进组件页时 useComponents 共享同一 query key。
+// dev 可设 VITE_SKIP_COMPONENTS_WARMUP=1 跳过整段预热，减轻 HMR 后 IPC 风暴。
+// skip 为构建期常量；不条件调用 hooks，而是把 enabled 传进取数层门控所有查询。
+export function useComponentsWarmup(): void {
+    const skip = import.meta.env.DEV && import.meta.env.VITE_SKIP_COMPONENTS_WARMUP === '1';
+
+    const [detectEnabled, setDetectEnabled] = useState(false);
+
+    useEffect(() => {
+        if (skip) return;
+        let cancelled = false;
+        const arm = () => {
+            if (!cancelled) setDetectEnabled(true);
+        };
+
+        const w = window as Window & {
+            requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+            cancelIdleCallback?: (id: number) => void;
+        };
+
+        if (typeof w.requestIdleCallback === 'function') {
+            const id = w.requestIdleCallback(arm, { timeout: 2500 });
+            return () => {
+                cancelled = true;
+                w.cancelIdleCallback?.(id);
+            };
+        }
+
+        const timer = window.setTimeout(arm, 800);
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timer);
+        };
+    }, [skip]);
+
+    useComponentsData({ enabled: !skip, detectEnabled: !skip && detectEnabled });
+}
+
+export function useComponents(): UseComponentsResult {
+    const { hosts, components, detectQueries, catalogError, catalogLoading, refetch } =
+        useComponentsData();
+
+    const view = useMemo<ComponentsView>(() => {
+        if (components.length === 0) {
+            return { framework: [], runtimeDep: [], selfApp: [] };
+        }
+
+        const hostCount = hosts.length;
+        const rows: ComponentRow[] = components.map((info, ci) => ({
+            info,
+            rows: hosts.map((host, hi) => {
+                const detectQuery = detectQueries[ci * hostCount + hi];
+                const detect = detectQuery?.data ?? null;
+                let status = deriveStatus(host, info, detect);
+
+                // detect 还在跑（首次加载或 invalidate 后重新拉）：状态改为
+                // "正在探测"，不要让 UI 一直显示"尚未探测"误以为出了错。
+                // isFetching 覆盖 isLoading + 重新拉取场景；只在 detect 为 null
+                // 时才覆盖，已经拿到 detect 数据后即使 isFetching 也保留旧值。
+                if (status.state === 'unknown' && detect === null && detectQuery?.isFetching) {
+                    status = {
+                        state: 'unknown',
+                        reason: '正在探测',
+                    };
+                }
+
+                // detect 真失败时把错误信息塞进 reason，让用户能看到具体原因
+                // （如 "自动连接被拒绝…" / "ssh connect timeout"）。后端返回的是
+                // Err(String)，invoke reject 出来是裸字符串而非 Error，必须走
+                // errorText 正规化，否则 (err as Error).message 取到 undefined
+                // 会把真因吞成空白。
+                if (status.state === 'unknown' && detectQuery?.error) {
+                    status = {
+                        state: 'unknown',
+                        reason: errorText(detectQuery.error, '探测失败'),
+                    };
+                }
+
+                return {
+                    component_id: info.id,
+                    host,
+                    status,
+                };
+            }),
+        }));
+
+        return splitByCategory(rows);
+    }, [components, hosts, detectQueries]);
+
+    // catalog 失败 = 整页爆。detect 单点失败下沉到 row，由页面 hook 转 InfoBar。
+    // catalogError 同样可能是裸字符串，正规化成带 message 的 Error，
+    // 让顶部 banner（读 error.message）能显示真因。
+    const error = catalogError ? new Error(errorText(catalogError, '加载组件清单失败')) : null;
+
+    const isLoading = catalogLoading || detectQueries.some((q) => q.isLoading);
+
+    return {
+        view,
+        hosts,
+        isLoading,
+        error,
+        refetch,
+    };
+}

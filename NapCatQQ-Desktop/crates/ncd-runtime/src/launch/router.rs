@@ -1,0 +1,696 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+
+use rand::RngCore;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+use crate::events::BroadcastEventBus;
+use crate::host_resolver::HostResolver;
+use crate::native_deployment_adapter::{
+    DockerDeploymentBackend, EventBusSink, RemoteNativeDeploymentBackend,
+};
+use ncd_backend_napcat::remote_native_launch::RemoteNativeLaunchTranslator;
+use ncd_backend_snowluma::remote_snowluma::{RemoteSnowLumaBackend, RemoteSnowLumaDaemon};
+use ncd_backend_snowluma::remote_snowluma_tunnel::RemoteSnowLumaTunnelRegistry;
+use ncd_deploy::remote_coordinator::RemoteQqEntryCoordinator;
+use ncd_deploy::{DockerDeployment, NativeDeployment};
+use ncd_domain::{
+    BackendType, BotConfig, BotConfigError, BotFlavor, BotId, RuntimeScenario, RuntimeTarget,
+};
+use ncd_host::{Host, Os};
+use ncd_traits::SecretStore;
+use ncd_traits::runtime_backend::BotBackend;
+
+pub(crate) type DockerQrLoginLocks = Arc<Mutex<HashMap<(String, u64), Arc<Mutex<()>>>>>;
+pub(crate) type RemoteSnowLumaInitLocks = Arc<Mutex<HashMap<String, Weak<RemoteSnowLumaInit>>>>;
+
+pub(crate) struct RemoteSnowLumaInit {
+    lock: Mutex<()>,
+    cancel: CancellationToken,
+}
+
+async fn remote_snowluma_init_lock(
+    locks: &RemoteSnowLumaInitLocks,
+    server_id: &str,
+) -> Arc<RemoteSnowLumaInit> {
+    let mut locks = locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(server_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(RemoteSnowLumaInit {
+        lock: Mutex::new(()),
+        cancel: CancellationToken::new(),
+    });
+    locks.insert(server_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+pub(crate) async fn cancel_remote_snowluma_initialization(
+    locks: &RemoteSnowLumaInitLocks,
+    server_id: Option<&str>,
+) {
+    let mut locks = locks.lock().await;
+    if let Some(server_id) = server_id {
+        if let Some(slot) = locks.remove(server_id).and_then(|slot| slot.upgrade()) {
+            slot.cancel.cancel();
+        }
+    } else {
+        for slot in locks.drain().filter_map(|(_, slot)| slot.upgrade()) {
+            slot.cancel.cancel();
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeRouterError {
+    #[error(transparent)]
+    Config(#[from] BotConfigError),
+    #[error("{0}")]
+    Render(String),
+    #[error("本机 SnowLuma backend 未注入，无法路由运行时")]
+    MissingLocalSnowLumaBackend,
+}
+
+#[derive(Clone)]
+pub(crate) struct DockerSecretProvider {
+    store: Option<Arc<dyn SecretStore + Send + Sync>>,
+}
+
+impl DockerSecretProvider {
+    pub fn new(store: Option<Arc<dyn SecretStore + Send + Sync>>) -> Self {
+        Self { store }
+    }
+
+    pub fn napcat_webui_token(&self, qq_id: u64) -> Result<String, RuntimeRouterError> {
+        self.get_or_create(qq_id, Self::napcat_webui_key, generate_docker_webui_token)
+    }
+
+    pub(crate) fn napcat_webui_key(qq_id: u64) -> String {
+        format!("bot:{qq_id}:napcat_docker_webui_token")
+    }
+
+    pub fn snowluma_vnc_passwd(&self, qq_id: u64) -> Result<String, RuntimeRouterError> {
+        self.get_or_create(
+            qq_id,
+            |id| format!("bot:{id}:snowluma_docker_vnc_passwd"),
+            generate_docker_password,
+        )
+    }
+
+    pub fn snowluma_webui_bootstrap(&self, qq_id: u64) -> Result<String, RuntimeRouterError> {
+        self.get_or_create(
+            qq_id,
+            |id| format!("bot:{id}:snowluma_docker_webui_bootstrap"),
+            generate_docker_password,
+        )
+    }
+
+    fn get_or_create(
+        &self,
+        qq_id: u64,
+        key_fn: fn(u64) -> String,
+        generate: fn() -> String,
+    ) -> Result<String, RuntimeRouterError> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            RuntimeRouterError::Render("Docker 部署需要凭据 secret store".to_string())
+        })?;
+        let key = key_fn(qq_id);
+        if let Some(existing) = store
+            .get(&key)
+            .map_err(|e| RuntimeRouterError::Render(e.to_string()))?
+        {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        let value = generate();
+        store
+            .put(&key, &value)
+            .map_err(|e| RuntimeRouterError::Render(e.to_string()))?;
+        Ok(value)
+    }
+}
+
+fn generate_docker_webui_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn generate_docker_password() -> String {
+    crate::snowluma::session::generate_strong_password(16)
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeBackendRouter {
+    local_backend: Arc<dyn BotBackend>,
+    local_snowluma_backend: Option<Arc<dyn BotBackend>>,
+    host_resolver: Option<Arc<dyn HostResolver>>,
+    docker_secrets: DockerSecretProvider,
+    event_bus: Arc<BroadcastEventBus>,
+    remote_snowluma_daemons: Arc<Mutex<HashMap<String, Arc<RemoteSnowLumaDaemon>>>>,
+    remote_snowluma_init_locks: RemoteSnowLumaInitLocks,
+    // 必须缓存:RemoteSnowLumaBackend.pollers 持有 status poller 句柄。
+    // 以前每次 start 新建 backend,函数返回后 Arc drop → poller Drop 补发
+    // Disconnected,UI 永远显示「QQ 已掉线」即使 WebUI 在线。
+    remote_snowluma_backends: Arc<Mutex<HashMap<String, Arc<RemoteSnowLumaBackend>>>>,
+    remote_snowluma_tunnels: Arc<RemoteSnowLumaTunnelRegistry>,
+    remote_qq_entry_coordinator: Arc<RemoteQqEntryCoordinator>,
+    /// 远端 NC 启动时注入探针（可选；未设则远端永不写 net-stats）
+    remote_metrics_injector: Option<Arc<crate::metrics::RuntimeRemoteMetricsInjector>>,
+    /// Docker bot 指标：本机 data_root + prefs（可选）
+    docker_metrics: Option<(std::path::PathBuf, crate::metrics::BotRuntimeMetricsPrefs)>,
+    server_manager: Option<Arc<crate::ServerManager>>,
+    /// 组件页、启动预检共用的库存副本;没接上时退回直接读档案 / 现探
+    remote_inventory: Option<Arc<crate::remote::inventory::RemoteInventoryService>>,
+    /// 本机 SnowLuma 数据根（app-config 固定密码），远端接管启动时读取
+    snowluma_data_root: Option<PathBuf>,
+    docker_qr_login_locks: DockerQrLoginLocks,
+    windows_bots: Arc<super::windows::WindowsBotRegistry>,
+}
+
+impl RuntimeBackendRouter {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        local_backend: Arc<dyn BotBackend>,
+        local_snowluma_backend: Option<Arc<dyn BotBackend>>,
+        host_resolver: Option<Arc<dyn HostResolver>>,
+        docker_secrets: DockerSecretProvider,
+        event_bus: Arc<BroadcastEventBus>,
+        remote_snowluma_daemons: Arc<Mutex<HashMap<String, Arc<RemoteSnowLumaDaemon>>>>,
+        remote_snowluma_backends: Arc<Mutex<HashMap<String, Arc<RemoteSnowLumaBackend>>>>,
+        remote_snowluma_tunnels: Arc<RemoteSnowLumaTunnelRegistry>,
+        remote_qq_entry_coordinator: Arc<RemoteQqEntryCoordinator>,
+    ) -> Self {
+        Self {
+            local_backend,
+            local_snowluma_backend,
+            host_resolver,
+            docker_secrets,
+            event_bus,
+            remote_snowluma_daemons,
+            remote_snowluma_init_locks: Arc::new(Mutex::new(HashMap::new())),
+            remote_snowluma_backends,
+            remote_snowluma_tunnels,
+            remote_qq_entry_coordinator,
+            remote_metrics_injector: None,
+            docker_metrics: None,
+            server_manager: None,
+            remote_inventory: None,
+            snowluma_data_root: None,
+            docker_qr_login_locks: Arc::new(Mutex::new(HashMap::new())),
+            windows_bots: Arc::new(super::windows::WindowsBotRegistry::default()),
+        }
+    }
+
+    pub fn with_remote_inventory(
+        mut self,
+        inventory: Arc<crate::remote::inventory::RemoteInventoryService>,
+    ) -> Self {
+        self.remote_inventory = Some(inventory);
+        self
+    }
+
+    pub(crate) fn with_remote_snowluma_init_locks(
+        mut self,
+        locks: RemoteSnowLumaInitLocks,
+    ) -> Self {
+        self.remote_snowluma_init_locks = locks;
+        self
+    }
+
+    pub(crate) fn with_windows_bots(
+        mut self,
+        registry: Arc<super::windows::WindowsBotRegistry>,
+    ) -> Self {
+        self.windows_bots = registry;
+        self
+    }
+
+    pub fn with_snowluma_data_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.snowluma_data_root = Some(path.into());
+        self
+    }
+
+    pub(crate) fn with_docker_qr_login_locks(mut self, locks: DockerQrLoginLocks) -> Self {
+        self.docker_qr_login_locks = locks;
+        self
+    }
+
+    pub fn with_server_manager(mut self, mgr: Arc<crate::ServerManager>) -> Self {
+        self.server_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_remote_metrics_injector(
+        mut self,
+        injector: Arc<crate::metrics::RuntimeRemoteMetricsInjector>,
+    ) -> Self {
+        self.remote_metrics_injector = Some(injector);
+        self
+    }
+
+    pub fn with_docker_metrics(
+        mut self,
+        local_data_root: impl Into<std::path::PathBuf>,
+        prefs: crate::metrics::BotRuntimeMetricsPrefs,
+    ) -> Self {
+        self.docker_metrics = Some((local_data_root.into(), prefs));
+        self
+    }
+
+    pub async fn backend_for_config(
+        &self,
+        config: &BotConfig,
+    ) -> Result<Arc<dyn BotBackend>, RuntimeRouterError> {
+        let scenario = RuntimeScenario::from_config(config)?;
+        self.backend_for_scenario(
+            &scenario,
+            config.bot.qq_id,
+            config.docker.as_ref().and_then(|s| s.engine),
+        )
+        .await
+    }
+
+    async fn backend_for_scenario(
+        &self,
+        scenario: &RuntimeScenario,
+        qq_id: u64,
+        engine: Option<ncd_domain::docker::ContainerEngine>,
+    ) -> Result<Arc<dyn BotBackend>, RuntimeRouterError> {
+        match scenario {
+            RuntimeScenario::LocalNative { backend } => self.local_backend_for(*backend),
+            RuntimeScenario::LocalDocker { backend }
+            | RuntimeScenario::RemoteDocker { backend, .. } => {
+                let target = match scenario.server_id() {
+                    Some(server_id) => RuntimeTarget::server(server_id),
+                    None => RuntimeTarget::Local,
+                };
+                let resolver = self
+                    .host_resolver
+                    .as_ref()
+                    .ok_or_else(|| RuntimeRouterError::Render("HostResolver 未初始化".into()))?;
+                let host = resolver
+                    .resolve(&target)
+                    .await
+                    .map_err(|error| RuntimeRouterError::Render(error.to_string()))?;
+                if host.os() != Os::Linux {
+                    return Err(RuntimeRouterError::Render(
+                        "Docker Bot 仅支持 Linux 主机".into(),
+                    ));
+                }
+                let host_key = scenario.server_id().unwrap_or("local").to_string();
+                let backend_id = BotId::new(format!("docker-{qq_id}"));
+                let flavor = BotFlavor::from(*backend);
+                let engine =
+                    engine.unwrap_or_else(|| ncd_deploy::docker::engine::engine_for(host.as_ref()));
+                let deployment: Arc<DockerDeployment> = match backend {
+                    BackendType::SnowLuma => {
+                        let vnc = self.docker_secrets.snowluma_vnc_passwd(qq_id)?;
+                        let webui = self.docker_secrets.snowluma_webui_bootstrap(qq_id)?;
+                        Arc::new(DockerDeployment::with_sl_secrets(vnc, webui).with_engine(engine))
+                    }
+                    BackendType::NapCat => {
+                        let token = self.docker_secrets.napcat_webui_token(qq_id)?;
+                        Arc::new(DockerDeployment::with_webui_token(token).with_engine(engine))
+                    }
+                };
+                let mut backend =
+                    DockerDeploymentBackend::new(deployment, host, backend_id, flavor);
+                if flavor == BotFlavor::SnowLuma {
+                    let enabled = self.snowluma_data_root.as_ref().is_some_and(|root| {
+                        ncd_backend_snowluma::snowluma::session::load_snowluma_app_config(root)
+                            .remote_qr_login_enabled
+                    });
+                    backend = backend.with_snowluma_qr_login(enabled);
+                    let lock = self
+                        .docker_qr_login_locks
+                        .lock()
+                        .await
+                        .entry((host_key, qq_id))
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone();
+                    backend = backend.with_qr_login_lock(lock);
+                }
+                if let Some((data_root, prefs)) = self.docker_metrics.clone() {
+                    backend = backend.with_metrics(data_root, prefs);
+                }
+                Ok(Arc::new(backend))
+            }
+            RuntimeScenario::RemoteNative { server_id, backend } => {
+                let host = self.resolve_remote_host(server_id).await?;
+                if host.os() == Os::Windows {
+                    let selected = self
+                        .ensure_inventory(server_id, host.as_ref())
+                        .await?
+                        .selected;
+                    let resolver = self.host_resolver.clone().ok_or_else(|| {
+                        RuntimeRouterError::Render("HostResolver 未初始化".into())
+                    })?;
+                    let data_root = self
+                        .remote_metrics_injector
+                        .as_ref()
+                        .map(|injector| injector.data_root().to_path_buf());
+                    let backend = self
+                        .windows_bots
+                        .backend(
+                            server_id,
+                            qq_id,
+                            *backend,
+                            resolver,
+                            Arc::clone(&self.event_bus),
+                            selected,
+                            data_root,
+                        )
+                        .await;
+                    return Ok(backend as Arc<dyn BotBackend>);
+                }
+                if host.os() != Os::Linux {
+                    return Err(RuntimeRouterError::Render(
+                        "远端「直接运行」目前仅支持 Linux SSH 主机。".to_string(),
+                    ));
+                }
+                match backend {
+                    BackendType::SnowLuma => {
+                        let backend = self
+                            .remote_snowluma_backend_for_server(server_id, Arc::clone(&host))
+                            .await?;
+                        Ok(backend as Arc<dyn BotBackend>)
+                    }
+                    BackendType::NapCat => {
+                        let coordinator = Arc::clone(&self.remote_qq_entry_coordinator);
+                        let backend_id = BotId::new(format!("remote-native-{qq_id}"));
+                        // 远端指标：上传探针 + 改 loadNapCat + 启动 env（失败不阻断）
+                        let metrics_injector = self.remote_metrics_injector.clone().map(|inj| {
+                            inj as Arc<
+                                dyn ncd_backend_napcat::remote_native_launch::RemoteMetricsInjector,
+                            >
+                        });
+                        let selected = self
+                            .ensure_inventory(server_id, host.as_ref())
+                            .await
+                            .ok()
+                            .map(|inv| inv.selected);
+                        let mut translator = RemoteNativeLaunchTranslator::new_with_metrics(
+                            Arc::clone(&host),
+                            BotFlavor::NapCat,
+                            server_id.to_string(),
+                            coordinator,
+                            metrics_injector,
+                        );
+                        if let Some(sel) = selected.clone() {
+                            translator = translator.with_selected(sel);
+                        }
+                        let event_sink: Arc<dyn ncd_deploy::NativeRuntimeEventSink> =
+                            Arc::new(EventBusSink::new(Arc::clone(&self.event_bus)));
+                        let deployment = Arc::new(NativeDeployment::new(
+                            Arc::new(translator),
+                            event_sink,
+                            None,
+                        ));
+                        let target = RuntimeTarget::server(server_id.to_string());
+                        let resolver = self.host_resolver.as_ref().ok_or_else(|| {
+                            RuntimeRouterError::Render("HostResolver 未初始化".to_string())
+                        })?;
+                        let mut backend = RemoteNativeDeploymentBackend::new(
+                            deployment,
+                            Arc::clone(resolver),
+                            target,
+                            backend_id,
+                            BotFlavor::NapCat,
+                        );
+                        if let Some(sel) = selected {
+                            backend = backend.with_selected(sel);
+                        }
+                        Ok(Arc::new(backend))
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn remote_snowluma_daemon_for_server(
+        &self,
+        server_id: &str,
+        host: Arc<dyn Host>,
+    ) -> Result<Arc<RemoteSnowLumaDaemon>, RuntimeRouterError> {
+        let sid = server_id.to_string();
+        let cached = self.remote_snowluma_daemons.lock().await.get(&sid).cloned();
+        if let Some(daemon) = cached {
+            self.refresh_remote_snowluma_host(&daemon, server_id, Arc::clone(&host))
+                .await?;
+            return Ok(daemon);
+        }
+        // A batch should probe a server's installation once. Keep other servers
+        // independent and release this guard on errors so a retry can initialize.
+        let init_lock = remote_snowluma_init_lock(&self.remote_snowluma_init_locks, &sid).await;
+        tokio::select! {
+        biased;
+        _ = init_lock.cancel.cancelled() => Err(RuntimeRouterError::Render("远端 SnowLuma 初始化已取消，请重试".into())),
+        result = async {
+        let _init = init_lock.lock.lock().await;
+        let cached = self.remote_snowluma_daemons.lock().await.get(&sid).cloned();
+        if let Some(daemon) = cached {
+            self.refresh_remote_snowluma_host(&daemon, server_id, Arc::clone(&host)).await?;
+            return Ok(daemon);
+        }
+        let daemon = if let Some(inv) = self.ensure_inventory(&sid, host.as_ref()).await.ok() {
+            let layout =
+                ncd_backend_snowluma::remote_snowluma_layout::layout_from_selected_or_probe(
+                    host.as_ref(),
+                    &inv.selected,
+                )
+                .await
+                .map_err(|e| RuntimeRouterError::Render(e.to_string()))?;
+            Arc::new(RemoteSnowLumaDaemon::from_layout(
+                sid.clone(),
+                Arc::clone(&host),
+                Arc::clone(&self.remote_snowluma_tunnels),
+                Arc::clone(&self.event_bus),
+                layout,
+            ))
+        } else {
+            Arc::new(
+                RemoteSnowLumaDaemon::new(
+                    sid.clone(),
+                    Arc::clone(&host),
+                    Arc::clone(&self.remote_snowluma_tunnels),
+                    Arc::clone(&self.event_bus),
+                )
+                .await
+                .map_err(|e| RuntimeRouterError::Render(e.to_string()))?,
+            )
+        };
+        // Do not hold the global registry lock across remote I/O.
+        let daemon = {
+            let initializing = self.remote_snowluma_init_locks.lock().await;
+            if !initializing.get(&sid).is_some_and(|slot| Weak::ptr_eq(slot, &Arc::downgrade(&init_lock))) {
+                return Err(RuntimeRouterError::Render("远端 SnowLuma 初始化已取消，请重试".into()));
+            }
+            let mut guard = self.remote_snowluma_daemons.lock().await;
+            Arc::clone(guard.entry(sid).or_insert(daemon))
+        };
+        self.refresh_remote_snowluma_host(&daemon, server_id, host).await?;
+        Ok(daemon)
+        } => result,
+        }
+    }
+
+    async fn refresh_remote_snowluma_host(
+        &self,
+        daemon: &RemoteSnowLumaDaemon,
+        server_id: &str,
+        host: Arc<dyn Host>,
+    ) -> Result<(), RuntimeRouterError> {
+        let expected = Arc::clone(&host);
+        daemon
+            .replace_host_if_current(host, async {
+                let current = if let Some(manager) = &self.server_manager {
+                    manager.get_host(server_id).await
+                } else if let Some(resolver) = &self.host_resolver {
+                    resolver
+                        .resolve(&RuntimeTarget::server(server_id.to_string()))
+                        .await
+                        .ok()
+                } else {
+                    // An explicitly injected Host has no external connection registry.
+                    Some(Arc::clone(&expected))
+                };
+                current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &expected))
+            })
+            .await
+            .map_err(|error| RuntimeRouterError::Render(error.to_string()))
+    }
+
+    /// 同 server 的远端 SL backend 单例:持有 per-bot status poller。
+    /// start / stop / bootstrap reconcile 必须走同一实例,否则 poller 会随
+    /// 临时 backend drop 被 dispose 并误发 Disconnected。
+    pub async fn remote_snowluma_backend_for_server(
+        &self,
+        server_id: &str,
+        host: Arc<dyn Host>,
+    ) -> Result<Arc<RemoteSnowLumaBackend>, RuntimeRouterError> {
+        let sid = server_id.to_string();
+        // Even a cached backend owns the daemon's SSH session. Refresh it before
+        // returning so reconnect/retry paths never reuse a poisoned Host handle.
+        let daemon = self
+            .remote_snowluma_daemon_for_server(server_id, Arc::clone(&host))
+            .await?;
+        {
+            let guard = self.remote_snowluma_backends.lock().await;
+            if let Some(backend) = guard.get(&sid) {
+                return Ok(Arc::clone(backend));
+            }
+        }
+        // backend 身份按 server 聚合(多 Bot 共享同一 daemon / 隧道 / poller 表)
+        let backend_id = BotId::new(format!("remote-sl-{sid}"));
+        let sl_metrics = self.remote_metrics_injector.clone().map(|inj| {
+            inj as Arc<dyn ncd_backend_snowluma::remote_snowluma::RemoteSlMetricsInjector>
+        });
+        let mut backend = RemoteSnowLumaBackend::new_with_metrics(
+            backend_id,
+            daemon,
+            Arc::clone(&self.event_bus),
+            Arc::clone(&self.remote_snowluma_tunnels),
+            Arc::clone(&self.remote_qq_entry_coordinator),
+            sl_metrics,
+        );
+        if let Some(root) = &self.snowluma_data_root {
+            backend = backend.with_snowluma_data_root(root.clone());
+        }
+        let backend = Arc::new(backend);
+        let mut guard = self.remote_snowluma_backends.lock().await;
+        // 双检:并发 start 时先到者胜,后来者复用
+        if let Some(existing) = guard.get(&sid) {
+            return Ok(Arc::clone(existing));
+        }
+        guard.insert(sid, Arc::clone(&backend));
+        Ok(backend)
+    }
+
+    pub async fn selected_for_server(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+    ) -> Option<ncd_domain::RemoteSelectedPaths> {
+        self.ensure_inventory(server_id, host)
+            .await
+            .ok()
+            .map(|inv| inv.selected)
+    }
+
+    pub(crate) async fn windows_snowluma_endpoint(
+        &self,
+        server: &str,
+    ) -> Option<(u16, String, u16)> {
+        self.windows_bots.snowluma_endpoint(server).await
+    }
+
+    async fn ensure_inventory(
+        &self,
+        server_id: &str,
+        host: &dyn Host,
+    ) -> Result<ncd_domain::RemoteInventory, RuntimeRouterError> {
+        if let Some(inventory) = &self.remote_inventory {
+            return inventory
+                .ensure(server_id, host, false)
+                .await
+                .map_err(RuntimeRouterError::Render);
+        }
+        let mgr = self.server_manager.as_ref();
+        let profile = if let Some(mgr) = mgr {
+            mgr.list_servers()
+                .await
+                .into_iter()
+                .find(|p| p.id == server_id)
+        } else {
+            None
+        };
+        let overrides = profile.as_ref().and_then(|p| p.path_overrides.as_ref());
+        let previous = profile.as_ref().and_then(|p| p.inventory.as_ref());
+        if let Some(inv) = previous {
+            if !crate::remote::inventory::inventory_is_stale(&inv.probed_at, chrono::Utc::now()) {
+                return Ok(inv.clone());
+            }
+        }
+        let inv = crate::remote::inventory::probe_remote_inventory(host, overrides, previous)
+            .await
+            .map_err(RuntimeRouterError::Render)?;
+        if let Some(mgr) = mgr {
+            let _ = mgr.set_inventory(server_id, inv.clone()).await;
+        }
+        Ok(inv)
+    }
+
+    async fn resolve_remote_host(
+        &self,
+        server_id: &str,
+    ) -> Result<Arc<dyn Host>, RuntimeRouterError> {
+        let resolver = self
+            .host_resolver
+            .as_ref()
+            .ok_or_else(|| RuntimeRouterError::Render("HostResolver 未初始化".to_string()))?;
+        resolver
+            .resolve(&RuntimeTarget::server(server_id.to_string()))
+            .await
+            .map_err(|e| RuntimeRouterError::Render(e.to_string()))
+    }
+
+    fn local_backend_for(
+        &self,
+        backend: BackendType,
+    ) -> Result<Arc<dyn BotBackend>, RuntimeRouterError> {
+        match backend {
+            BackendType::SnowLuma => self
+                .local_snowluma_backend
+                .clone()
+                .ok_or(RuntimeRouterError::MissingLocalSnowLumaBackend),
+            BackendType::NapCat => Ok(Arc::clone(&self.local_backend)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn snowluma_init_lock_is_shared_only_while_initialization_is_live() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let first = remote_snowluma_init_lock(&locks, "first").await;
+        let waiter = remote_snowluma_init_lock(&locks, "first").await;
+        assert!(Arc::ptr_eq(&first, &waiter));
+        let other = remote_snowluma_init_lock(&locks, "other").await;
+        assert!(!Arc::ptr_eq(&first, &other));
+        drop(first);
+        drop(waiter);
+
+        let retry = remote_snowluma_init_lock(&locks, "first").await;
+        assert_eq!(locks.lock().await.len(), 2);
+        drop(retry);
+        drop(other);
+        let next = remote_snowluma_init_lock(&locks, "next").await;
+        assert_eq!(locks.lock().await.len(), 1);
+        assert_eq!(Arc::strong_count(&next), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_initialization_detaches_the_old_generation_before_retry() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let old = remote_snowluma_init_lock(&locks, "server").await;
+        cancel_remote_snowluma_initialization(&locks, Some("server")).await;
+        assert!(old.cancel.is_cancelled());
+        let fresh = remote_snowluma_init_lock(&locks, "server").await;
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert!(!fresh.cancel.is_cancelled());
+        cancel_remote_snowluma_initialization(&locks, None).await;
+        assert!(fresh.cancel.is_cancelled());
+        assert!(locks.lock().await.is_empty());
+    }
+}

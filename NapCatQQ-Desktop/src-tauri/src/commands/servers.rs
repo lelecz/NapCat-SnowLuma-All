@@ -1,0 +1,195 @@
+//! Tauri 命令:远端主机 ServerProfile CRUD + test_connection
+//!
+//! 这层只管"档案"——服务器列表,连接测试,连接缓存组件部署走 components.rs
+//! 的 run_component_action(host_id = "remote:<server_id>")
+
+use std::sync::Arc;
+
+use ncd_host::Host;
+use ncd_runtime::{DiscoveredSshHost, ProbeReport, RemoteInventory, ServerProfile};
+use tauri::State;
+
+use crate::AppState;
+
+#[tauri::command]
+pub async fn list_servers(state: State<'_, AppState>) -> Result<Vec<ServerProfile>, String> {
+    Ok(state.server_manager.list_servers().await)
+}
+
+#[tauri::command]
+pub async fn get_remote_windows_info(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Option<ncd_domain::windows_remote::RemoteWindowsInfo>, String> {
+    let host = state.server_manager.ensure_connected(&server_id).await?;
+    if host.os() != ncd_host::Os::Windows {
+        return Ok(None);
+    }
+    host.remote_windows_info()
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn test_server_connection(
+    state: State<'_, AppState>,
+    id: String,
+    password: Option<String>,
+) -> Result<ProbeReport, String> {
+    let report = state
+        .server_manager
+        .test_connection(&id, password, true)
+        .await?;
+    if report.success {
+        if let Some(host) = state.server_manager.get_host(&id).await {
+            let host: Arc<dyn Host> = host;
+            let _ = state
+                .components
+                .inventory()
+                .ensure(&id, host.as_ref(), true)
+                .await;
+        }
+    }
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn refresh_remote_inventory(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<RemoteInventory, String> {
+    state.migrate_gate.ensure_idle()?;
+    let host = state
+        .server_manager
+        .ensure_connected(&server_id)
+        .await
+        .map_err(|e| format!("无法连接远端主机: {e}"))?;
+    state
+        .components
+        .inventory()
+        .ensure(&server_id, host.as_ref(), true)
+        .await
+}
+
+/// 用户在 host key 指纹确认弹窗点"信任"后调用:把这把 key 写进 known_hosts,
+/// 之后该主机连接走 TOFU 校验即可通过已有不同 key 记录(疑似中间人)时拒绝
+#[tauri::command]
+pub async fn confirm_server_host_key(
+    state: State<'_, AppState>,
+    id: String,
+    key_kind: String,
+    key_b64: String,
+) -> Result<(), String> {
+    state
+        .server_manager
+        .confirm_host_key(&id, &key_kind, &key_b64)
+        .await
+}
+
+#[tauri::command]
+pub async fn add_server(
+    state: State<'_, AppState>,
+    profile: ServerProfile,
+    password: Option<String>,
+) -> Result<ServerProfile, String> {
+    state.migrate_gate.ensure_idle()?;
+    state.server_manager.add_server(profile, password).await
+}
+
+#[tauri::command]
+pub async fn update_server(
+    state: State<'_, AppState>,
+    profile: ServerProfile,
+    password: Option<String>,
+) -> Result<ServerProfile, String> {
+    state.migrate_gate.ensure_idle()?;
+    state.server_manager.update_server(profile, password).await
+}
+
+/// 密码登录 → 自动配置免密:用密码连一次,把本地新生成的公钥写进远端
+/// authorized_keys,档案切到密钥认证成功后返回更新后的档案
+#[tauri::command]
+pub async fn setup_server_key_auth(
+    state: State<'_, AppState>,
+    id: String,
+    password: String,
+) -> Result<ServerProfile, String> {
+    state.migrate_gate.ensure_idle()?;
+    state.server_manager.setup_key_auth(&id, &password).await
+}
+
+#[tauri::command]
+pub async fn delete_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.migrate_gate.ensure_idle()?;
+    state.server_manager.delete_server(&id).await
+}
+
+/// 扫描本机 ~/.ssh/config（含 Include），列出可导入的 Host。
+/// 只读路径与 config 文本，不读私钥内容。
+#[tauri::command]
+pub async fn discover_local_ssh_hosts(
+    state: State<'_, AppState>,
+) -> Result<Vec<DiscoveredSshHost>, String> {
+    state.server_manager.discover_local_ssh_hosts().await
+}
+
+/// 扫描本地 ~/.ssh/ 下的标准命名私钥(id_ed25519 / id_ecdsa / id_rsa / id_dsa)
+/// 仅返回已存在的文件绝对路径,按现代算法优先级排序
+/// 不读取私钥内容,纯路径枚举——给 UI 做候选项下拉用
+#[tauri::command]
+pub async fn scan_local_ssh_keys() -> Result<Vec<String>, String> {
+    const STANDARD_KEY_NAMES: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
+
+    let ssh_dir = match dirs::home_dir() {
+        Some(home) => home.join(".ssh"),
+        None => return Ok(Vec::new()),
+    };
+    if !ssh_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for name in STANDARD_KEY_NAMES {
+        let candidate = ssh_dir.join(name);
+        if candidate.is_file() {
+            found.push(candidate.to_string_lossy().into_owned());
+        }
+    }
+    Ok(found)
+}
+
+/// 导入迁移：按 backend × deployment 拉取远端框架网络配置。
+/// 返回 None 表示远端没有可迁移的 onebot 文件。
+#[tauri::command]
+pub async fn fetch_imported_network(
+    state: State<'_, AppState>,
+    server_id: String,
+    qq_id: String,
+    backend: ncd_domain::BackendType,
+    deployment: ncd_domain::DeploymentType,
+    docker_name: Option<String>,
+) -> Result<Option<ncd_domain::ImportedNetworkConfig>, String> {
+    let profile = state
+        .server_manager
+        .list_servers()
+        .await
+        .into_iter()
+        .find(|p| p.id == server_id)
+        .ok_or_else(|| format!("远端主机不存在: {server_id}"))?;
+    let selected = profile
+        .inventory
+        .as_ref()
+        .map(|inv| &inv.selected)
+        .ok_or_else(|| "尚未发现该主机的安装库存，请先在导入对话框点「重新发现」".to_string())?;
+
+    let host = state.server_manager.get_live_host(&server_id).await?;
+    ncd_runtime::fetch_imported_network(
+        host.as_ref(),
+        selected,
+        backend,
+        deployment,
+        &qq_id,
+        docker_name.as_deref(),
+    )
+    .await
+}

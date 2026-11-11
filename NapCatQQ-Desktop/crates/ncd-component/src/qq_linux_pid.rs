@@ -1,0 +1,232 @@
+//! 一次进程快照确认 QQ 账号；单实例接管先认唯一主进程，再按需查其 Ptlogin。
+
+pub const LINUX_QQ_PROCESS_PROBE: &str = include_str!("../resources/qq-process.py");
+
+/// 生成 dash-safe 探测脚本。stdout 第一行是 pid，没有则空。
+///
+/// `allow_single_main_fallback`：导入接管（reconcile）专用兜底。远端自启的 QQ 常不带
+/// `-q`，ptlogin 口也可能没开，账号证据全拿不到；此时若整机只有一个 QQ 主进程在跑，
+/// 且调用方确认该主机只配置了这一个 native SL Bot，就把它当作目标实例。
+/// start / status / stop 路径必须传 false，不允许猜归因。
+pub fn linux_qq_running_pid_script(
+    qq_id: u64,
+    pid_file: Option<&str>,
+    qq_bin: Option<&str>,
+    allow_single_main_fallback: bool,
+) -> String {
+    let probe = ncd_host::shell_single_quote(include_str!("../resources/qq-running-pid.py"));
+    let args = [
+        qq_id.to_string(),
+        pid_file.unwrap_or_default().to_owned(),
+        qq_bin.unwrap_or_default().to_owned(),
+        if allow_single_main_fallback { "1" } else { "0" }.to_owned(),
+    ]
+    .iter()
+    .map(|value| ncd_host::shell_single_quote(value))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let fallback =
+        legacy_qq_running_pid_script(qq_id, pid_file, qq_bin, allow_single_main_fallback);
+    format!(
+        "if command -v python3 >/dev/null 2>&1; then\nexec python3 -I -B -c {probe} {args}\nfi\n{fallback}"
+    )
+}
+
+// Older NapCat hosts may not have Python; preserve their existing probe contract.
+fn legacy_qq_running_pid_script(
+    qq_id: u64,
+    pid_file: Option<&str>,
+    qq_bin: Option<&str>,
+    allow_single_main_fallback: bool,
+) -> String {
+    let pid_file = ncd_host::shell_single_quote(pid_file.unwrap_or(""));
+    let qq_bin = ncd_host::shell_single_quote(qq_bin.unwrap_or(""));
+    let allow_single = if allow_single_main_fallback { "1" } else { "0" };
+    format!(
+        r#"pidfile={pid_file}
+qqbin={qq_bin}
+qid='{qq_id}'
+allow_single='{allow_single}'
+if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)
+    case "$cmd" in
+      *"-q $qid"*|*-q"$qid"*|*"--qq $qid"*|*"--qq=$qid"*|*"--qq-id=$qid"*)
+        echo "$pid"
+        exit 0
+        ;;
+    esac
+  fi
+  rm -f "$pidfile"
+fi
+alive() {{
+  [ -n "$1" ] && [ "$1" != "0" ] && kill -0 "$1" 2>/dev/null
+}}
+is_helper() {{
+  case "$1" in *"--type="*) return 0 ;; esac
+  return 1
+}}
+collect_qq_pids() {{
+  pgrep -x qq 2>/dev/null
+  pgrep -x QQ 2>/dev/null
+  if [ -n "$qqbin" ] && [ -x "$qqbin" ]; then
+    for proc in /proc/[0-9]*; do
+      [ -d "$proc" ] || continue
+      pid=${{proc#/proc/}}
+      alive "$pid" || continue
+      exe=$(readlink -f "$proc/exe" 2>/dev/null || true)
+      [ "$exe" = "$qqbin" ] || continue
+      echo "$pid"
+    done
+  fi
+}}
+http_get() {{
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sk --max-time 2 \
+      -H 'Host: localhost.ptlogin2.qq.com' \
+      -H 'Referer: https://xui.ptlogin2.qq.com/' \
+      -H 'Cookie: pt_local_token=0' \
+      "$url" 2>/dev/null
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import ssl,urllib.request,sys
+ctx=ssl._create_unverified_context()
+req=urllib.request.Request(sys.argv[1], headers={{'Host':'localhost.ptlogin2.qq.com','Referer':'https://xui.ptlogin2.qq.com/','Cookie':'pt_local_token=0'}})
+try:
+    print(urllib.request.urlopen(req, context=ctx, timeout=2).read().decode('utf-8','replace'))
+except Exception:
+    pass" "$url" 2>/dev/null
+  fi
+}}
+fetch_ptlogin() {{
+  port="$1"
+  body=$(http_get "https://127.0.0.1:${{port}}/pt_get_uins?callback=ptui_getuins_CB&pt_local_tk=0")
+  [ -n "$body" ] || body=$(http_get "http://127.0.0.1:${{port}}/pt_get_uins?callback=ptui_getuins_CB&pt_local_tk=0")
+  echo "$body"
+}}
+pid_on_port() {{
+  port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E ":${{port}}[[:space:]]" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1
+    return
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -n tcp "$port" 2>/dev/null | awk '{{print $1; exit}}'
+  fi
+}}
+# cmdline 明确带账号（Desktop 冷启动）
+for pid in $(collect_qq_pids | awk 'NF && !a[$1]++'); do
+  alive "$pid" || continue
+  cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)
+  is_helper "$cmd" && continue
+  case "$cmd" in
+    *"-q $qid"*|*-q"$qid"*|*"--qq $qid"*|*"--qq=$qid"*|*"--qq-id=$qid"*)
+      echo "$pid"
+      exit 0
+      ;;
+  esac
+done
+# Ptlogin2：QQ NT 本机快捷登录口，不依赖 -q
+for port in 4301 4303 4305 4307 4309; do
+  body=$(fetch_ptlogin "$port")
+  [ -n "$body" ] || continue
+  if echo "$body" | grep -qE '"uin"[[:space:]]*:[[:space:]]*"?'"$qid"; then
+    pid=$(pid_on_port "$port")
+    if alive "$pid"; then
+      echo "$pid"
+      exit 0
+    fi
+  fi
+done
+# 主进程 cmdline 里出现该 UIN
+for pid in $(collect_qq_pids | awk 'NF && !a[$1]++'); do
+  alive "$pid" || continue
+  cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)
+  is_helper "$cmd" && continue
+  if echo "$cmd" | grep -qE "(^|[^0-9])$qid([^0-9]|$)"; then
+    echo "$pid"
+    exit 0
+  fi
+done
+# 单主进程兜底（allow_single=1 才启用）：无任何账号证据时，整机只有一个
+# QQ 主进程在跑就认它；多主进程不猜，避免把别的账号挂到目标 Bot 上
+if [ "$allow_single" = "1" ]; then
+  mains=
+  for pid in $(collect_qq_pids | awk 'NF && !a[$1]++'); do
+    alive "$pid" || continue
+    cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null || true)
+    is_helper "$cmd" && continue
+    mains="$mains $pid"
+  done
+  set -- $mains
+  if [ "$#" -eq 1 ] && alive "$1"; then
+    echo "$1"
+    exit 0
+  fi
+fi
+exit 0
+"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linux_qq_running_pid_script;
+
+    #[test]
+    fn script_uses_ptlogin_not_fixed_webui_port() {
+        let script = linux_qq_running_pid_script(
+            2703401480,
+            Some("/tmp/pid_bot_2703401480"),
+            Some("/root/Napcat/opt/QQ/qq"),
+            false,
+        );
+        assert!(script.contains("pt_get_uins"));
+        assert!(script.contains("4301"));
+        assert!(script.contains("pgrep -x qq"));
+        assert!(script.contains("-q $qid"));
+        assert!(!script.contains("5099"));
+        assert!(script.contains("2703401480"));
+    }
+
+    #[test]
+    fn script_escapes_quotes_in_paths() {
+        let script = linux_qq_running_pid_script(1, Some("/tmp/a'b"), Some("/opt/x'y"), false);
+        assert!(script.contains(r"pidfile='/tmp/a'\''b'"));
+        assert!(script.contains(r"qqbin='/opt/x'\''y'"));
+    }
+
+    #[test]
+    fn script_single_main_fallback_gated_by_flag() {
+        let on = linux_qq_running_pid_script(2703401480, None, None, true);
+        assert!(on.contains("allow_single='1'"));
+        assert!(on.contains("mains="));
+        let off = linux_qq_running_pid_script(2703401480, None, None, false);
+        assert!(off.contains("allow_single='0'"));
+    }
+
+    #[test]
+    fn script_pidfile_requires_account_evidence() {
+        let script = linux_qq_running_pid_script(
+            2707600964,
+            Some("/tmp/pid_bot_2707600964"),
+            Some("/opt/QQ/qq"),
+            false,
+        );
+        let pidfile_block = script
+            .split("alive()")
+            .next()
+            .expect("pidfile block precedes alive()");
+        assert!(
+            pidfile_block.contains("kill -0"),
+            "pidfile still needs a liveness check"
+        );
+        assert!(
+            pidfile_block.contains("-q") || pidfile_block.contains("qid"),
+            "stale pidfile must not win on kill -0 alone; cmdline must match qq id"
+        );
+    }
+}

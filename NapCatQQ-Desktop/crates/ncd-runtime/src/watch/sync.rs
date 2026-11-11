@@ -1,0 +1,1239 @@
+//! 为远端 server 组装 ncd-watch 的 notify.json,并经 Host 写入
+//!
+//! 对齐 Desktop 离线通知子集: Webhook + Email + 同机 OneBot + 登录探活凭据。
+
+use ncd_deploy::{DockerDeployment, bot_docker_container_name};
+use ncd_domain::bot_config::{BackendType, BotConfig, DeploymentType};
+use ncd_domain::docker::DockerDeploySpec;
+#[cfg(test)]
+use ncd_domain::kinds::RuntimeTarget;
+use ncd_domain::{
+    OfflineEmailSettings, OfflineOneBotSettings, OfflineWebhookChannel, OfflineWebhookSettings,
+    WebUiPollerSettings,
+};
+use ncd_host::{Host, HostPath};
+use ncd_watch::config::{
+    DesktopPresentFile, NotifyBotTarget, NotifyConfig, WATCH_PROTOCOL_V1, WatchOneBotMessenger,
+    WatchOneBotSettings, normalize_onebot_path,
+};
+
+pub use ncd_watch::config::NotifyConfig as WatchNotifyConfig;
+
+/// 组装 notify 时可选的 per-bot WebUI 凭据与 OneBot
+#[derive(Debug, Clone, Default)]
+pub struct WatchNotifyExtras {
+    /// bot_id(qq 字符串) -> (port, token)
+    pub webui_by_bot: std::collections::HashMap<String, (u16, String)>,
+    pub webhook_enabled: bool,
+    pub email_enabled: bool,
+    pub notify_on_recovered: bool,
+    pub email: OfflineEmailSettings,
+    pub onebot: OfflineOneBotSettings,
+}
+
+impl WatchNotifyExtras {
+    pub fn from_app(
+        poller: &WebUiPollerSettings,
+        email: OfflineEmailSettings,
+        onebot: OfflineOneBotSettings,
+        webui_by_bot: std::collections::HashMap<String, (u16, String)>,
+    ) -> Self {
+        Self {
+            webui_by_bot,
+            webhook_enabled: poller.offline_webhook_notice,
+            email_enabled: poller.offline_email_notice,
+            notify_on_recovered: poller.offline_notify_behavior.notify_on_recovered,
+            email,
+            onebot,
+        }
+    }
+}
+
+/// 从本机 Bot 列表筛出落在 `server_id` 上的目标
+pub fn bots_for_server<'a>(
+    server_id: &str,
+    bots: impl IntoIterator<Item = &'a BotConfig>,
+) -> Vec<&'a BotConfig> {
+    bots.into_iter()
+        .filter(|c| c.bot.runtime_target.server_id() == Some(server_id))
+        .collect()
+}
+
+/// Docker NapCat WebUI 宿主机端口: 6099 + (qq % 500)
+pub fn napcat_docker_webui_host_port(qq_id: u64) -> u16 {
+    DockerDeploySpec::napcat_default()
+        .with_host_port_offset(qq_id)
+        .host_port_for_container(6099)
+        .unwrap_or(6099)
+}
+
+fn is_any_addr(host: &str) -> bool {
+    matches!(host.trim(), "" | "0.0.0.0" | "::" | "[::]")
+}
+
+fn is_loopback_or_any(host: &str) -> bool {
+    let host = host.trim();
+    is_any_addr(host)
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+        || host.eq_ignore_ascii_case("localhost")
+}
+
+/// 从 Bot connect.httpServers 投影出 watch 在同一台主机上能连到的 OneBot HTTP 发送方
+///
+/// 直接运行:第一个监听在回环或通配地址上的服务 → `http://127.0.0.1:port`。
+/// Docker:派生配置会把回环监听改成通配地址，可通过宿主机发布口访问。
+/// 优先挑按部署规则映射到宿主机的那个;规则里没有就把 base_url 留空,带上容器名和
+/// 容器内端口,由 watch 发送前用 docker inspect 查实际映射(导入的容器常不按规则映射)。
+/// 其它 host 视为本机连不到,跳过。
+pub fn watch_onebot_messenger_from_bot(config: &BotConfig) -> Option<WatchOneBotMessenger> {
+    let bot_id = config.bot.qq_id.to_string();
+    let mut enabled = config
+        .connect
+        .http_servers
+        .iter()
+        .filter(|s| s.base.enable && s.port > 0);
+    match config.bot.deployment_type {
+        DeploymentType::Native => {
+            let server = enabled.find(|s| is_loopback_or_any(&s.host))?;
+            Some(WatchOneBotMessenger {
+                bot_id,
+                base_url: format!("http://127.0.0.1:{}", server.port),
+                path: normalize_onebot_path(&server.path),
+                access_token: server.base.token.clone(),
+                container_name: None,
+                container_port: None,
+            })
+        }
+        DeploymentType::Docker => {
+            let candidates: Vec<_> = enabled.filter(|s| is_loopback_or_any(&s.host)).collect();
+            let spec = DockerDeployment::build_spec(config);
+            let (server, host_port) = candidates
+                .iter()
+                .find_map(|s| spec.host_port_for_container(s.port).map(|p| (*s, Some(p))))
+                .or_else(|| candidates.first().map(|s| (*s, None)))?;
+            Some(WatchOneBotMessenger {
+                bot_id,
+                base_url: host_port
+                    .map(|p| format!("http://127.0.0.1:{p}"))
+                    .unwrap_or_default(),
+                path: normalize_onebot_path(&server.path),
+                access_token: server.base.token.clone(),
+                container_name: Some(spec.container_name.clone()),
+                container_port: Some(server.port),
+            })
+        }
+    }
+}
+
+/// 仅收录与 `server_id` 同机、且配置了可用 HTTP 的 messenger
+pub fn build_watch_onebot_for_server(
+    server_id: &str,
+    all_bots: &[BotConfig],
+    settings: &OfflineOneBotSettings,
+) -> WatchOneBotSettings {
+    let mut onebot = settings.clone();
+    onebot.normalize();
+    if !onebot.enabled {
+        return WatchOneBotSettings::default();
+    }
+    let mut messengers = Vec::new();
+    for mid in onebot.effective_messenger_ids() {
+        let Some(cfg) = all_bots.iter().find(|c| c.bot.qq_id.to_string() == mid) else {
+            continue;
+        };
+        if cfg.bot.runtime_target.server_id() != Some(server_id) {
+            continue;
+        }
+        if let Some(messenger) = watch_onebot_messenger_from_bot(cfg) {
+            messengers.push(messenger);
+        }
+    }
+    let targets = onebot.effective_target_ids();
+    let messenger_ids = onebot.effective_messenger_ids();
+    let event_endpoints: Vec<_> = messenger_ids
+        .iter()
+        .filter_map(|id| {
+            all_bots.iter().find(|c| {
+                c.bot.runtime_target.server_id() == Some(server_id)
+                    && c.bot.qq_id.to_string() == *id
+            })
+        })
+        .filter_map(watch_event_endpoint)
+        .collect();
+    let enabled = (!messengers.is_empty() && !targets.is_empty())
+        || (onebot.relogin.enabled
+            && !onebot.relogin.administrator_ids.is_empty()
+            && !event_endpoints.is_empty());
+    WatchOneBotSettings {
+        relogin: ncd_watch::relogin_config::WatchReloginConfig {
+            settings: onebot.relogin,
+            login_targets: Vec::new(),
+            event_endpoints,
+        },
+        enabled,
+        messengers,
+        target_type: onebot.target_type,
+        target_ids: targets,
+        message_template: onebot.message_template,
+    }
+}
+
+pub fn watch_event_endpoint(
+    config: &BotConfig,
+) -> Option<ncd_watch::relogin_config::WatchEventEndpoint> {
+    let docker = config.bot.deployment_type == DeploymentType::Docker;
+    let server = config.connect.websocket_servers.iter().find(|s| {
+        s.base.enable
+            && s.port > 0
+            && is_loopback_or_any(&s.host)
+            && matches!(s.role, ncd_domain::WsRole::Universal)
+    })?;
+    Some(ncd_watch::relogin_config::WatchEventEndpoint {
+        bot_id: config.bot.qq_id.to_string(),
+        port: server.port,
+        path: normalize_onebot_path(&server.path),
+        token: server.base.token.clone(),
+        container_name: docker
+            .then(|| bot_docker_container_name(config.bot.backend_type, config.bot.qq_id)),
+    })
+}
+
+/// 把 BotConfig 投影成 watch 探活目标。
+pub fn bot_to_notify_target(config: &BotConfig) -> NotifyBotTarget {
+    bot_to_notify_target_with_webui(config, None)
+}
+
+pub fn bot_to_notify_target_with_webui(
+    config: &BotConfig,
+    webui: Option<(u16, String)>,
+) -> NotifyBotTarget {
+    let qq = config.bot.qq_id;
+    let backend = match config.bot.backend_type {
+        BackendType::SnowLuma => "snowluma",
+        BackendType::NapCat => "napcat",
+    };
+    let deployment = match config.bot.deployment_type {
+        DeploymentType::Docker => "docker",
+        DeploymentType::Native => "native",
+    };
+
+    let (container_name, pid_file, process_match) = match config.bot.deployment_type {
+        DeploymentType::Docker => (
+            Some(bot_docker_container_name(config.bot.backend_type, qq)),
+            None,
+            None,
+        ),
+        DeploymentType::Native => {
+            // 勿以 `-q` 开头：旧 ncd-watch 调 `pgrep -f <pat>` 时 procps 会把 `-q` 当选项，
+            // 探活永远 offline。前缀用真实命令行片段，且新版 probe 另加 `--`。
+            let process_match = if qq > 0 {
+                Some(format!("no-sandbox -q {qq}$"))
+            } else {
+                None
+            };
+            (None, None, process_match)
+        }
+    };
+
+    // webui 为 (0, token) 表示 token 已知、容器实际映射的口还没拿到(会话隧道没开起来)
+    let (webui_port, webui_token, webui_port_guessed) = match (config.bot.backend_type, webui) {
+        (_, Some((port, token))) if port > 0 && !token.trim().is_empty() => {
+            (Some(port), Some(token), false)
+        }
+        (BackendType::NapCat, webui)
+            if matches!(config.bot.deployment_type, DeploymentType::Docker) =>
+        {
+            let token = webui.map(|(_, t)| t).filter(|t| !t.trim().is_empty());
+            (Some(napcat_docker_webui_host_port(qq)), token, true)
+        }
+        _ => (None, None, false),
+    };
+
+    NotifyBotTarget {
+        bot_id: qq.to_string(),
+        qq_id: qq,
+        bot_name: config.bot.name.clone(),
+        backend: backend.into(),
+        deployment: deployment.into(),
+        container_name,
+        pid_file,
+        process_match,
+        webui_port,
+        webui_token,
+        enabled: config.advanced.offline_notice,
+        webui_port_guessed,
+    }
+}
+
+/// 普通探活和重登共用远端主机端点;关闭重登仍需 SL daemon 凭据及 per-bot PID 绑定。
+pub fn apply_watch_login_targets(
+    notify: &mut NotifyConfig,
+    targets: &[ncd_watch::relogin_config::WatchLoginTarget],
+) {
+    for bot in &mut notify.bots {
+        if !bot.backend.eq_ignore_ascii_case("snowluma") {
+            continue;
+        }
+        let Some(target) = targets.iter().find(|target| target.bot_id == bot.bot_id) else {
+            continue;
+        };
+        if target.webui_port > 0 {
+            bot.webui_port = Some(target.webui_port);
+            bot.webui_port_guessed = false;
+        }
+        if !target.webui_secret.trim().is_empty() {
+            bot.webui_token = Some(target.webui_secret.clone());
+        }
+        if !bot.is_docker() {
+            bot.pid_file.clone_from(&target.pid_file);
+        }
+    }
+}
+
+pub fn build_notify_config(
+    server_id: &str,
+    bots: &[BotConfig],
+    webhook: &OfflineWebhookSettings,
+) -> NotifyConfig {
+    build_notify_config_with_extras(server_id, bots, webhook, &WatchNotifyExtras::default())
+}
+
+pub fn build_notify_config_with_extras(
+    server_id: &str,
+    bots: &[BotConfig],
+    webhook: &OfflineWebhookSettings,
+    extras: &WatchNotifyExtras,
+) -> NotifyConfig {
+    let mut settings = webhook.clone();
+    settings.normalize();
+    let webhooks: Vec<OfflineWebhookChannel> = settings
+        .effective_channels()
+        .into_iter()
+        .filter(|c| c.enabled && !c.url.trim().is_empty())
+        .collect();
+    let targets = bots_for_server(server_id, bots)
+        .into_iter()
+        .map(|c| {
+            let webui = extras.webui_by_bot.get(&c.bot.qq_id.to_string()).cloned();
+            bot_to_notify_target_with_webui(c, webui)
+        })
+        .collect();
+    // 旧调用未填 extras 时:有通道则 webhook 视为开启
+    let webhook_enabled = extras.webhook_enabled || !webhooks.is_empty();
+    let onebot = build_watch_onebot_for_server(server_id, bots, &extras.onebot);
+    NotifyConfig {
+        protocol: WATCH_PROTOCOL_V1,
+        server_id: Some(server_id.to_string()),
+        bots: targets,
+        webhooks,
+        webhook_enabled,
+        email_enabled: extras.email_enabled,
+        notify_on_recovered: extras.notify_on_recovered,
+        email: extras.email.clone(),
+        onebot,
+    }
+}
+
+/// 心跳/同步在 WebUI 端点尚未入内存表时,不要用空 port/token 覆盖远端已有凭据。
+/// 否则 Bot 重启后一段空窗内会把 notify.json 的 webui 清掉,登录踢号探活哑火。
+/// 按规则推出来的口也算没有:导入的容器可能映射到别的口,不能拿推测值冲掉之前拿到的真实口。
+pub fn merge_notify_preserve_webui(new: &mut NotifyConfig, prev: &NotifyConfig) {
+    for target in &mut new.onebot.relogin.login_targets {
+        let identity_unchanged = new
+            .bots
+            .iter()
+            .find(|b| b.bot_id == target.bot_id)
+            .zip(prev.bots.iter().find(|b| b.bot_id == target.bot_id))
+            .is_some_and(|(a, b)| a.backend == b.backend && a.deployment == b.deployment);
+        if !identity_unchanged {
+            continue;
+        }
+        if let Some(old) = prev
+            .onebot
+            .relogin
+            .login_targets
+            .iter()
+            .find(|t| t.bot_id == target.bot_id)
+        {
+            if target.webui_port == 0 {
+                target.webui_port = old.webui_port;
+            }
+            if target.webui_secret.is_empty() {
+                target.webui_secret.clone_from(&old.webui_secret);
+            }
+            if target.pid_file.is_none() {
+                target.pid_file.clone_from(&old.pid_file);
+            }
+            if target.expected_pid.is_none() {
+                target.expected_pid = old.expected_pid;
+            }
+            if target.container_name.is_none() {
+                target.container_name.clone_from(&old.container_name);
+            }
+            if target.container_webui_port.is_none() {
+                target.container_webui_port = old.container_webui_port;
+            }
+        }
+    }
+    for bot in &mut new.bots {
+        let Some(old) = prev.bots.iter().find(|b| {
+            b.bot_id == bot.bot_id && b.backend == bot.backend && b.deployment == bot.deployment
+        }) else {
+            continue;
+        };
+        if bot.backend.eq_ignore_ascii_case("snowluma") && bot.pid_file.is_none() {
+            bot.pid_file.clone_from(&old.pid_file);
+        }
+        let has_port = !bot.webui_port_guessed && bot.webui_port.filter(|p| *p > 0).is_some();
+        let has_token = bot
+            .webui_token
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_port && has_token {
+            continue;
+        }
+        if !has_port {
+            if let Some(p) = old.webui_port.filter(|p| *p > 0) {
+                bot.webui_port = Some(p);
+            }
+        }
+        if !has_token {
+            if let Some(t) = old
+                .webui_token
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                bot.webui_token = Some(t.to_string());
+            }
+        }
+    }
+}
+
+pub fn remote_watch_root(home: &str) -> HostPath {
+    if home.as_bytes().get(1) == Some(&b':') {
+        return HostPath::from_windows(home).join("ncd-watch");
+    }
+    HostPath::from_posix(format!("{}/ncd-watch", home.trim_end_matches('/')))
+}
+
+pub fn target_watch_home(host: &dyn Host, fallback: &str) -> Result<String, String> {
+    if host.os() == ncd_host::Os::Windows {
+        return host
+            .target_managed_root()
+            .map(|root| root.render(ncd_host::PathStyle::Windows))
+            .ok_or_else(|| "Windows user managed root is unavailable".into());
+    }
+    Ok(fallback.to_string())
+}
+
+pub async fn read_notify_json(host: &dyn Host, home: &str) -> Result<Option<NotifyConfig>, String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let path = remote_watch_root(home).join("config").join("notify.json");
+    let exists = host.exists(&path).await.map_err(|e| e.to_string())?;
+    if !exists {
+        return Ok(None);
+    }
+    let bytes = host.read_file(&path).await.map_err(|e| e.to_string())?;
+    let cfg = serde_json::from_slice(&bytes).map_err(|e| format!("parse notify.json: {e}"))?;
+    Ok(Some(cfg))
+}
+
+/// 写入远端 ncd-watch metrics.json（实例指标续采配置）
+pub async fn write_metrics_json(
+    host: &dyn Host,
+    home: &str,
+    metrics: &ncd_watch::WatchMetricsConfig,
+) -> Result<(), String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let root = remote_watch_root(home);
+    let config_dir = root.join("config");
+    host.create_dir_all(&config_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = config_dir.join("metrics.json");
+    let body = serde_json::to_vec_pretty(metrics).map_err(|e| e.to_string())?;
+    host.write_file(&path, &body)
+        .await
+        .map_err(|e| e.to_string())?;
+    if host.os() != ncd_host::Os::Windows {
+        let _ = host
+            .run_to_string(
+                ncd_host::HostCommand::new("chmod")
+                    .arg("600")
+                    .arg(path.as_posix()),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+/// 从 App 设置与该 host 上的 bot 列表组装 WatchMetricsConfig
+pub fn build_watch_metrics_config(
+    home: &str,
+    enabled: bool,
+    interval_ms: u64,
+    retention_days: u32,
+    bots: &[&BotConfig],
+) -> ncd_watch::WatchMetricsConfig {
+    let root = format!("{}/ncd-watch", home.trim_end_matches('/'));
+    let history_min = interval_ms.max(60_000) as u32;
+    let bots = bots
+        .iter()
+        .map(|c| {
+            let bot_id = c.bot.qq_id.to_string();
+            ncd_watch::WatchMetricsBot {
+                bot_id: bot_id.clone(),
+                qq_id: c.bot.qq_id,
+                stats_path: format!("{root}/metrics/{bot_id}/net-stats.json"),
+                history_path: format!("{root}/metrics/{bot_id}/history.jsonl"),
+            }
+        })
+        .collect();
+    ncd_watch::WatchMetricsConfig {
+        enabled,
+        sample_interval_ms: interval_ms.clamp(1000, 30_000) as u32,
+        retention_days: retention_days.clamp(1, 90),
+        history_min_interval_ms: history_min,
+        bots,
+    }
+    .clamp()
+}
+
+pub async fn write_notify_json(
+    host: &dyn Host,
+    home: &str,
+    notify: &NotifyConfig,
+) -> Result<(), String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let root = remote_watch_root(home);
+    let config_dir = root.join("config");
+    host.create_dir_all(&config_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = config_dir.join("notify.json");
+    if host.os() == ncd_host::Os::Windows {
+        if notify.onebot.relogin.settings.enabled {
+            use ncd_domain::windows_remote::*;
+            let response = host
+                .windows_agent_request(WindowsAgentRequest {
+                    v: 1,
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    action: WindowsAgentAction::Hello,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            if !matches!(response.result, WindowsAgentResult::Hello(ref status) if status.capabilities.iter().any(|feature| feature == ncd_watch::relogin_config::RELOGIN_CAPABILITY))
+            {
+                return Err("Windows Agent lacks the relogin watch capability".into());
+            }
+        }
+        let body = serde_json::to_vec_pretty(notify).map_err(|e| e.to_string())?;
+        let temporary = config_dir.join(format!(".notify-{}.json", uuid::Uuid::new_v4()));
+        host.write_file(&temporary, &body)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(error) = host.rename(&temporary, &path).await {
+            let _ = host.remove_file(&temporary).await;
+            return Err(error.to_string());
+        }
+        return Ok(());
+    }
+    let permissions = host
+        .run_to_string(
+            ncd_host::HostCommand::new("chmod")
+                .arg("700")
+                .arg(config_dir.as_posix()),
+        )
+        .await
+        .map_err(|_| "无法限制通知目录权限")?;
+    if !permissions.success() {
+        return Err("无法限制通知目录权限".into());
+    }
+    if notify.onebot.relogin.settings.enabled {
+        let binary = root.join("bin").join("ncd-watch");
+        let output = host
+            .run_to_string(
+                ncd_host::HostCommand::new(binary.as_posix())
+                    .arg("capabilities")
+                    .timeout(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .map_err(|_| "无法确认 watch 的重登能力，请先升级远端 ncd-watch")?;
+        #[derive(serde::Deserialize)]
+        struct Capabilities {
+            v: u32,
+            features: Vec<String>,
+        }
+        let capabilities = serde_json::from_str::<Capabilities>(&output.stdout).ok();
+        if !output.success()
+            || !capabilities.is_some_and(|c| {
+                c.v == 1
+                    && c.features
+                        .iter()
+                        .any(|f| f == ncd_watch::relogin_config::RELOGIN_CAPABILITY)
+            })
+        {
+            return Err("远端 ncd-watch 不支持重登通知，请先升级再同步".into());
+        }
+    }
+    let body = serde_json::to_vec_pretty(notify).map_err(|e| e.to_string())?;
+    let temporary = config_dir.join(&format!(".notify-{}.json", uuid::Uuid::new_v4()));
+    host.write_file(&temporary, &body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let permissions = host
+        .run_to_string(
+            ncd_host::HostCommand::new("chmod")
+                .arg("600")
+                .arg(temporary.as_posix()),
+        )
+        .await
+        .map_err(|_| "无法限制通知配置权限")?;
+    if !permissions.success() {
+        let _ = host.remove_file(&temporary).await;
+        return Err("无法限制通知配置权限".into());
+    }
+    if let Err(error) = host.rename(&temporary, &path).await {
+        let _ = host.remove_file(&temporary).await;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+pub async fn relogin_loaded(host: &dyn Host, home: &str) -> Result<Option<NotifyConfig>, String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let Some(config) = read_notify_json(host, home).await? else {
+        return Ok(None);
+    };
+    if !config.onebot.relogin.settings.enabled {
+        return Ok(None);
+    }
+    let path = remote_watch_root(home)
+        .join("state")
+        .join("relogin-status.json");
+    let bytes = host
+        .read_file(&path)
+        .await
+        .map_err(|_| "watch 尚未加载重登配置，请确认服务运行后重试")?;
+    if bytes.len() > 16384 {
+        return Err("watch 重登状态无效".into());
+    }
+    let status: ncd_watch::relogin_config::WatchReloginStatus =
+        serde_json::from_slice(&bytes).map_err(|_| "watch 重登状态无效")?;
+    let age = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(status.updated_at);
+    if status.v != 1
+        || !(0..=120).contains(&age)
+        || status.configuration
+            != ncd_watch::relogin_config::fingerprint(&config).map_err(|e| e.to_string())?
+    {
+        return Err("配置已写入，watch 尚未确认加载，请稍后重试".into());
+    }
+    Ok(Some(config))
+}
+
+/// 读旧 notify 合并 webui 后再写,避免心跳空窗擦掉登录探活凭据
+pub async fn write_notify_json_merged(
+    host: &dyn Host,
+    home: &str,
+    notify: &NotifyConfig,
+) -> Result<(), String> {
+    let mut merged = notify.clone();
+    if let Ok(Some(prev)) = read_notify_json(host, home).await {
+        merge_notify_preserve_webui(&mut merged, &prev);
+    }
+    write_notify_json(host, home, &merged).await
+}
+
+pub async fn write_desktop_present(
+    host: &dyn Host,
+    home: &str,
+    desktop_version: Option<&str>,
+) -> Result<(), String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let root = remote_watch_root(home);
+    let state_dir = root.join("state");
+    host.create_dir_all(&state_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = state_dir.join("desktop_present");
+    let body = DesktopPresentFile {
+        updated_at_unix: chrono::Utc::now().timestamp(),
+        desktop_version: desktop_version.map(|s| s.to_string()),
+    };
+    let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    host.write_file(&path, &bytes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Desktop 退出时删掉心跳文件,让 watch 立刻 allow_notify,不必干等 TTL。
+/// 文件缺失时 present 判定为 false(见 ncd-watch present.rs)。
+pub async fn clear_desktop_present(host: &dyn Host, home: &str) -> Result<(), String> {
+    let resolved_home = target_watch_home(host, home)?;
+    let home = resolved_home.as_str();
+    let path = remote_watch_root(home)
+        .join("state")
+        .join("desktop_present");
+    let exists = host.exists(&path).await.map_err(|e| e.to_string())?;
+    if !exists {
+        return Ok(());
+    }
+    host.remove_file(&path).await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ncd_domain::bot_config::{
+        AdvancedConfig, BotBasicConfig, ConnectConfig, HttpServerConfig, MessagePostFormat,
+        NetworkBaseFields,
+    };
+
+    fn sample_remote(server: &str, qq: u64) -> BotConfig {
+        BotConfig {
+            bot: BotBasicConfig {
+                name: format!("b{qq}"),
+                qq_id: qq,
+                music_sign_url: String::new(),
+                auto_restart_schedule: Default::default(),
+                offline_auto_restart: false,
+                runtime_target: RuntimeTarget::server(server),
+                backend_type: BackendType::NapCat,
+                deployment_type: DeploymentType::Docker,
+                snowluma_start_mode: None,
+                webui_password_takeover: false,
+            },
+            connect: ConnectConfig {
+                http_servers: vec![],
+                http_sse_servers: vec![],
+                http_clients: vec![],
+                websocket_servers: vec![],
+                websocket_clients: vec![],
+                plugins: vec![],
+            },
+            advanced: AdvancedConfig::default(),
+            docker: None,
+            status_command: None,
+        }
+    }
+
+    fn with_http(mut cfg: BotConfig, port: u16) -> BotConfig {
+        cfg.connect.http_servers.push(HttpServerConfig {
+            base: NetworkBaseFields {
+                enable: true,
+                name: "http".into(),
+                message_post_format: MessagePostFormat::Array,
+                token: "t".into(),
+                debug: false,
+            },
+            host: "0.0.0.0".into(),
+            port,
+            enable_cors: false,
+            enable_websocket: false,
+            path: "/".into(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn filters_server_bots() {
+        let bots = vec![sample_remote("s1", 1), sample_remote("s2", 2), {
+            let mut l = sample_remote("s1", 3);
+            l.bot.runtime_target = RuntimeTarget::Local;
+            l.bot.qq_id = 3;
+            l
+        }];
+        let got = bots_for_server("s1", &bots);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].bot.qq_id, 1);
+    }
+
+    #[test]
+    fn relogin_accepts_ws_only_messenger_and_does_not_require_legacy_targets() {
+        let mut bot = sample_remote("s1", 42);
+        bot.connect
+            .websocket_servers
+            .push(ncd_domain::WebsocketServerConfig {
+                base: NetworkBaseFields {
+                    enable: true,
+                    name: "watch".into(),
+                    message_post_format: MessagePostFormat::Array,
+                    token: "t".into(),
+                    debug: false,
+                },
+                host: "0.0.0.0".into(),
+                port: 3001,
+                report_self_message: false,
+                enable_force_push_event: false,
+                heart_interval: 30000,
+                path: "/".into(),
+                role: ncd_domain::WsRole::Universal,
+            });
+        let mut settings = OfflineOneBotSettings::default();
+        settings.enabled = true;
+        settings.messenger_bot_ids = vec!["42".into()];
+        settings.relogin.enabled = true;
+        settings.relogin.administrator_ids = vec![99];
+        let config = build_watch_onebot_for_server("s1", &[bot.clone()], &settings);
+        assert!(config.enabled);
+        assert_eq!(config.relogin.event_endpoints.len(), 1);
+        assert!(config.messengers.is_empty());
+        bot.connect.websocket_servers[0].role = ncd_domain::WsRole::Api;
+        assert!(watch_event_endpoint(&bot).is_none());
+        bot.connect.websocket_servers[0].role = ncd_domain::WsRole::Universal;
+        bot.connect.websocket_servers[0].host = "127.0.0.1".into();
+        assert_eq!(watch_event_endpoint(&bot).unwrap().port, 3001);
+        bot.connect.websocket_servers[0].host = "10.0.0.5".into();
+        assert!(watch_event_endpoint(&bot).is_none());
+    }
+
+    #[test]
+    fn merging_login_credentials_preserves_revocation_and_rejects_different_backend() {
+        use ncd_watch::relogin_config::WatchLoginTarget;
+        let mut old = build_notify_config(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+        );
+        old.onebot.relogin.login_targets.push(WatchLoginTarget {
+            bot_id: "9".into(),
+            webui_port: 5555,
+            webui_secret: "old".into(),
+            qr_enabled: true,
+            ..Default::default()
+        });
+        let mut new = old.clone();
+        new.onebot.relogin.login_targets[0] = WatchLoginTarget {
+            bot_id: "9".into(),
+            qr_enabled: false,
+            ..Default::default()
+        };
+        merge_notify_preserve_webui(&mut new, &old);
+        assert_eq!(new.onebot.relogin.login_targets[0].webui_secret, "old");
+        assert!(!new.onebot.relogin.login_targets[0].qr_enabled);
+        new.bots[0].backend = "snowluma".into();
+        new.onebot.relogin.login_targets[0].webui_secret.clear();
+        merge_notify_preserve_webui(&mut new, &old);
+        assert!(new.onebot.relogin.login_targets[0].webui_secret.is_empty());
+        assert!(!new.bots[0].enabled);
+    }
+
+    #[test]
+    fn snowluma_notify_credentials_and_pid_bindings_do_not_require_relogin() {
+        use ncd_watch::relogin_config::WatchLoginTarget;
+        let mut a = sample_remote("s1", 11);
+        a.bot.backend_type = BackendType::SnowLuma;
+        a.bot.deployment_type = DeploymentType::Native;
+        let mut b = a.clone();
+        b.bot.qq_id = 22;
+        let mut notify = build_notify_config("s1", &[a, b], &OfflineWebhookSettings::default());
+        apply_watch_login_targets(
+            &mut notify,
+            &[11, 22].map(|qq| WatchLoginTarget {
+                bot_id: qq.to_string(),
+                webui_port: 5099,
+                webui_secret: "daemon-password".into(),
+                pid_file: Some(format!("/home/sl/run/{qq}.pid")),
+                ..Default::default()
+            }),
+        );
+        assert!(!notify.onebot.relogin.settings.enabled);
+        assert!(notify.onebot.relogin.login_targets.is_empty());
+        for bot in &notify.bots {
+            assert_eq!(bot.webui_port, Some(5099));
+            assert_eq!(bot.webui_token.as_deref(), Some("daemon-password"));
+            assert_eq!(
+                bot.pid_file.as_deref(),
+                Some(format!("/home/sl/run/{}.pid", bot.bot_id).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn snowluma_docker_notify_uses_host_mapping_and_preserves_credentials_in_restart_gap() {
+        use ncd_watch::relogin_config::WatchLoginTarget;
+        let mut cfg = sample_remote("s1", 11);
+        cfg.bot.backend_type = BackendType::SnowLuma;
+        let mut old = build_notify_config("s1", &[cfg.clone()], &OfflineWebhookSettings::default());
+        apply_watch_login_targets(
+            &mut old,
+            &[WatchLoginTarget {
+                bot_id: "11".into(),
+                webui_port: 15555,
+                webui_secret: "password".into(),
+                container_name: Some("slbot-11".into()),
+                container_webui_port: Some(5099),
+                ..Default::default()
+            }],
+        );
+        let mut next = build_notify_config("s1", &[cfg], &OfflineWebhookSettings::default());
+        merge_notify_preserve_webui(&mut next, &old);
+        assert_eq!(next.bots[0].webui_port, Some(15555));
+        assert_eq!(next.bots[0].webui_token.as_deref(), Some("password"));
+        assert!(next.bots[0].pid_file.is_none());
+        next.bots[0].backend = "napcat".into();
+        next.bots[0].webui_port = None;
+        next.bots[0].webui_token = None;
+        merge_notify_preserve_webui(&mut next, &old);
+        assert!(next.bots[0].webui_port.is_none());
+        assert!(next.bots[0].webui_token.is_none());
+    }
+
+    #[test]
+    fn snowluma_native_restart_gap_preserves_pid_binding() {
+        let mut cfg = sample_remote("s1", 11);
+        cfg.bot.backend_type = BackendType::SnowLuma;
+        cfg.bot.deployment_type = DeploymentType::Native;
+        let mut old = build_notify_config("s1", &[cfg.clone()], &OfflineWebhookSettings::default());
+        old.bots[0].webui_port = Some(5099);
+        old.bots[0].webui_token = Some("password".into());
+        old.bots[0].pid_file = Some("/home/sl/run/11.pid".into());
+        let mut next = build_notify_config("s1", &[cfg], &OfflineWebhookSettings::default());
+        merge_notify_preserve_webui(&mut next, &old);
+        assert_eq!(
+            next.bots[0].pid_file.as_deref(),
+            Some("/home/sl/run/11.pid")
+        );
+        assert_eq!(next.bots[0].webui_token.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn build_notify_includes_webhook_channels() {
+        let bots = vec![sample_remote("s1", 9)];
+        let mut wh = OfflineWebhookSettings::default();
+        wh.url = "https://example.invalid/h".into();
+        let n = build_notify_config("s1", &bots, &wh);
+        assert_eq!(n.bots.len(), 1);
+        assert_eq!(n.bots[0].container_name.as_deref(), Some("ncbot-9"));
+        assert!(n.webhook_enabled);
+    }
+
+    #[test]
+    fn docker_targets_use_flavor_container_names() {
+        let nc = sample_remote("s1", 10001);
+        let mut sl = sample_remote("s1", 10002);
+        sl.bot.backend_type = BackendType::SnowLuma;
+        let t_nc = bot_to_notify_target(&nc);
+        let t_sl = bot_to_notify_target(&sl);
+        assert_eq!(t_nc.container_name.as_deref(), Some("ncbot-10001"));
+        assert_eq!(t_sl.container_name.as_deref(), Some("slbot-10002"));
+        assert_eq!(t_nc.webui_port, Some(napcat_docker_webui_host_port(10001)));
+    }
+
+    #[test]
+    fn native_targets_use_per_qq_process_match() {
+        let mut a = sample_remote("s1", 11);
+        a.bot.deployment_type = DeploymentType::Native;
+        let mut b = sample_remote("s1", 22);
+        b.bot.deployment_type = DeploymentType::Native;
+        b.bot.backend_type = BackendType::SnowLuma;
+        let ta = bot_to_notify_target(&a);
+        let tb = bot_to_notify_target(&b);
+        assert_eq!(ta.process_match.as_deref(), Some("no-sandbox -q 11$"));
+        assert_eq!(tb.process_match.as_deref(), Some("no-sandbox -q 22$"));
+    }
+
+    #[test]
+    fn merge_preserves_webui_when_new_missing() {
+        let mut prev = build_notify_config(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+        );
+        prev.bots[0].webui_port = Some(61061);
+        prev.bots[0].webui_token = Some("old-tok".into());
+
+        let mut next = build_notify_config(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+        );
+        // Docker sample may synthesize port; clear both to simulate restart gap
+        next.bots[0].webui_port = None;
+        next.bots[0].webui_token = None;
+
+        merge_notify_preserve_webui(&mut next, &prev);
+        assert_eq!(next.bots[0].webui_port, Some(61061));
+        assert_eq!(next.bots[0].webui_token.as_deref(), Some("old-tok"));
+    }
+
+    #[test]
+    fn merge_prefers_fresh_webui_over_stale() {
+        let mut prev = build_notify_config(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+        );
+        prev.bots[0].webui_port = Some(11111);
+        prev.bots[0].webui_token = Some("stale".into());
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("9".into(), (22222, "fresh".into()));
+        let extras = WatchNotifyExtras {
+            webui_by_bot: map,
+            ..WatchNotifyExtras::default()
+        };
+        let mut next = build_notify_config_with_extras(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+            &extras,
+        );
+        merge_notify_preserve_webui(&mut next, &prev);
+        assert_eq!(next.bots[0].webui_port, Some(22222));
+        assert_eq!(next.bots[0].webui_token.as_deref(), Some("fresh"));
+    }
+
+    fn extras_with_webui(qq: &str, port: u16, token: &str) -> WatchNotifyExtras {
+        let mut map = std::collections::HashMap::new();
+        map.insert(qq.into(), (port, token.into()));
+        WatchNotifyExtras {
+            webui_by_bot: map,
+            ..WatchNotifyExtras::default()
+        }
+    }
+
+    #[test]
+    fn guessed_docker_port_does_not_overwrite_known_port() {
+        // 导入的容器映射到 16099;桌面端刚启动、隧道还没开时只知道 token
+        let mut prev = build_notify_config_with_extras(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+            &extras_with_webui("9", 16099, "tok"),
+        );
+        prev.bots[0].webui_port_guessed = false;
+
+        let mut next = build_notify_config_with_extras(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+            &extras_with_webui("9", 0, "tok"),
+        );
+        assert!(next.bots[0].webui_port_guessed);
+        assert_eq!(
+            next.bots[0].webui_port,
+            Some(napcat_docker_webui_host_port(9))
+        );
+        assert_eq!(next.bots[0].webui_token.as_deref(), Some("tok"));
+
+        merge_notify_preserve_webui(&mut next, &prev);
+        assert_eq!(next.bots[0].webui_port, Some(16099));
+    }
+
+    #[test]
+    fn guessed_docker_port_is_kept_when_nothing_known() {
+        let prev = NotifyConfig::default();
+        let mut next = build_notify_config_with_extras(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+            &extras_with_webui("9", 0, "tok"),
+        );
+        merge_notify_preserve_webui(&mut next, &prev);
+        assert_eq!(
+            next.bots[0].webui_port,
+            Some(napcat_docker_webui_host_port(9))
+        );
+    }
+
+    #[test]
+    fn guessed_flag_is_not_written_to_notify_json() {
+        let n = build_notify_config(
+            "s1",
+            &[sample_remote("s1", 9)],
+            &OfflineWebhookSettings::default(),
+        );
+        assert!(n.bots[0].webui_port_guessed);
+        let raw = serde_json::to_string(&n).unwrap();
+        assert!(!raw.contains("guessed"), "{raw}");
+    }
+
+    #[test]
+    fn extras_attach_webui_and_email() {
+        let bots = vec![sample_remote("s1", 10001)];
+        let mut map = std::collections::HashMap::new();
+        map.insert("10001".into(), (6100, "tok".into()));
+        let mut email = OfflineEmailSettings::default();
+        email.smtp_server = "smtp.example".into();
+        let extras = WatchNotifyExtras {
+            webui_by_bot: map,
+            webhook_enabled: true,
+            email_enabled: true,
+            notify_on_recovered: true,
+            email,
+            onebot: OfflineOneBotSettings::default(),
+        };
+        let n = build_notify_config_with_extras(
+            "s1",
+            &bots,
+            &OfflineWebhookSettings::default(),
+            &extras,
+        );
+        assert_eq!(n.bots[0].webui_port, Some(6100));
+        assert_eq!(n.bots[0].webui_token.as_deref(), Some("tok"));
+        assert!(n.email_enabled);
+        assert!(n.notify_on_recovered);
+        assert!(!n.onebot.enabled);
+    }
+
+    #[test]
+    fn same_host_onebot_messengers_only() {
+        // Docker 容器内 3000 → 宿主机 3000 + 10002 % 500
+        let m_s1 = with_http(sample_remote("s1", 10002), 3000);
+        let m_s2 = with_http(sample_remote("s2", 10003), 3003);
+        let mut local = with_http(sample_remote("s1", 10004), 3004);
+        local.bot.runtime_target = RuntimeTarget::Local;
+        let bots = vec![sample_remote("s1", 10001), m_s1, m_s2, local];
+        let mut onebot = OfflineOneBotSettings::default();
+        onebot.enabled = true;
+        onebot.messenger_bot_ids = vec!["10002".into(), "10003".into(), "10004".into()];
+        onebot.target_ids = vec![999];
+        let extras = WatchNotifyExtras {
+            onebot,
+            ..WatchNotifyExtras::default()
+        };
+        let n = build_notify_config_with_extras(
+            "s1",
+            &bots,
+            &OfflineWebhookSettings::default(),
+            &extras,
+        );
+        assert!(n.onebot.enabled);
+        assert_eq!(n.onebot.messengers.len(), 1);
+        assert_eq!(n.onebot.messengers[0].bot_id, "10002");
+        assert_eq!(n.onebot.messengers[0].base_url, "http://127.0.0.1:3002");
+        assert_eq!(n.onebot.target_ids, vec![999]);
+    }
+
+    #[test]
+    fn skips_non_loopback_http_host() {
+        let mut m = sample_remote("s1", 10002);
+        m.connect.http_servers.push(HttpServerConfig {
+            base: NetworkBaseFields {
+                enable: true,
+                name: "http".into(),
+                message_post_format: MessagePostFormat::Array,
+                token: String::new(),
+                debug: false,
+            },
+            host: "10.0.0.5".into(),
+            port: 3000,
+            enable_cors: false,
+            enable_websocket: false,
+            path: "/".into(),
+        });
+        assert!(watch_onebot_messenger_from_bot(&m).is_none());
+    }
+
+    fn with_http_host(mut cfg: BotConfig, host: &str, port: u16) -> BotConfig {
+        cfg = with_http(cfg, port);
+        cfg.connect.http_servers.last_mut().unwrap().host = host.into();
+        cfg
+    }
+
+    #[test]
+    fn docker_messenger_custom_port_uses_automatic_mapping() {
+        let cfg = with_http(sample_remote("s1", 1277629216), 3010);
+        let m = watch_onebot_messenger_from_bot(&cfg).unwrap();
+        assert_eq!(m.base_url, "http://127.0.0.1:3226");
+        assert_eq!(m.container_name.as_deref(), Some("ncbot-1277629216"));
+        assert_eq!(m.container_port, Some(3010));
+        assert_eq!(m.access_token, "t");
+    }
+
+    #[test]
+    fn messenger_projection_keeps_http_prefix_for_native_and_docker_resolution() {
+        let mut cfg = with_http(sample_remote("s1", 10002), 3010);
+        cfg.connect.http_servers[0].path = " botB/ ".into();
+        let docker = watch_onebot_messenger_from_bot(&cfg).unwrap();
+        assert_eq!(docker.base_url, "http://127.0.0.1:3012");
+        assert_eq!(docker.path, "/botB/");
+        assert_eq!(docker.container_port, Some(3010));
+        cfg.bot.deployment_type = DeploymentType::Native;
+        let native = watch_onebot_messenger_from_bot(&cfg).unwrap();
+        assert_eq!(native.base_url, "http://127.0.0.1:3010");
+        assert_eq!(native.path, "/botB/");
+    }
+
+    #[test]
+    fn event_endpoint_normalizes_default_and_missing_leading_slash() {
+        let mut cfg = sample_remote("s1", 10002);
+        cfg.connect
+            .websocket_servers
+            .push(ncd_domain::WebsocketServerConfig {
+                base: NetworkBaseFields {
+                    enable: true,
+                    name: "watch".into(),
+                    message_post_format: MessagePostFormat::Array,
+                    token: String::new(),
+                    debug: false,
+                },
+                host: "0.0.0.0".into(),
+                port: 3001,
+                report_self_message: false,
+                enable_force_push_event: false,
+                heart_interval: 30000,
+                path: String::new(),
+                role: ncd_domain::WsRole::Universal,
+            });
+        assert_eq!(watch_event_endpoint(&cfg).unwrap().path, "/");
+        cfg.connect.websocket_servers[0].path = " botB ".into();
+        assert_eq!(watch_event_endpoint(&cfg).unwrap().path, "/botB");
+    }
+
+    #[test]
+    fn docker_messenger_uses_first_enabled_automatically_published_server() {
+        let cfg = with_http(with_http(sample_remote("s1", 1277629216), 3010), 3001);
+        let m = watch_onebot_messenger_from_bot(&cfg).unwrap();
+        assert_eq!(m.base_url, "http://127.0.0.1:3226");
+        assert_eq!(m.container_port, Some(3010));
+    }
+
+    #[test]
+    fn docker_messenger_uses_normalized_container_loopback() {
+        for host in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            let cfg = with_http_host(sample_remote("s1", 10002), host, 3000);
+            assert_eq!(
+                watch_onebot_messenger_from_bot(&cfg).unwrap().base_url,
+                "http://127.0.0.1:3002"
+            );
+        }
+    }
+
+    #[test]
+    fn native_messenger_skips_remote_host_and_takes_next() {
+        let mut cfg = with_http_host(sample_remote("s1", 10002), "10.0.0.5", 3000);
+        cfg = with_http_host(cfg, "127.0.0.1", 3100);
+        cfg.bot.deployment_type = DeploymentType::Native;
+        let m = watch_onebot_messenger_from_bot(&cfg).unwrap();
+        assert_eq!(m.base_url, "http://127.0.0.1:3100");
+        assert_eq!(m.container_name, None);
+    }
+
+    #[test]
+    fn messenger_container_fields_are_optional_in_json() {
+        let cfg = with_http_host(sample_remote("s1", 10002), "127.0.0.1", 3100);
+        let mut native = cfg.clone();
+        native.bot.deployment_type = DeploymentType::Native;
+        let raw =
+            serde_json::to_string(&watch_onebot_messenger_from_bot(&native).unwrap()).unwrap();
+        assert!(!raw.contains("container"), "{raw}");
+        // 旧 notify.json 里没有这两个字段也要能读
+        let old: WatchOneBotMessenger =
+            serde_json::from_str(r#"{"botId":"1","baseUrl":"http://127.0.0.1:1"}"#).unwrap();
+        assert_eq!(old.container_port, None);
+        assert_eq!(old.path, "");
+    }
+}

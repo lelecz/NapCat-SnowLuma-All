@@ -1,0 +1,728 @@
+//! 远端 SnowLuma 是否在跑、WebUI 实际端口：看进程和套接字，不写死 5099。
+//!
+//! 栈就绪：验证同用户 Node 的真实安装路径，未知状态不得补启动。
+//! WebUI 端口只接受唯一安装 Node 拥有且通过 HTTP 确认的监听 socket。
+
+use std::time::Duration;
+
+use ncd_host::{Host, HostCommand, HostPath, shell_single_quote};
+use ncd_traits::runtime_backend::BotBackendError;
+
+use super::helpers::read_remote_log_tail;
+use super::layout::{RemoteSnowLumaLayout, SnowLumaRemotePaths};
+use super::remote_bash::resolve_remote_bash;
+
+#[path = "node_presence.rs"]
+mod node_presence;
+pub use node_presence::{ResolvedWebuiEndpoint, VerifiedWebuiNode};
+
+/// daemon / node 是否已在远端就绪（进程，不是某个固定 TCP 口）
+pub async fn is_stack_ready(
+    host: &dyn Host,
+    layout: &RemoteSnowLumaLayout,
+) -> Result<bool, BotBackendError> {
+    node_presence::is_present(host, layout).await
+}
+
+/// A successful bootstrap may be reused only while its exact node process lives.
+/// Include Linux start time and configuration metadata so a recycled pid or
+/// credentials edited outside Desktop cannot validate a stale session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedNodeIdentity {
+    pub pid: u32,
+    fingerprint: String,
+}
+
+fn managed_node_identity_script(
+    paths: &SnowLumaRemotePaths,
+    pid_hint: Option<u32>,
+    secret_paths: &[String],
+) -> String {
+    format!(
+        r#"# ncd-snowluma-node-identity
+SL_PATH={sl}
+SL=$(readlink -f "$SL_PATH") || exit 1
+file_identity() {{
+  for path in "$@"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      stat -Lc '%d:%i:%s:%y:%z' -- "$path" || return 1
+    elif [ -x "$(dirname "$path")" ]; then
+      printf 'missing:%s\n' "$path"
+    else
+      return 1
+    fi
+  done
+}}
+identity() {{
+  pid="$1"
+  case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+  case "$comm" in node|nodejs) ;; *) return 1 ;; esac
+  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || return 1
+  if [ "$cwd" != "$SL" ]; then
+    args=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    printf '%s\n' "$args" | grep -Fx -e "$SL/index.mjs" -e "$SL_PATH/index.mjs" >/dev/null || return 1
+  fi
+  stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+  stat=${{stat##*) }}
+  set -- $stat
+  [ "$#" -ge 20 ] || return 1
+  case "$1" in Z|X) return 1 ;; esac
+  shift 19
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  files=$(file_identity {runtime_json} {webui_json} {webui_secret} {vnc_secret} {secret_paths}) || return 1
+  printf '%s:%s\n' "$pid" "$1"
+  printf '%s\n' "$files"
+}}
+PID_HINT={pid_hint}
+if [ -n "$PID_HINT" ]; then
+  identity "$PID_HINT"
+  exit $?
+fi
+for pid_file in {pid_node} {pid_daemon}; do
+  pid=$(cat "$pid_file" 2>/dev/null) || continue
+  identity "$pid" && exit 0
+done
+# Imported services do not write Desktop pid files. Scan once, then keep the verified pid.
+for proc in /proc/[0-9]*; do
+  identity "${{proc#/proc/}}" && exit 0
+done
+exit 1
+"#,
+        sl = shell_single_quote(&paths.snowluma_dir),
+        pid_hint = shell_single_quote(&pid_hint.map(|pid| pid.to_string()).unwrap_or_default()),
+        pid_node = shell_single_quote(&paths.pid_node_path()),
+        pid_daemon = shell_single_quote(&paths.pid_daemon),
+        runtime_json = shell_single_quote(&format!("{}/runtime.json", paths.config_dir)),
+        webui_json = shell_single_quote(&format!("{}/webui.json", paths.config_dir)),
+        webui_secret = shell_single_quote(&paths.webui_secret),
+        vnc_secret = shell_single_quote(&paths.vnc_secret),
+        secret_paths = secret_paths
+            .iter()
+            .map(|path| shell_single_quote(path))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+pub(crate) async fn managed_node_identity(
+    host: &dyn Host,
+    paths: &SnowLumaRemotePaths,
+    pid_hint: Option<u32>,
+    secret_paths: &[String],
+) -> Option<ManagedNodeIdentity> {
+    let out = host
+        .run_to_string(
+            HostCommand::new("sh")
+                .arg("-c")
+                .arg(managed_node_identity_script(paths, pid_hint, secret_paths))
+                .timeout(Duration::from_secs(5)),
+        )
+        .await
+        .ok()?;
+    if !out.success() {
+        return None;
+    }
+    let fingerprint = out.stdout.trim().to_string();
+    let pid = fingerprint.split_once(':')?.0.parse().ok()?;
+    (pid != 0).then_some(ManagedNodeIdentity { pid, fingerprint })
+}
+
+pub(crate) fn qq_main_running_script(qq_bin: &str) -> String {
+    let qq_bin = shell_single_quote(qq_bin);
+    format!(
+        r#"QQ_BIN={qq_bin}
+qq_bin=$(readlink -f "$QQ_BIN") || exit 2
+[ -n "$qq_bin" ] || exit 2
+for proc in /proc/[0-9]*; do
+  exe=$(readlink -f "$proc/exe" 2>/dev/null || true)
+  [ "$exe" = "$qq_bin" ] || continue
+  cmd=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+  case "$cmd" in ''|*"--type="*) continue ;; esac
+  echo running
+  exit 0
+done
+echo stopped
+"#
+    )
+}
+
+pub(crate) async fn remote_qq_main_running(
+    host: &dyn Host,
+    qq_bin: &str,
+) -> Result<bool, BotBackendError> {
+    let out = host
+        .run_to_string(
+            HostCommand::new("sh")
+                .arg("-c")
+                .arg(qq_main_running_script(qq_bin)),
+        )
+        .await
+        .map_err(|err| BotBackendError::Io(err.to_string()))?;
+    match (out.success(), out.stdout.trim()) {
+        (true, "running") => Ok(true),
+        (true, "stopped") => Ok(false),
+        _ => Err(BotBackendError::Io(
+            "无法确认远端 QQ 主进程是否已退出".into(),
+        )),
+    }
+}
+
+pub fn parse_port_lines(out: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Ok(p) = t.parse::<u16>() else {
+            continue;
+        };
+        if p > 0 && !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+/// 解析远端 SnowLuma WebUI 当前端口（导入安装可能不是 5099）。
+pub async fn resolve_remote_webui_port(
+    host: &dyn Host,
+    layout: &RemoteSnowLumaLayout,
+) -> Result<u16, BotBackendError> {
+    Ok(resolve_remote_webui_endpoint(host, layout).await?.port)
+}
+
+pub async fn resolve_remote_webui_endpoint(
+    host: &dyn Host,
+    layout: &RemoteSnowLumaLayout,
+) -> Result<ResolvedWebuiEndpoint, BotBackendError> {
+    node_presence::resolve_endpoint(host, layout).await
+}
+
+const NOVNC_LISTEN_PORTS_SCRIPT: &str = r#"
+if command -v ss >/dev/null 2>&1; then
+  ss -ltnp 2>/dev/null | awk '/websockify/ {print $4}' | sed -n 's/.*[:.]\([0-9][0-9]*\)$/\1/p'
+fi
+"#;
+
+/// 解析远端 websockify（noVNC）实际监听口。外来图形栈（systemd 自装等）
+/// 常用自定义端口，隧道不能写死 6081；同机出现多个时优先桌面约定的 6081。
+pub async fn resolve_remote_novnc_port(host: &dyn Host) -> u16 {
+    let cmd = HostCommand::new("sh")
+        .arg("-c")
+        .arg(NOVNC_LISTEN_PORTS_SCRIPT);
+    let Ok(out) = host.run_to_string(cmd).await else {
+        return super::tunnel::REMOTE_NOVNC_PORT;
+    };
+    let ports = parse_port_lines(&out.stdout);
+    if ports.contains(&super::tunnel::REMOTE_NOVNC_PORT) {
+        return super::tunnel::REMOTE_NOVNC_PORT;
+    }
+    ports
+        .first()
+        .copied()
+        .unwrap_or(super::tunnel::REMOTE_NOVNC_PORT)
+}
+
+/// 从正在跑的 x11vnc 进程 cmdline 提取 `-passwdfile` 指向的实际密码文件路径。
+/// 外来安装（systemd 自启）常把 vnc.secret 放在 snowluma_dir 父目录，不在 Desktop
+/// 假设的 `{workspace}/vnc.secret` 下；这里以进程事实为准回退读取。
+pub async fn resolve_remote_vnc_secret_from_x11vnc(
+    host: &dyn Host,
+) -> Result<Option<String>, BotBackendError> {
+    // 只取第一个 x11vnc 主进程的 -passwdfile 参数值；多实例场景由调用方上层隔离
+    let script = r#"ps -eo pid,args 2>/dev/null | awk '/x11vnc/ && !/awk/ {print; exit}' \
+| grep -oE '\-passwdfile[[:space:]]+[^[:space:]]+' | awk '{print $2}'"#;
+    let cmd = HostCommand::new("sh").arg("-c").arg(script);
+    let out = host
+        .run_to_string(cmd)
+        .await
+        .map_err(|e| BotBackendError::Io(e.to_string()))?;
+    let path = out.stdout.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(path.to_string()))
+}
+
+/// 在 snowluma_dir 父目录下探测 webui.secret。外来安装常把 secret/log 放在 framework
+/// 根的上一级（systemd 启动脚本的工作目录），Desktop 假设的 `{workspace}/webui.secret`
+/// 在扁平布局下不存在；这里以实际文件为准。
+pub async fn resolve_remote_webui_secret_near_snowluma_dir(
+    host: &dyn Host,
+    snowluma_dir: &str,
+) -> Result<Option<String>, BotBackendError> {
+    // snowluma_dir 形如 /opt/snowluma，父目录 /opt 是外来启动脚本的常见工作目录
+    let parent = snowluma_dir.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    if parent.is_empty() {
+        return Ok(None);
+    }
+    let candidate = format!("{parent}/webui.secret");
+    if host
+        .exists(&HostPath::from_posix(&candidate))
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(Some(candidate));
+    }
+    Ok(None)
+}
+
+/// 日志跟随目标：外来安装的真实日志在 framework 自带 logs 目录（日期滚动命名），
+/// 桌面自装布局才是 workspace/log。按远端存在性解析；都没有则回落布局路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSnowLumaLogTargets {
+    pub bot: String,
+    pub daemon: String,
+}
+
+/// 单次 SSH 解析两个跟随源：bot/daemon 布局路径存在则原样沿用，
+/// 缺失时回落 framework 目录里最新的一份 snowluma-*.log。
+pub async fn resolve_remote_snowluma_log_targets(
+    host: &dyn Host,
+    paths: &SnowLumaRemotePaths,
+    layout_bot_log: &str,
+) -> ResolvedSnowLumaLogTargets {
+    let fallback = ResolvedSnowLumaLogTargets {
+        bot: layout_bot_log.to_string(),
+        daemon: paths.log_daemon.clone(),
+    };
+    let script = format!(
+        r#"BOT={bot}
+DAEMON={daemon}
+FW=$(ls -t {logs}/snowluma-*.log 2>/dev/null | head -n 1)
+[ -f "$BOT" ] && echo "bot_ok=1"
+[ -f "$DAEMON" ] && echo "daemon_ok=1"
+[ -n "$FW" ] && echo "framework=$FW"
+"#,
+        bot = shell_single_quote(layout_bot_log),
+        daemon = shell_single_quote(&paths.log_daemon),
+        logs = shell_single_quote(&format!("{}/logs", paths.snowluma_dir)),
+    );
+    let cmd = HostCommand::new("sh").arg("-c").arg(script);
+    let Ok(out) = host.run_to_string(cmd).await else {
+        return fallback;
+    };
+    let stdout = out.stdout;
+    let framework = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("framework="))
+        .map(str::trim)
+        .filter(|stripped| !stripped.is_empty())
+        .map(str::to_string);
+    match framework {
+        Some(fw) => ResolvedSnowLumaLogTargets {
+            bot: if stdout.contains("bot_ok=1") {
+                layout_bot_log.to_string()
+            } else {
+                fw.clone()
+            },
+            daemon: if stdout.contains("daemon_ok=1") {
+                paths.log_daemon.clone()
+            } else {
+                fw
+            },
+        },
+        None => fallback,
+    }
+}
+
+fn wait_webui_ready_script(paths: &SnowLumaRemotePaths, timeout: Duration) -> String {
+    let secs = timeout.as_secs().max(1);
+    let rt = shell_single_quote(&format!("{}/runtime.json", paths.config_dir));
+    let log = shell_single_quote(&paths.log_daemon);
+    let pid_daemon = shell_single_quote(&paths.pid_daemon);
+    let pid_node = shell_single_quote(&paths.pid_node_path());
+    let sl = shell_single_quote(&paths.snowluma_dir);
+    format!(
+        r#"deadline=$(( $(date +%s) + {secs} ))
+RT={rt}
+LOG={log}
+PID_DAEMON={pid_daemon}
+PID_NODE={pid_node}
+SL={sl}
+tcp_up() {{
+  p="$1"
+  [ -n "$p" ] && [ "$p" != "0" ] || return 1
+  if command -v bash >/dev/null 2>&1 && bash -c "(: > /dev/tcp/127.0.0.1/$p)" 2>/dev/null; then return 0; fi
+  if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$p" 2>/dev/null; then return 0; fi
+  return 1
+}}
+alive() {{
+  pid="$1"
+  [ -n "$pid" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null
+}}
+find_node_pid() {{
+  if [ -f "$PID_NODE" ]; then
+    pid=$(cat "$PID_NODE" 2>/dev/null || true)
+    if alive "$pid"; then echo "$pid"; return 0; fi
+  fi
+  if [ -f "$PID_DAEMON" ]; then
+    pid=$(cat "$PID_DAEMON" 2>/dev/null || true)
+    if alive "$pid"; then echo "$pid"; return 0; fi
+  fi
+  for proc in /proc/[0-9]*; do
+    [ -d "$proc" ] || continue
+    pid=${{proc#/proc/}}
+    comm=$(cat "$proc/comm" 2>/dev/null || true)
+    case "$comm" in node|nodejs) ;; *) continue ;; esac
+    alive "$pid" || continue
+    cwd=$(readlink -f "$proc/cwd" 2>/dev/null || true)
+    if [ -n "$cwd" ] && [ "$cwd" = "$SL" ]; then echo "$pid"; return 0; fi
+    cmd=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *"index.mjs"*)
+        case "$cmd" in
+          *"$SL"*) echo "$pid"; return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}}
+dump_listen_ports() {{
+  pid="$1"
+  alive "$pid" || return 0
+  inodes=" "
+  for fd in /proc/$pid/fd/*; do
+    t=$(readlink "$fd" 2>/dev/null || true)
+    case "$t" in
+      socket:\[*\])
+        ino=${{t#socket:[}}
+        ino=${{ino%']'}}
+        inodes="$inodes$ino "
+        ;;
+    esac
+  done
+  [ "$inodes" != " " ] || return 0
+  for table in /proc/net/tcp /proc/net/tcp6; do
+    [ -f "$table" ] || continue
+    tail -n +2 "$table" 2>/dev/null | while read -r _ local _ st _ _ _ _ _ inode _; do
+      [ "$st" = "0A" ] || continue
+      case "$inodes" in
+        *" $inode "*)
+          ph=${{local##*:}}
+          echo $((0x$ph)) 2>/dev/null || true
+          ;;
+      esac
+    done
+  done
+}}
+grep_webui_ports() {{
+  f="$1"
+  [ -f "$f" ] || return 0
+  grep -iF '[WebUI]' "$f" 2>/dev/null \
+    | grep -oiE 'is in use, using [0-9]+ instead|listening https?://[^[:space:]]+' \
+    | tail -n 1 \
+    | awk '{{
+        if (tolower($1) == "is") port = $5;
+        else {{ port = $2; sub(/^.*:/, "", port); sub(/[^0-9].*$/, "", port); }}
+        if (port+0 > 0 && port+0 <= 65535) print port+0;
+      }}'
+}}
+preferred_ports() {{
+  grep_webui_ports "$LOG"
+  FW=$(ls -t "$SL"/logs/snowluma-*.log 2>/dev/null | head -n 1)
+  if [ -n "$FW" ] && [ "$FW" != "$LOG" ]; then
+    grep_webui_ports "$FW"
+  fi
+  if [ -f "$RT" ]; then
+    sed -n 's/.*"webuiPort"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$RT" 2>/dev/null
+  fi
+}}
+uniq_ports() {{
+  awk 'NF && $1 ~ /^[0-9]+$/ && $1+0 > 0 {{print $1+0}}' | awk '!a[$1]++'
+}}
+start=$(date +%s)
+seen_alive=0
+dead_ticks=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  pid=$(find_node_pid || true)
+  if [ -n "$pid" ]; then
+    seen_alive=1
+    dead_ticks=0
+  elif [ "$seen_alive" = 1 ]; then
+    dead_ticks=$((dead_ticks + 1))
+    if [ "$dead_ticks" -ge 2 ]; then
+      echo "node_exited" >&2
+      exit 2
+    fi
+  else
+    now=$(date +%s)
+    if [ $((now - start)) -ge 8 ]; then
+      echo "node_not_started" >&2
+      exit 2
+    fi
+  fi
+  for p in $(preferred_ports | uniq_ports); do
+    if tcp_up "$p"; then
+      echo "$p"
+      exit 0
+    fi
+  done
+  sleep 1
+done
+pid=$(find_node_pid || true)
+if [ -n "$pid" ]; then
+  for p in $(dump_listen_ports "$pid" | uniq_ports); do
+    if tcp_up "$p"; then
+      echo "$p"
+      exit 0
+    fi
+  done
+fi
+exit 1
+"#
+    )
+}
+
+/// 等到 WebUI 在某个已发现的端口上监听，返回实际端口。
+pub async fn wait_remote_webui_ready(
+    host: &dyn Host,
+    paths: &SnowLumaRemotePaths,
+    timeout: Duration,
+) -> Result<u16, BotBackendError> {
+    let script = wait_webui_ready_script(paths, timeout);
+    let bash = resolve_remote_bash(host).await?;
+    let cmd = HostCommand::new(bash)
+        .arg("-c")
+        .arg(script)
+        .timeout(timeout + Duration::from_secs(30));
+    let out = host
+        .run_to_string(cmd)
+        .await
+        .map_err(|e| BotBackendError::Io(e.to_string()))?;
+    if !out.success() {
+        let hint = match out.exit_code {
+            Some(2) if out.stderr.contains("node_exited") => {
+                "SnowLuma 进程启动后退出，WebUI 未就绪"
+            }
+            Some(2) if out.stderr.contains("node_not_started") => {
+                "SnowLuma 进程未能拉起，WebUI 未就绪"
+            }
+            _ => "SnowLuma WebUI 在时限内未就绪",
+        };
+        let tail = webui_wait_failure_log_tail(host, paths).await;
+        if tail.trim().is_empty() {
+            return Err(BotBackendError::Io(hint.into()));
+        }
+        return Err(BotBackendError::Io(format!(
+            "{hint}\n--- 远端日志末尾 ---\n{tail}"
+        )));
+    }
+    let line = out.stdout.lines().last().unwrap_or("").trim();
+    line.parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| BotBackendError::Io(format!("SnowLuma WebUI 就绪但未返回端口: {line}")))
+}
+
+async fn webui_wait_failure_log_tail(host: &dyn Host, paths: &SnowLumaRemotePaths) -> String {
+    let resolved = resolve_remote_snowluma_log_targets(host, paths, &paths.log_daemon).await;
+    let mut chunks = Vec::new();
+    for path in [resolved.daemon, resolved.bot] {
+        if let Ok(text) = read_remote_log_tail(host, &path, 30).await {
+            let t = text.trim();
+            if !t.is_empty() {
+                chunks.push(format!("{path}:\n{t}"));
+            }
+        }
+    }
+    chunks.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote_snowluma::layout::SnowLumaRemotePaths;
+
+    fn sample_paths() -> SnowLumaRemotePaths {
+        SnowLumaRemotePaths::from_remote_home("/home/u")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_identity_detects_config_changes_process_exit_and_wrong_cwd() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::Builder::new()
+            .prefix("sl identity '")
+            .tempdir()
+            .unwrap();
+        let dir = root.path().to_str().unwrap();
+        let paths = SnowLumaRemotePaths::from_workspace_and_dir(dir, dir);
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        for path in [
+            format!("{}/runtime.json", paths.config_dir),
+            format!("{}/webui.json", paths.config_dir),
+            paths.webui_secret.clone(),
+            paths.vnc_secret.clone(),
+        ] {
+            std::fs::write(path, b"initial").unwrap();
+        }
+        let node = root.path().join("node");
+        std::os::unix::fs::symlink("/bin/sleep", &node).unwrap();
+        let mut child = Child(
+            std::process::Command::new(&node)
+                .arg("30")
+                .current_dir(root.path())
+                .spawn()
+                .unwrap(),
+        );
+        std::fs::write(paths.pid_node_path(), child.0.id().to_string()).unwrap();
+        let probe = |paths: &SnowLumaRemotePaths| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(managed_node_identity_script(paths, None, &[]))
+                .output()
+                .unwrap()
+        };
+        let first = probe(&paths);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(first.stdout, probe(&paths).stdout);
+        std::fs::remove_file(paths.pid_node_path()).unwrap();
+        assert_eq!(
+            first.stdout,
+            probe(&paths).stdout,
+            "imported node has no Desktop pid file"
+        );
+        let hinted = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(managed_node_identity_script(
+                &paths,
+                Some(child.0.id()),
+                &[],
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(first.stdout, hinted.stdout);
+        std::fs::write(&paths.webui_secret, b"changed credentials").unwrap();
+        let changed = probe(&paths);
+        assert!(changed.status.success());
+        assert_ne!(first.stdout, changed.stdout);
+        std::fs::remove_file(&paths.webui_secret).unwrap();
+        let fallback = root.path().join("external-webui.secret");
+        std::fs::write(&fallback, b"external credentials").unwrap();
+        let imported = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(managed_node_identity_script(
+                    &paths,
+                    Some(child.0.id()),
+                    &[fallback.to_str().unwrap().into()],
+                ))
+                .output()
+                .unwrap()
+        };
+        let absent_primary = imported();
+        assert!(absent_primary.status.success());
+        assert_eq!(absent_primary.stdout, imported().stdout);
+        std::fs::write(&fallback, b"rotated external credentials").unwrap();
+        assert_ne!(absent_primary.stdout, imported().stdout);
+        let rotated = imported();
+        std::fs::write(&paths.webui_secret, b"new primary credentials").unwrap();
+        assert_ne!(rotated.stdout, imported().stdout);
+        let mut other = paths.clone();
+        other.snowluma_dir = "/different/install".into();
+        assert!(!probe(&other).status.success());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(!probe(&paths).status.success());
+    }
+
+    #[test]
+    fn wait_script_discovers_port_instead_of_assuming_5099() {
+        let script = wait_webui_ready_script(&sample_paths(), Duration::from_secs(5));
+        assert!(script.contains("webuiPort"));
+        assert!(script.contains("listening"));
+        assert!(script.contains("/proc/net/tcp"));
+        // 5099 只应作为 Rust 侧最后兜底，远程等待脚本不应写死唯一探测口
+        let assigned = script
+            .lines()
+            .filter(|l| l.contains("5099") && l.contains('='))
+            .count();
+        assert_eq!(assigned, 0, "wait script must not assign a fixed 5099");
+    }
+
+    #[test]
+    fn wait_script_fails_fast_when_node_dies() {
+        let script = wait_webui_ready_script(&sample_paths(), Duration::from_secs(5));
+        assert!(script.contains("node_exited"));
+        assert!(script.contains("node_not_started"));
+        assert!(script.contains("seen_alive"));
+    }
+
+    #[test]
+    fn wait_script_polls_preferred_ports_before_listen_fallback() {
+        let script = wait_webui_ready_script(&sample_paths(), Duration::from_secs(5));
+        assert!(
+            script.contains("preferred_ports"),
+            "wait loop must poll log/runtime ports, not every node LISTEN socket"
+        );
+        let loop_body = script
+            .split("while [ \"$(date +%s)\" -lt \"$deadline\" ]; do")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndone\n").next())
+            .unwrap_or("");
+        assert!(
+            loop_body.contains("preferred_ports"),
+            "poll loop should only try preferred_ports"
+        );
+        assert!(
+            !loop_body.contains("dump_listen_ports"),
+            "LISTEN dump must not run every second inside the wait loop"
+        );
+        let after_loop = script
+            .split("while [ \"$(date +%s)\" -lt \"$deadline\" ]; do")
+            .nth(1)
+            .and_then(|rest| rest.split("\ndone\n").nth(1))
+            .unwrap_or("");
+        assert!(
+            after_loop.contains("dump_listen_ports"),
+            "LISTEN dump is last-resort after preferred ports time out"
+        );
+    }
+
+    #[test]
+    fn wait_script_greps_framework_log_not_only_desktop_daemon_log() {
+        let script = wait_webui_ready_script(&sample_paths(), Duration::from_secs(5));
+        assert!(
+            script.contains("snowluma-*.log"),
+            "imported/full packages log to framework logs/, not workspace/log/daemon.log"
+        );
+        assert!(script.contains("/logs"));
+    }
+
+    #[test]
+    fn parse_port_lines_dedupes() {
+        assert_eq!(
+            parse_port_lines("5099\n5099\n5100\nbad\n"),
+            vec![5099, 5100]
+        );
+    }
+
+    #[test]
+    fn parent_dir_of_snowluma_dir_is_extracted_for_webui_secret_fallback() {
+        // snowluma_dir=/opt/snowluma → 父目录 /opt 是外来启动脚本常见工作目录
+        let parent = "/opt/snowluma"
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or("");
+        assert_eq!(parent, "/opt");
+        // 扁平系统目录根场景：/snowluma → 父目录空，不回退
+        let root = "/snowluma".rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        assert_eq!(root, "");
+    }
+}

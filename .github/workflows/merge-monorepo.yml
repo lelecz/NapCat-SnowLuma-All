@@ -1,0 +1,46 @@
+name: Merge into monorepo
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 平铺合并 7 个仓库
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name  "lelecz"
+          git config user.email "lelecz@users.noreply.github.com"
+          REPOS="NapCatQQ SnowLuma NapCatQQ-Desktop NapCat-Installer NapCat-Termux LiteLoader-NapCatExample BytecodeInjectBoot"
+          mkdir -p /tmp/src
+          for r in $REPOS; do
+            echo "::group::clone $r"
+            rm -rf "/tmp/src/$r"
+            git clone --depth 1 --single-branch -q \
+              "https://x-access-token:${GH_PAT}@github.com/lelecz/${r}.git" "/tmp/src/$r"
+            rm -rf "$r"
+            mkdir -p "$r"
+            cp -a "/tmp/src/$r/." "$r/"
+            rm -rf "$r/.git"
+            echo "::endgroup::"
+          done
+          rm -f .gitmodules
+          git add -A
+          if git diff --cached --quiet; then
+            echo "NO_CHANGE"
+          else
+            git commit -q -m "feat: 平铺合并 NapCat / SnowLuma 全生态（7 个项目，单一仓库）"
+            git push -q origin HEAD:main
+            echo "PUSHED $(git rev-parse --short HEAD)"
+          fi
+          echo "=== 结果目录 ==="
+          du -sh */ | sort -h

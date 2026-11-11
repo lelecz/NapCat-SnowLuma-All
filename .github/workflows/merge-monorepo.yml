@@ -1,4 +1,4 @@
-name: Merge into monorepo
+name: Build monorepo
 on:
   workflow_dispatch:
 
@@ -6,39 +6,110 @@ permissions:
   contents: write
 
 jobs:
-  merge:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
           submodules: false
 
-      - name: 平铺合并 7 个仓库
+      - name: 分类平铺合并 NapCat 全生态
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          MAP: |
+              01-core/NapCatQQ NapCatQQ
+              01-core/SnowLuma SnowLuma
+              02-client/NapCatQQ-Desktop NapCatQQ-Desktop
+              02-client/NapCat-Windows-Boot NapCat-Windows-Boot
+              02-client/napcat-linux-launcher napcat-linux-launcher
+              02-client/NapCat-TUI-CLI NapCat-TUI-CLI
+              02-client/NapCat-Magic-Cli NapCat-Magic-Cli
+              02-client/NapCatQQ-CLI NapCatQQ-CLI
+              03-deploy/NapCat-Installer NapCat-Installer
+              03-deploy/napcat-linux-installer napcat-linux-installer
+              03-deploy/NapCat-Mac-Installer NapCat-Mac-Installer
+              03-deploy/NapCat-Win-Installer NapCat-Win-Installer
+              03-deploy/NapCat-Termux NapCat-Termux
+              03-deploy/NapCat-Docker NapCat-Docker
+              03-deploy/NapCat.Docker.Framework NapCat.Docker.Framework
+              03-deploy/NapCatAppImageBuild NapCatAppImageBuild
+              03-deploy/NapCatLinuxNodeLoader NapCatLinuxNodeLoader
+              04-plugins/napcat-plugin-template napcat-plugin-template
+              04-plugins/napcat-plugin-debug napcat-plugin-debug
+              04-plugins/napcat-plugin-cleaner napcat-plugin-cleaner
+              04-plugins/napcat-plugin-index-archive napcat-plugin-index
+              04-plugins/LiteLoader-NapCatExample LiteLoader-NapCatExample
+              05-native/NapCat-Hook NapCat-Hook
+              05-native/NapCat-Native NapCat-Native
+              05-native/NapCatNative-legacy NapCatNative
+              05-native/NapCat-Core-Lib NapCat-Core-Lib
+              05-native/BytecodeInjectBoot BytecodeInjectBoot
+              05-native/NC-BootWay05 NC-BootWay05
+              05-native/FridaNodeTest FridaNodeTest
+              05-native/PacketRelease PacketRelease
+              05-native/ffmpegAddon ffmpegAddon
+              05-native/ffmpeg-build ffmpeg-build
+              05-native/ntsilkwasm ntsilkwasm
+              05-native/ntsilkwasm.core ntsilkwasm.core
+              05-native/NapCatResource NapCatResource
+              06-tools/NTQQAntiRecall NTQQAntiRecall
+              06-tools/qq_dump_db qq_dump_db
+              06-tools/NTQQScanQuick NTQQScanQuick
+              06-tools/protobuf-decoder protobuf-decoder
+              06-tools/NapProto NapProto
+              06-tools/napcat-protocol napcat-protocol
+              06-tools/NapCatReforged-archive NapCatReforged
+              06-tools/LLQQNT-Protocol-Enhance-archive LLQQNT-Protocol-Enhance
+              06-tools/napcat-pr-release napcat-pr-release
+              07-docs/NapCatDocs NapCatDocs
+              07-docs/napneko.github.io napneko.github.io
+              07-docs/NapCatRoadMap NapCatRoadMap
         run: |
-          set -euo pipefail
+          set -uo pipefail
           git config user.name  "lelecz"
           git config user.email "lelecz@users.noreply.github.com"
-          REPOS="NapCatQQ SnowLuma NapCatQQ-Desktop NapCat-Installer NapCat-Termux LiteLoader-NapCatExample BytecodeInjectBoot"
-          mkdir -p /tmp/src
-          for r in $REPOS; do
-            echo "::group::clone $r"
-            rm -rf "/tmp/src/$r"
-            git clone --depth 1 --single-branch -q \
-              "https://x-access-token:${GH_PAT}@github.com/lelecz/${r}.git" "/tmp/src/$r"
-            git rm -r --cached --quiet "$r" > /dev/null 2>&1 || true
-            rm -rf "$r" ".git/modules/$r"
-            mkdir -p "$r"
-            cp -a "/tmp/src/$r/." "$r/"
-            rm -rf "$r/.git"
-            echo "::endgroup::"
+
+          # 移除旧的平铺结构（保持 README / .github）
+          for old in NapCatQQ SnowLuma NapCatQQ-Desktop NapCat-Installer NapCat-Termux \
+                     LiteLoader-NapCatExample BytecodeInjectBoot; do
+            git rm -r --cached --quiet "$old" >/dev/null 2>&1 || true
+            rm -rf "$old"
+          done
+          for d in 01-core 02-client 03-deploy 04-plugins 05-native 06-tools 07-docs; do
+            git rm -r --cached --quiet "$d" >/dev/null 2>&1 || true
+            rm -rf "$d"
           done
           rm -f .gitmodules
+          mkdir -p /tmp/src
+
+          while read -r dest repo; do
+            [ -z "${dest:-}" ] && continue
+            echo "::group::$repo -> $dest"
+            rm -rf "/tmp/src/$repo"
+            if git clone --depth 1 --single-branch -q \
+                 "https://x-access-token:${GH_PAT}@github.com/lelecz/${repo}.git" "/tmp/src/$repo" 2>/dev/null; then
+              mkdir -p "$dest"
+              cp -a "/tmp/src/$repo/." "$dest/"
+              rm -rf "$dest/.git"
+              echo "ok: $(find "$dest" -type f | wc -l) files"
+            else
+              mkdir -p "$dest"
+              printf '# %s\n\n上游为空仓库（无 Git 内容），此处仅占位。\n\n源：https://github.com/NapNeko/%s\n' "$repo" "$repo" > "$dest/README.md"
+              echo "::warning::$repo 为空仓库，已占位"
+            fi
+            echo "::endgroup::"
+          done <<< "$MAP"
+
+          # 大文件预警
+          BIG=$(find . -path ./.git -prune -o -type f -size +95M -print | head -20)
+          [ -n "$BIG" ] && echo "::warning::超过 95MB 的文件: $BIG"
+
           git add -A -f
-          echo "staged files: $(git diff --cached --name-only | wc -l)"
-          git commit -q -m "feat: 平铺合并 NapCat / SnowLuma 全生态（7 个项目，单一仓库）" || echo "nothing to commit"
+          echo "staged: $(git diff --cached --name-only | wc -l) files"
+          git commit -q -m "feat: NapCat 全生态分类合并（7 大类，$(echo "$MAP" | wc -l) 个项目）" || echo "nothing to commit"
           git push -q origin HEAD:main
           echo "PUSHED $(git rev-parse --short HEAD)"
-          du -sh */
+          echo "=== 各分类体积 ==="
+          du -sh 0*/ 2>/dev/null | sort -k2

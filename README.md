@@ -1,7 +1,7 @@
 # NapCat 全生态镜像（单一仓库 · 七大分类）
 
 [NapCat](https://github.com/NapNeko/NapCatQQ) 与 [SnowLuma](https://github.com/TomyJan/SnowLuma) 全生态的完整快照，
-按用途分七类平铺在一个仓库里。克隆一次拿到全部 **48 个项目 / 16439 个文件 / 约 512 MB**，无需子模块。
+按用途分七类平铺在一个仓库里。克隆一次拿到全部 **47 个项目 / 16439 个文件 / 约 512 MB**，无需子模块。
 
 ```bash
 git clone https://github.com/lelecz/NapCat-SnowLuma-All.git
